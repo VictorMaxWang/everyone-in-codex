@@ -1,5 +1,5 @@
 From 8e011f549f9b10123379a144fbd2bd539418800d Mon Sep 17 00:00:00 2001
-From: wangwang <1280424159@qq.com>
+From: Everyone in Codex <noreply@everyone-in-codex.invalid>
 Date: Sat, 29 Aug 2026 19:03:31 +0800
 Subject: [PATCH 03/11] fix: complete external Router setup flow
 
@@ -491,4 +491,3 @@ index 116bad7..d1ca411 100644
    }
 -- 
 2.55.0.windows.2
-

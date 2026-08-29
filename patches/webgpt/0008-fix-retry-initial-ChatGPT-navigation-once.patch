@@ -1,5 +1,5 @@
 From d3b128814b542f6a82beb39e0ea2e2749af0caee Mon Sep 17 00:00:00 2001
-From: wangwang <1280424159@qq.com>
+From: Everyone in Codex <noreply@everyone-in-codex.invalid>
 Date: Sat, 29 Aug 2026 22:24:21 +0800
 Subject: [PATCH 08/11] fix: retry initial ChatGPT navigation once
 
@@ -507,4 +507,3 @@ index c297ffc..4ff1c0c 100644
    expect(workerSource).toContain("CHATGPT_EFFORT_ITEM_SELECTOR");
 -- 
 2.55.0.windows.2
-

@@ -1,5 +1,5 @@
 From 1a57b56730ce2ea05982902874f57ec63e7ba63a Mon Sep 17 00:00:00 2001
-From: wangwang <1280424159@qq.com>
+From: Everyone in Codex <noreply@everyone-in-codex.invalid>
 Date: Sat, 29 Aug 2026 21:44:10 +0800
 Subject: [PATCH 07/11] fix: close browser helper protocol races
 
@@ -393,4 +393,3 @@ index 88cd515..c297ffc 100644
    const pressed: string[] = [];
 -- 
 2.55.0.windows.2
-

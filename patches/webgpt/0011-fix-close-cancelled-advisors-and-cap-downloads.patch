@@ -1,5 +1,5 @@
 From 46ba4a6abfeb70cdd4a396882568149d4655fbea Mon Sep 17 00:00:00 2001
-From: wangwang <1280424159@qq.com>
+From: Everyone in Codex <noreply@everyone-in-codex.invalid>
 Date: Sat, 29 Aug 2026 23:33:06 +0800
 Subject: [PATCH 11/11] fix: close cancelled advisors and cap downloads
 
@@ -251,4 +251,3 @@ index 98d290c..a1a5c4d 100644
      closeAll: async () => {},
 -- 
 2.55.0.windows.2
-

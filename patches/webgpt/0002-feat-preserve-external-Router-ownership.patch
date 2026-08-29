@@ -1,5 +1,5 @@
 From 326f36abc5bebd8014601411a5d4b26cf18d96c6 Mon Sep 17 00:00:00 2001
-From: wangwang <1280424159@qq.com>
+From: Everyone in Codex <noreply@everyone-in-codex.invalid>
 Date: Sat, 29 Aug 2026 18:40:24 +0800
 Subject: [PATCH 02/11] feat: preserve external Router ownership
 
@@ -1677,4 +1677,3 @@ index 0000000..116bad7
 +});
 -- 
 2.55.0.windows.2
-

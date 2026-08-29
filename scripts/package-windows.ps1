@@ -198,13 +198,36 @@ exit /b %ERRORLEVEL%
     }
     Compress-Archive -LiteralPath $stagingRoot -DestinationPath $zipPath -CompressionLevel Optimal
 
+    # 源码包只来自已提交 Git tree；这既排除本机配置，也保证 patch/lock 可重放。
+    & git -C $resolvedRepoRoot diff --quiet --
+    Assert-ExternalCommandSucceeded -ExitCode $LASTEXITCODE -Operation 'Source tree cleanliness check'
+    & git -C $resolvedRepoRoot diff --cached --quiet --
+    Assert-ExternalCommandSucceeded -ExitCode $LASTEXITCODE -Operation 'Source index cleanliness check'
+    $sourceName = "everyone-codex-$($package.version)-source"
+    $sourceZipName = "$sourceName.zip"
+    $sourceZipPath = Join-Path $resolvedOutputDirectory $sourceZipName
+    if (Test-Path -LiteralPath $sourceZipPath) {
+        Remove-Item -LiteralPath $sourceZipPath -Force
+    }
+    & git -C $resolvedRepoRoot archive `
+        --format=zip `
+        "--prefix=$sourceName/" `
+        "--output=$sourceZipPath" `
+        HEAD
+    Assert-ExternalCommandSucceeded -ExitCode $LASTEXITCODE -Operation 'Source archive build'
+
     $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sourceHash = (Get-FileHash -LiteralPath $sourceZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $checksumPath = Join-Path $resolvedOutputDirectory 'SHA256SUMS.txt'
-    Set-Content -LiteralPath $checksumPath -Value "$hash  $zipName`n" -Encoding utf8 -NoNewline
+    Set-Content -LiteralPath $checksumPath `
+        -Value "$hash  $zipName`n$sourceHash  $sourceZipName`n" `
+        -Encoding utf8 `
+        -NoNewline
 
     [ordered]@{
         ok = $true
         artifact = $zipPath
+        sourceArtifact = $sourceZipPath
         checksums = $checksumPath
         version = [string]$package.version
     } | ConvertTo-Json -Compress | Write-Output

@@ -1,5 +1,5 @@
 From 51ab320878d311b9961e94a89d8b9c3d8dbf36b1 Mon Sep 17 00:00:00 2001
-From: wangwang <1280424159@qq.com>
+From: Everyone in Codex <noreply@everyone-in-codex.invalid>
 Date: Sat, 29 Aug 2026 20:14:55 +0800
 Subject: [PATCH 05/11] fix: harden Bigger Context submission protocol
 
@@ -2516,4 +2516,3 @@ index 232f4be..9fffde9 100644
 +});
 -- 
 2.55.0.windows.2
-

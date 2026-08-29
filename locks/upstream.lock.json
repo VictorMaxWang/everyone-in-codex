@@ -23,47 +23,47 @@
     "patchSeries": [
       {
         "file": "0001-docs-record-v4.0.5-migration-plan.patch",
-        "sha256": "777add7a70c7e9d03ed78805178e1d6ecbe574efc1d597ebd1926e1bd32a8380"
+        "sha256": "b0f4357a56aa43d58cb9f28d65a3f01d4568e8b1de039d7777f9a9c88a6c7555"
       },
       {
         "file": "0002-feat-preserve-external-Router-ownership.patch",
-        "sha256": "1846d94006d938282e24af051e38cf9141b9a98c7ad2fdb484ee058c243104fa"
+        "sha256": "04f9f5cd228aa197ed8e2824c1e0cb5d0e37ff358000882220059d2f04c0a4c5"
       },
       {
         "file": "0003-fix-complete-external-Router-setup-flow.patch",
-        "sha256": "e6d7e03c84c5b73715b02f9cb41038e8644f3235c5bd9a6c6018db1561aefa9a"
+        "sha256": "8cfb7bbbe67af543e5770c43662c09c0ba0acdc5ddf570869eed08e3a05dea90"
       },
       {
         "file": "0004-docs-refine-Bigger-Context-migration-task.patch",
-        "sha256": "5d43dcd7676c53227d8ad090c76d4c355385a5f75add039c1905cf9dcb959d94"
+        "sha256": "62d9ff89f19a8f144f7186fd803ef168f30e16acf250a6743ae6cf3521bc294b"
       },
       {
         "file": "0005-fix-harden-Bigger-Context-submission-protocol.patch",
-        "sha256": "0e9d9c0e3b1cce2a0e56707677f06caffa59ee4e48341154754d3b11861dfd0e"
+        "sha256": "4bd523547a7c94ba6b7d294221076905e92c9a2ac4e5dc83b433f118360dda1b"
       },
       {
         "file": "0006-fix-close-browser-helper-protocol-review-gaps.patch",
-        "sha256": "6a3db8cb0e66c041ebaf2508fe44fed566b68ca216109c9bd9aca4d629884403"
+        "sha256": "34acaaeffa2a328c6d3dfd388e4dbfb71538f3715889cb7986a80aca0769c1cd"
       },
       {
         "file": "0007-fix-close-browser-helper-protocol-races.patch",
-        "sha256": "5258f7a5ba5c2892012b725b460b56700c2c5134fa47c62845296b1bc77f88fa"
+        "sha256": "be9c5685af82c628311bf2c35b63ea777e56a1aebc80a907c668e601fdc9dae2"
       },
       {
         "file": "0008-fix-retry-initial-ChatGPT-navigation-once.patch",
-        "sha256": "33eb5a6a0bbe8a94b8691a9b27623756d14c2cf474d8467f28f11d943f75b8c2"
+        "sha256": "ff2153a81a1d0918368a41908a2392f59def9793b53b07053200021da5c20774"
       },
       {
         "file": "0009-fix-stop-retry-after-boundary-abort.patch",
-        "sha256": "554ebbb4123a1b8e79d39fa16bfbfb472854045db852e42972e6a953a02ea36e"
+        "sha256": "3e7cbf21ff7e872b4ff0ade121ac68178cb0b7e090a674db51d33849fc1199e0"
       },
       {
         "file": "0010-feat-restore-bundled-Pro-advisor-runtime.patch",
-        "sha256": "72161c2de29d1ba0eebb18981bb7128795aeadd995b5ce3d9c96e30f1c654805"
+        "sha256": "80facd8c713e269bb5ec24e03f2a7b3532102cc71f0774ec91699add212b621f"
       },
       {
         "file": "0011-fix-close-cancelled-advisors-and-cap-downloads.patch",
-        "sha256": "0baf5c89bd9f4c584c3ad1f6152d5b64de20ccc4aceb60f12bf37146eb3a7810"
+        "sha256": "33eeae2ed6080311256ba07abd361746ab052ef3fa52e59d9e17b57a9c5bdcbf"
       }
     ],
     "runtimeArtifacts": {

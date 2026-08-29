@@ -1,5 +1,5 @@
 From 31f0fad1a72b94a7b8558c402fdf9d142a45501c Mon Sep 17 00:00:00 2001
-From: wangwang <1280424159@qq.com>
+From: Everyone in Codex <noreply@everyone-in-codex.invalid>
 Date: Sat, 29 Aug 2026 19:13:04 +0800
 Subject: [PATCH 04/11] docs: refine Bigger Context migration task
 
@@ -28,4 +28,3 @@ index 5325593..00d7ed6 100644
  
 -- 
 2.55.0.windows.2
-

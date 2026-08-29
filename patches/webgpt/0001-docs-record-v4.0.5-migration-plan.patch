@@ -1,5 +1,5 @@
 From 67642a36cb240c26afafef7aac2625b01b251a24 Mon Sep 17 00:00:00 2001
-From: wangwang <1280424159@qq.com>
+From: Everyone in Codex <noreply@everyone-in-codex.invalid>
 Date: Sat, 29 Aug 2026 18:10:40 +0800
 Subject: [PATCH 01/11] docs: record v4.0.5 migration plan
 
@@ -65,4 +65,3 @@ index 0000000..5325593
 +- [ ] 验证 `/healthz`、Router 健康、目录不变；完整重启 Codex 后运行 Pro、四并发 Advisor 和 110k/205k/286k canary。
 -- 
 2.55.0.windows.2
-

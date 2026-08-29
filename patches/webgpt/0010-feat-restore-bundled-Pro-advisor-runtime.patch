@@ -1,5 +1,5 @@
 From 4e0c648d91acbbd7f4d96e8d9e89619ea5f43e07 Mon Sep 17 00:00:00 2001
-From: wangwang <1280424159@qq.com>
+From: Everyone in Codex <noreply@everyone-in-codex.invalid>
 Date: Sat, 29 Aug 2026 23:16:07 +0800
 Subject: [PATCH 10/11] feat: restore bundled Pro advisor runtime
 
@@ -5674,4 +5674,3 @@ index 5781551..374e091 100644
        process_running: true,
 -- 
 2.55.0.windows.2
-

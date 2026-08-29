@@ -225,6 +225,23 @@ test(
       } catch {
         copyFileSync(process.execPath, join(nodeRoot, "node.exe"));
       }
+      execFileSync("git", ["init", "-b", "main", fixtureRoot], { windowsHide: true });
+      execFileSync("git", ["-C", fixtureRoot, "add", "."], { windowsHide: true });
+      execFileSync(
+        "git",
+        [
+          "-C",
+          fixtureRoot,
+          "-c",
+          "user.name=Everyone in Codex Test",
+          "-c",
+          "user.email=noreply@everyone-in-codex.invalid",
+          "commit",
+          "-m",
+          "test fixture",
+        ],
+        { windowsHide: true },
+      );
 
       const result = spawnSync(
         "pwsh.exe",
@@ -249,7 +266,15 @@ test(
       const zipPath = join(outputRoot, zipName);
       assert.equal(existsSync(zipPath), true);
       const expectedHash = createHash("sha256").update(readFileSync(zipPath)).digest("hex");
-      assert.equal(readFileSync(join(outputRoot, "SHA256SUMS.txt"), "utf8"), `${expectedHash}  ${zipName}\n`);
+      const sourceZipName = "everyone-codex-9.8.7-source.zip";
+      const sourceZipPath = join(outputRoot, sourceZipName);
+      const expectedSourceHash = createHash("sha256")
+        .update(readFileSync(sourceZipPath))
+        .digest("hex");
+      assert.equal(
+        readFileSync(join(outputRoot, "SHA256SUMS.txt"), "utf8"),
+        `${expectedHash}  ${zipName}\n${expectedSourceHash}  ${sourceZipName}\n`,
+      );
 
       execFileSync("tar.exe", ["-xf", zipPath, "-C", expandedRoot], { windowsHide: true });
       const releaseRoot = join(expandedRoot, "everyone-codex-9.8.7-windows-x64");

@@ -1,5 +1,5 @@
 From aba44aea9cb4284ec28836ba5bc3d9dab9e2ae1c Mon Sep 17 00:00:00 2001
-From: wangwang <1280424159@qq.com>
+From: Everyone in Codex <noreply@everyone-in-codex.invalid>
 Date: Sat, 29 Aug 2026 21:14:58 +0800
 Subject: [PATCH 06/11] fix: close browser helper protocol review gaps
 
@@ -1461,4 +1461,3 @@ index 9fffde9..1dbea77 100644
 +});
 -- 
 2.55.0.windows.2
-
