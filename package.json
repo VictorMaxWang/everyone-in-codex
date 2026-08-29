@@ -10,6 +10,8 @@
   "scripts": {
     "test": "node --test tests/*.test.mjs",
     "check": "node scripts/check-sources.mjs",
+    "build:codexhost": "pwsh.exe -NoLogo -NoProfile -NonInteractive -File scripts/build-codexhost-payload.ps1",
+    "prepare:codexhost-payload": "node scripts/prepare-codexhost-payload.mjs",
     "package:win": "pwsh.exe -NoLogo -NoProfile -NonInteractive -File scripts/package-windows.ps1"
   },
   "engines": {
