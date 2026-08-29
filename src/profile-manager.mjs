@@ -61,9 +61,16 @@ function normalizeModels(models) {
   });
 }
 
-function profileContents(gatewayOrigin) {
+function tomlString(value) {
+  return JSON.stringify(String(value).replaceAll("\\", "/"));
+}
+
+function profileContents(gatewayOrigin, catalogPath) {
   return [
     "# 由 Everyone in Codex 管理；模型选择继续由 Codex UI 决定。",
+    'model_provider = "everyone-in-codex"',
+    `model_catalog_json = ${tomlString(catalogPath)}`,
+    "",
     "[model_providers.everyone-in-codex]",
     'name = "Everyone in Codex"',
     `base_url = "${gatewayOrigin}/v1"`,
@@ -102,7 +109,7 @@ export class ProfileManager {
   async publish({ gatewayBaseUrl, models }) {
     const gatewayOrigin = normalizeGatewayBaseUrl(gatewayBaseUrl);
     const normalizedModels = normalizeModels(models);
-    const profile = profileContents(gatewayOrigin);
+    const profile = profileContents(gatewayOrigin, this.catalogPath);
     const catalog = `${JSON.stringify({ version: 1, models: normalizedModels }, null, 2)}\n`;
 
     await mkdir(this.codexHome, { recursive: true });

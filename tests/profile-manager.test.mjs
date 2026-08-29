@@ -41,6 +41,11 @@ test("命名 Profile 发布和恢复不改变基础 config", async () => {
   assert.equal(JSON.stringify(receipt).includes("capability"), false);
 
   const profile = await readFile(receipt.profilePath, "utf8");
+  assert.match(profile, /^model_provider = "everyone-in-codex"$/m);
+  assert.equal(
+    profile.includes(`model_catalog_json = "${receipt.catalogPath.replaceAll("\\", "/")}"`),
+    true,
+  );
   assert.match(profile, /base_url = "http:\/\/127\.0\.0\.1:45678\/v1"/);
   assert.match(profile, /env_key = "EVERYONE_CODEX_LEASE_CAPABILITY"/);
   assert.doesNotMatch(profile, /^model\s*=/m);
