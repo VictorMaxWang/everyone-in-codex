@@ -63,6 +63,29 @@ test("portable release audit accepts only the documented public payload", () => 
   }
 });
 
+test("portable release audit permits generic Windows roots", () => {
+  const root = mkdtempSync(join(tmpdir(), "everyone-audit-drive-root-"));
+  try {
+    createPortableFixture(root);
+    write(
+      root,
+      "src/root.mjs",
+      [
+        String.raw`export const defaultCwd = "C:\\";`,
+        String.raw`export const systemRoot = "C:\\Windows";`,
+        String.raw`export const programFiles = "C:\\Program Files\\Example";`,
+        `export const schema = { ${["api", "Key"].join("")}: external_exports.string().min(1).optional() };`,
+      ].join("\n"),
+    );
+
+    const result = runAudit(root);
+
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("portable release audit rejects a file outside the release allowlist", () => {
   const root = mkdtempSync(join(tmpdir(), "everyone-audit-extra-"));
   try {
@@ -86,6 +109,7 @@ test("portable release audit rejects local identity and credential traces", asyn
     ["Codex task URL", `codex://${"threads"}/00000000-0000-0000-0000-000000000000`],
     ["API key", `sk-${"a".repeat(40)}`],
     ["bearer token", `Bearer ${"b".repeat(40)}`],
+    ["assigned token", `${["auth", "token"].join("_")} = "${"c".repeat(40)}"`],
     ...(process.env.USERNAME ? [["current username", `build owner: ${process.env.USERNAME}`]] : []),
   ];
 

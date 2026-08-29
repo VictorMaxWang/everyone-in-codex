@@ -40,7 +40,12 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 
 const FORBIDDEN_CONTENT = [
-  { name: "local drive path", pattern: /(?:^|[\s"'=(])(?:[A-Za-z]:[\\/])[^\s"'<>]*/m },
+  // `C:\\` 及 Windows/Program Files 等公共系统根是可移植默认值；其他盘符路径才是泄漏。
+  {
+    name: "local drive path",
+    pattern:
+      /(?:^|[\s"'=(])(?:[A-Za-z]:[\\/]+)(?!(?:Windows|Program Files(?: \(x86\))?|ProgramData)(?:[\\/]|[\s"'<>]|$))(?=[^\\/\s"'<>])[^\s"'<>]*/im,
+  },
   { name: "Windows user profile", pattern: /\\Users\\[^\\\s"'<>]+/i },
   { name: "Codex 2 profile", pattern: /CodexProfiles[\\/]second/i },
   { name: "Codex task URL", pattern: /codex:\/\/threads\/[0-9a-f-]+/i },
@@ -49,7 +54,8 @@ const FORBIDDEN_CONTENT = [
   { name: "bearer token", pattern: /\bBearer\s+[A-Za-z0-9._~+/-]{20,}={0,2}\b/i },
   {
     name: "assigned key or token",
-    pattern: /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token)\b\s*[:=]\s*["']?[A-Za-z0-9._~+/-]{20,}/i,
+    pattern:
+      /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token)\b\s*[:=]\s*["'][A-Za-z0-9._~+/-]{20,}["']/i,
   },
 ];
 
