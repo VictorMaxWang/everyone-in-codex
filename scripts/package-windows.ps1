@@ -103,6 +103,9 @@ try {
     Copy-DirectoryContents `
         -Source (Join-Path $resolvedRepoRoot 'locks') `
         -Destination (Join-Path $stagingRoot 'locks')
+    Copy-DirectoryContents `
+        -Source (Join-Path $resolvedRepoRoot 'config') `
+        -Destination (Join-Path $stagingRoot 'config')
 
     if (-not $NodeRoot) {
         if ($env:EVERYONE_CODEX_NODE_ROOT) {

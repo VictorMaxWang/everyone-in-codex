@@ -10,7 +10,7 @@ The project deliberately keeps three responsibilities separate:
 
 ## Safety defaults
 
-- The base Codex Profile is never rewritten. A named `everyone-in-codex` profile is layered for the managed launch.
+- The base Codex Profile is never rewritten. The managed launch publishes an owned catalog and passes only seven allowlisted `-c` overrides to `app-server`.
 - Router and WebGPT are external dependencies. This CLI does not start, stop, restart, repair or upgrade them.
 - The Router caller capability remains in the gateway process memory and is never exposed to a Harness.
 - Models are capability-filtered. WebGPT models are visible only to the Codex Harness.
@@ -28,3 +28,9 @@ everyone-codex restore
 ```
 
 The implementation is under active development. Until a portable release is produced, run commands only from a trusted source checkout.
+
+For a local or portable setup, copy the two templates in `config/` to
+`fusion.local.json` and `validation-policy.local.json`, then replace every
+placeholder with the exact Codex 2, Router and Desktop paths. All four Codex 2
+paths must be explicitly allowlisted; any symlink or Windows reparse ancestor is
+rejected before a process starts.

@@ -35,6 +35,8 @@ function createPortableFixture(root) {
   write(root, "package.json", '{"name":"fixture","version":"1.2.3","type":"module"}\n');
   write(root, "bin/everyone-codex.cmd", "@echo off\r\n");
   write(root, "src/cli.mjs", 'if (process.argv.includes("--help")) console.log("help");\n');
+  write(root, "config/fusion.example.json", '{"schemaVersion":1}\n');
+  write(root, "config/validation-policy.example.json", '{"schemaVersion":1}\n');
   write(root, "runtime/node/node.exe", "fixture-binary");
   write(root, "runtime/node/LICENSE", "Node.js license fixture\n");
 }
@@ -208,6 +210,8 @@ test(
         '{"name":"everyone-in-codex","version":"9.8.7","type":"module"}\n',
       );
       write(fixtureRoot, "src/cli.mjs", 'if (process.argv.includes("--help")) console.log("help");\n');
+      write(fixtureRoot, "config/fusion.example.json", '{"schemaVersion":1}\n');
+      write(fixtureRoot, "config/validation-policy.example.json", '{"schemaVersion":1}\n');
       write(
         fixtureRoot,
         "locks/toolchains.lock.json",
@@ -254,6 +258,11 @@ test(
         ["LICENSE", "node.exe"],
       );
       assert.equal(existsSync(join(releaseRoot, "bin", "everyone-codex.cmd")), true);
+      assert.equal(existsSync(join(releaseRoot, "config", "fusion.example.json")), true);
+      assert.equal(
+        existsSync(join(releaseRoot, "config", "validation-policy.example.json")),
+        true,
+      );
       assert.equal(existsSync(join(releaseRoot, "patches")), false);
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });

@@ -10,6 +10,8 @@ const REQUIRED_PORTABLE_FILES = [
   "package.json",
   "bin/everyone-codex.cmd",
   "src/cli.mjs",
+  "config/fusion.example.json",
+  "config/validation-policy.example.json",
   "runtime/node/node.exe",
   "runtime/node/LICENSE",
 ];
@@ -18,6 +20,7 @@ const ALLOWED_PORTABLE_PATHS = [
   /^(?:README\.md|LICENSE|THIRD_PARTY_NOTICES\.md|package\.json|release-manifest\.json)$/,
   /^bin\/everyone-codex\.cmd$/,
   /^src\/[A-Za-z0-9._/-]+\.(?:mjs|json|md)$/,
+  /^config\/[A-Za-z0-9._/-]+\.json$/,
   /^locks\/[A-Za-z0-9._/-]+\.json$/,
   /^runtime\/node\/(?:node\.exe|LICENSE)$/,
   /^runtime\/codexhost\/[A-Za-z0-9._/-]+\.(?:exe|dll|node|js|mjs|cjs|json|wasm|pak|bin|dat|txt|md|html|css|png|ico)$/,
