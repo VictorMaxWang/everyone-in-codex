@@ -108,7 +108,9 @@ test("Gateway 不向调用方透出 Router 错误正文或 capability", async (t
 test("Gateway 只为 Grok 补全 Responses SSE sequence_number", async (t) => {
   const router = createServer((_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
-    response.write('data: {"type":"response.created","response":{"id":"r1"}}\n');
+    response.write(
+      'data: {"type":"response.output_item.added","item":{"type":"reasoning","id":"r1"}}\n',
+    );
     response.write("\n");
     response.end('data: {"type":"response.completed","sequence_number":7}\n\n');
   });
@@ -133,4 +135,5 @@ test("Gateway 只为 Grok 补全 Responses SSE sequence_number", async (t) => {
     .map((line) => JSON.parse(line.slice("data:".length)));
 
   assert.deepEqual(events.map((event) => event.sequence_number), [0, 7]);
+  assert.deepEqual(events[0].item.summary, []);
 });

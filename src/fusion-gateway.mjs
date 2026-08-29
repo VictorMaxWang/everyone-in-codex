@@ -71,9 +71,19 @@ function grokSseSequenceTransform() {
       ) return line;
       if (Number.isInteger(event.sequence_number) && event.sequence_number >= 0) {
         sequenceNumber = Math.max(sequenceNumber, event.sequence_number + 1);
-        return line;
+      } else {
+        event.sequence_number = sequenceNumber++;
       }
-      return `data: ${JSON.stringify({ ...event, sequence_number: sequenceNumber++ })}`;
+      const pending = [event];
+      while (pending.length > 0) {
+        const value = pending.pop();
+        if (!value || typeof value !== "object") continue;
+        if (value.type === "reasoning" && !Object.hasOwn(value, "summary")) value.summary = [];
+        for (const nested of Object.values(value)) {
+          if (nested && typeof nested === "object") pending.push(nested);
+        }
+      }
+      return `data: ${JSON.stringify(event)}`;
     } catch {
       return line;
     }
