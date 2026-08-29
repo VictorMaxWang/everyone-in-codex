@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "codexhost": {
+    "repository": "https://github.com/BytePioneer-AI/codex-host.git",
+    "tag": "v0.3.5",
+    "commit": "c2b3b9984f23405f66c6f061a6889569b30c37ae"
+  },
+  "webgpt": {
+    "repository": "https://github.com/miuuyy/codex-chatgpt-web.git",
+    "tag": "v4.0.5",
+    "baseCommit": "d638315",
+    "integrationCommit": "46ba4a6abfeb70cdd4a396882568149d4655fbea"
+  },
+  "router": {
+    "minimumVersion": "0.4.0-beta.4",
+    "mode": "external"
+  }
+}

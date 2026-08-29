@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "harnesses": [
+    { "id": "pi", "version": "0.84.4", "command": "pi", "compatibility": "full", "routerProtocol": "openai-responses" },
+    { "id": "omp", "version": "18.0.10", "command": "omp", "compatibility": "inference-only", "routerProtocol": "openai-responses" },
+    { "id": "deepseek-harness", "version": "0.1.1-rc.2", "command": "dsh", "compatibility": "full-preview", "routerProtocol": "openai-responses" },
+    { "id": "grok", "version": "1.0.13", "command": "grok", "compatibility": "probe-required", "routerProtocol": "openai-responses" },
+    { "id": "claude-code", "version": "2.1.220", "command": "claude", "compatibility": "native-only", "routerProtocol": null }
+  ]
+}
