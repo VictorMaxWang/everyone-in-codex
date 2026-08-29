@@ -112,7 +112,9 @@ test("Gateway 只为 Grok 补全 Responses SSE sequence_number", async (t) => {
       'data: {"type":"response.output_item.added","item":{"type":"reasoning","id":"r1"}}\n',
     );
     response.write("\n");
-    response.end('data: {"type":"response.completed","sequence_number":7}\n\n');
+    response.end(
+      'data: {"type":"response.completed","sequence_number":7,"response":{"text":{}}}\n\n',
+    );
   });
   const routerBaseUrl = `${await listen(router)}/_codex-router/upstream-secret-value/v1/`;
   t.after(() => close(router));
@@ -136,4 +138,5 @@ test("Gateway 只为 Grok 补全 Responses SSE sequence_number", async (t) => {
 
   assert.deepEqual(events.map((event) => event.sequence_number), [0, 7]);
   assert.deepEqual(events[0].item.summary, []);
+  assert.deepEqual(events[1].response.text.format, { type: "text" });
 });

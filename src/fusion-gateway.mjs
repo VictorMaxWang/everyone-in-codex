@@ -79,6 +79,15 @@ function grokSseSequenceTransform() {
         const value = pending.pop();
         if (!value || typeof value !== "object") continue;
         if (value.type === "reasoning" && !Object.hasOwn(value, "summary")) value.summary = [];
+        if (
+          Object.hasOwn(value, "text")
+          && value.text
+          && typeof value.text === "object"
+          && !Array.isArray(value.text)
+          && !Object.hasOwn(value.text, "format")
+        ) {
+          value.text.format = { type: "text" };
+        }
         for (const nested of Object.values(value)) {
           if (nested && typeof nested === "object") pending.push(nested);
         }
