@@ -1,0 +1,1874 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Everyone in Codex <noreply@everyone-in-codex.invalid>
+Date: Sun, 30 Aug 2026 05:20:30 +0800
+Subject: [PATCH] feat: isolate Codex Desktop profiles
+
+---
+ crates/launcher/src/main.rs                   | 124 ++++++++++--
+ crates/launcher/src/runtime_instance.rs       |  54 +++++-
+ crates/shim/src/lib.rs                        | 177 +++++++++++++++++-
+ .../src/deepseek-harness-adapter.ts           |  69 ++++++-
+ .../test/deepseek-harness-adapter.test.ts     |  42 ++++-
+ packages/adapters/grok/src/acp-transport.ts   |  19 +-
+ packages/adapters/grok/src/command.ts         |   3 +-
+ packages/adapters/grok/src/grok-adapter.ts    |  33 +++-
+ packages/adapters/grok/src/grok-models.ts     |  70 ++++++-
+ packages/adapters/grok/src/index.ts           |   1 +
+ .../adapters/grok/test/grok-adapter.test.ts   |  36 ++++
+ .../grok/test/grok-environment.test.ts        |  23 +++
+ packages/adapters/omp/src/omp-adapter.ts      |  45 ++++-
+ packages/adapters/omp/src/omp-rpc-session.ts  |  10 +-
+ .../adapters/omp/test/omp-adapter.test.ts     |  50 ++++-
+ .../adapters/omp/test/omp-rpc-session.test.ts |  48 +++++
+ packages/adapters/pi/src/pi-rpc-session.ts    |   3 +-
+ .../adapters/pi/test/pi-rpc-session.test.ts   |  33 ++++
+ .../host-runtime/src/adapter-composition.ts   | 159 +++++++++++++++-
+ packages/host-runtime/src/index.ts            |   8 +
+ .../test/adapter-composition.test.ts          |  67 +++++++
+ 21 files changed, 1017 insertions(+), 57 deletions(-)
+ create mode 100644 packages/adapters/grok/test/grok-environment.test.ts
+
+diff --git a/crates/launcher/src/main.rs b/crates/launcher/src/main.rs
+index 9fc2c11..eff9392 100644
+--- a/crates/launcher/src/main.rs
++++ b/crates/launcher/src/main.rs
+@@ -60,6 +60,7 @@ use system_proxy_environment::launcher_proxy_environment;
+ const HOST_NODE_PATH_ENV: &str = "CODEXHOST_HOST_NODE_PATH";
+ const HOST_RUNTIME_PATH_ENV: &str = "CODEXHOST_HOST_RUNTIME_PATH";
+ const DATA_DIRECTORY_ENV: &str = "CODEXHOST_DATA_DIR";
++const CODEX_CONFIG_OVERRIDES_ENV: &str = "CODEXHOST_CODEX_CONFIG_OVERRIDES";
+ const REMOTE_SSH_MANAGED_ENV: &str = "CODEXHOST_REMOTE_SSH_MANAGED";
+ const PI_COMMAND_ENV: &str = "CODEXHOST_PI_COMMAND";
+ const DEFAULT_AGENT_ENV: &str = "CODEXHOST_DEFAULT_AGENT";
+@@ -112,7 +113,7 @@ impl Error for UnmanagedDesktopConflict {}
+ 
+ fn usage() {
+     eprintln!(
+-        "usage:\n  codexhost\n  codexhost inspect [--custom-install <absolute-directory>]\n  codexhost launch [--shim <absolute-file>] [--node <absolute-file>] [--host-runtime <absolute-file>] [--desktop-controller <absolute-file>] [--renderer <absolute-file>] [--pi <absolute-file>] [--custom-install <absolute-directory>]"
++        "usage:\n  codexhost\n  codexhost inspect [--custom-install <absolute-directory>]\n  codexhost launch [--shim <absolute-file>] [--node <absolute-file>] [--host-runtime <absolute-file>] [--desktop-controller <absolute-file>] [--renderer <absolute-file>] [--pi <absolute-file>] [--custom-install <absolute-directory>] [--desktop-user-data-dir <absolute-existing-directory>]"
+     );
+ }
+ 
+@@ -231,6 +232,7 @@ struct LaunchOptions {
+     renderer_extension: Option<PathBuf>,
+     pi: Option<PathBuf>,
+     custom_install_root: Option<PathBuf>,
++    desktop_user_data_dir: Option<PathBuf>,
+ }
+ 
+ #[derive(Debug)]
+@@ -242,6 +244,7 @@ struct ResolvedLaunchOptions {
+     renderer_extension: PathBuf,
+     pi: Option<PathBuf>,
+     custom_install_root: Option<PathBuf>,
++    desktop_user_data_dir: Option<PathBuf>,
+ }
+ 
+ fn required_path(arguments: &[String], index: &mut usize, option: &str) -> Result<PathBuf, String> {
+@@ -260,6 +263,7 @@ fn parse_launch_options(arguments: &[String]) -> Result<LaunchOptions, String> {
+     let mut renderer_extension = None;
+     let mut pi = None;
+     let mut custom_install_root = None;
++    let mut desktop_user_data_dir = None;
+     let mut index = 0;
+     while index < arguments.len() {
+         match arguments[index].as_str() {
+@@ -283,6 +287,13 @@ fn parse_launch_options(arguments: &[String]) -> Result<LaunchOptions, String> {
+                 custom_install_root =
+                     Some(required_path(arguments, &mut index, "--custom-install")?)
+             }
++            "--desktop-user-data-dir" => {
++                desktop_user_data_dir = Some(required_path(
++                    arguments,
++                    &mut index,
++                    "--desktop-user-data-dir",
++                )?)
++            }
+             unknown => return Err(format!("unknown launch option: {unknown}")),
+         }
+         index += 1;
+@@ -295,6 +306,7 @@ fn parse_launch_options(arguments: &[String]) -> Result<LaunchOptions, String> {
+         renderer_extension,
+         pi,
+         custom_install_root,
++        desktop_user_data_dir,
+     })
+ }
+ 
+@@ -382,10 +394,30 @@ impl LaunchOptions {
+                 .custom_install_root
+                 .map(|path| absolute_directory(&path, "--custom-install"))
+                 .transpose()?,
++            desktop_user_data_dir: self
++                .desktop_user_data_dir
++                .map(|path| absolute_directory(&path, "--desktop-user-data-dir"))
++                .transpose()?,
+         })
+     }
+ }
+ 
++/// Build the ephemeral Electron arguments owned by this Launcher invocation.
++fn desktop_arguments(options: &ResolvedLaunchOptions, control: &RuntimeControl) -> Vec<OsString> {
++    let mut arguments = vec![control.inspector_argument.clone()];
++    if let Some(directory) = &options.desktop_user_data_dir {
++        // 使用单个 `--user-data-dir=` 参数，避免 Windows 路径中的空格被二次拆分。
++        let mut argument = OsString::from("--user-data-dir=");
++        argument.push(directory.as_os_str());
++        arguments.push(argument);
++    }
++    arguments
++}
++
++fn external_desktop_restart_allowed(custom_install_root: Option<&Path>) -> bool {
++    custom_install_root.is_none()
++}
++
+ fn desktop_controller_command(
+     options: &ResolvedLaunchOptions,
+     control: &RuntimeControl,
+@@ -775,6 +807,7 @@ fn desktop_environment(
+     launcher_executable: &Path,
+     descriptor_path: &Path,
+     data_directory: Option<OsString>,
++    codex_config_overrides: Option<OsString>,
+ ) -> Vec<(OsString, OsString)> {
+     let mut environment = vec![
+         (
+@@ -816,6 +849,9 @@ fn desktop_environment(
+     if let Some(data_directory) = data_directory {
+         environment.push((OsString::from(DATA_DIRECTORY_ENV), data_directory));
+     }
++    if let Some(overrides) = codex_config_overrides {
++        environment.push((OsString::from(CODEX_CONFIG_OVERRIDES_ENV), overrides));
++    }
+     if env::var_os(STARTUP_TRACE_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+         environment.push((OsString::from(STARTUP_TRACE_ENV), OsString::from("1")));
+     }
+@@ -941,6 +977,11 @@ fn launch(
+                 }
+                 #[cfg(target_os = "windows")]
+                 {
++                    // 自定义安装可能属于另一套 Codex Profile；没有本 Launcher 的 live
++                    // descriptor 时绝不终止它，避免误伤并行运行的 Desktop。
++                    if !external_desktop_restart_allowed(options.custom_install_root.as_deref()) {
++                        return Err(Box::new(UnmanagedDesktopConflict));
++                    }
+                     if _interactive_running_desktop {
+                         match prompt_running_desktop() {
+                             RunningDesktopChoice::Restart => {
+@@ -954,7 +995,7 @@ fn launch(
+                             RunningDesktopChoice::Cancel => return Ok(()),
+                         }
+                     }
+-                    // A Desktop is running without a live codexhost owner (an official
++                    // A stock Desktop is running without a live codexhost owner (an official
+                     // instance or a controlled instance whose Launcher exited). Drop the
+                     // stale runtime descriptor, force-stop the Desktop, and relaunch.
+                     if let Some(descriptor) = &descriptor {
+@@ -985,6 +1026,7 @@ fn launch(
+                 env::var_os(DATA_DIRECTORY_ENV),
+                 env::var_os(REMOTE_SSH_MANAGED_ENV),
+             ),
++            env::var_os(CODEX_CONFIG_OVERRIDES_ENV),
+         );
+         #[cfg(target_os = "macos")]
+         let environment = {
+@@ -992,10 +1034,11 @@ fn launch(
+             environment.extend(launcher_proxy_environment());
+             environment
+         };
++        let desktop_arguments = desktop_arguments(&options, &control);
+         let result = supervise_desktop(
+             &installation,
+             &options,
+-            std::slice::from_ref(&control.inspector_argument),
++            &desktop_arguments,
+             &environment,
+             &control,
+             &descriptor_path,
+@@ -1082,11 +1125,13 @@ fn launch(
+             env::var_os(DATA_DIRECTORY_ENV),
+             env::var_os(REMOTE_SSH_MANAGED_ENV),
+         ),
++        env::var_os(CODEX_CONFIG_OVERRIDES_ENV),
+     );
++    let desktop_arguments = desktop_arguments(&options, &control);
+     supervise_desktop(
+         &installation,
+         &options,
+-        std::slice::from_ref(&control.inspector_argument),
++        &desktop_arguments,
+         &environment,
+         &control,
+         &descriptor_path,
+@@ -1102,6 +1147,7 @@ fn default_launch_options() -> LaunchOptions {
+         renderer_extension: None,
+         pi: None,
+         custom_install_root: None,
++        desktop_user_data_dir: None,
+     }
+ }
+ 
+@@ -1185,13 +1231,15 @@ mod tests {
+     #[cfg(target_os = "windows")]
+     use super::wait_for_desktop_exit;
+     use super::{
+-        CONTROL_NONCE_ENV, CONTROL_PORT_ENV, DEFAULT_AGENT_ENV, HOST_NODE_PATH_ENV,
+-        LAUNCHER_EXECUTABLE_ENV, LAUNCHER_PID_ENV, NPM_CLI_PATH_ENV, NPM_LAUNCHER_PATH_ENV,
+-        NPM_NODE_PATH_ENV, NPM_PACKAGE_ROOT_ENV, RUNTIME_DESCRIPTOR_PATH_ENV,
+-        ResolvedLaunchOptions, RuntimeControl, STARTUP_TRACE_ENV, absolute_directory,
+-        allocate_runtime_control, desktop_controller_command, desktop_environment, emit_ready_line,
+-        managed_desktop_data_directory, npm_update_runtime_environment, parse_inspect_options,
+-        parse_launch_options, read_bounded_controller_line,
++        CODEX_CONFIG_OVERRIDES_ENV, CONTROL_NONCE_ENV, CONTROL_PORT_ENV, DEFAULT_AGENT_ENV,
++        HOST_NODE_PATH_ENV, LAUNCHER_EXECUTABLE_ENV, LAUNCHER_PID_ENV, NPM_CLI_PATH_ENV,
++        NPM_LAUNCHER_PATH_ENV, NPM_NODE_PATH_ENV, NPM_PACKAGE_ROOT_ENV,
++        RUNTIME_DESCRIPTOR_PATH_ENV, ResolvedLaunchOptions, RuntimeControl, STARTUP_TRACE_ENV,
++        absolute_directory, allocate_runtime_control, desktop_arguments,
++        desktop_controller_command, desktop_environment, emit_ready_line,
++        external_desktop_restart_allowed, managed_desktop_data_directory,
++        npm_update_runtime_environment, parse_inspect_options, parse_launch_options,
++        read_bounded_controller_line,
+     };
+     #[test]
+     fn ready_line_is_the_exact_wrapper_protocol() {
+@@ -1316,6 +1364,30 @@ mod tests {
+         assert_eq!(parse_inspect_options(&[]).expect("bare inspect"), None);
+     }
+ 
++    #[test]
++    fn desktop_user_data_directory_is_forwarded_as_one_electron_argument() {
++        let directory = std::env::temp_dir();
++        let parsed = parse_launch_options(&[
++            "--desktop-user-data-dir".into(),
++            directory.to_string_lossy().into_owned(),
++        ])
++        .expect("launch accepts a Desktop user-data directory");
++
++        assert_eq!(
++            parsed.desktop_user_data_dir.as_deref(),
++            Some(directory.as_path())
++        );
++        let options = ResolvedLaunchOptions {
++            desktop_user_data_dir: Some(directory.clone()),
++            ..resolved_options()
++        };
++        let arguments = desktop_arguments(&options, &runtime_control());
++        assert_eq!(arguments[0], "--inspect=127.0.0.1:43123");
++        let mut expected = OsString::from("--user-data-dir=");
++        expected.push(directory.as_os_str());
++        assert_eq!(arguments[1], expected);
++    }
++
+     #[test]
+     fn removed_agent_option_is_rejected() {
+         assert!(parse_launch_options(&["--agent".into(), "pi".into()]).is_err());
+@@ -1324,6 +1396,7 @@ mod tests {
+     #[test]
+     fn custom_install_root_rejects_missing_values_and_unknown_options() {
+         assert!(parse_launch_options(&["--custom-install".into()]).is_err());
++        assert!(parse_launch_options(&["--desktop-user-data-dir".into()]).is_err());
+         assert!(parse_inspect_options(&["--custom-install".into()]).is_err());
+         assert!(parse_inspect_options(&["--unknown".into()]).is_err());
+     }
+@@ -1341,6 +1414,14 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn unmanaged_custom_install_is_never_eligible_for_forced_restart() {
++        assert!(!external_desktop_restart_allowed(Some(Path::new(
++            "/opt/CodexPortable"
++        ))));
++        assert!(external_desktop_restart_allowed(None));
++    }
++
+     fn resolved_options() -> ResolvedLaunchOptions {
+         ResolvedLaunchOptions {
+             shim: PathBuf::from("/opt/codexhost-shim"),
+@@ -1350,6 +1431,7 @@ mod tests {
+             renderer_extension: PathBuf::from("/opt/renderer-extension.js"),
+             pi: None,
+             custom_install_root: None,
++            desktop_user_data_dir: None,
+         }
+     }
+ 
+@@ -1412,6 +1494,7 @@ mod tests {
+             Path::new("/opt/codexhost"),
+             Path::new("/run/user/1000/codexhost/desktop-runtime-v1.json"),
+             None,
++            None,
+         );
+         let value = |name: &str| {
+             environment
+@@ -1499,6 +1582,7 @@ mod tests {
+             Path::new("/opt/codexhost"),
+             Path::new("/run/user/1000/codexhost/desktop-runtime-v1.json"),
+             Some(OsString::from("/home/codex/.codexhost")),
++            None,
+         );
+ 
+         assert!(environment.contains(&(
+@@ -1507,6 +1591,23 @@ mod tests {
+         )));
+     }
+ 
++    #[test]
++    fn desktop_environment_propagates_codex_config_overrides_to_the_shim() {
++        let overrides = OsString::from(
++            "model_provider=\"everyone-in-codex\"\u{1f}model_catalog_json=\"C:/safe/models.json\"",
++        );
++        let environment = desktop_environment(
++            &resolved_options(),
++            &runtime_control(),
++            Path::new("/opt/codexhost"),
++            Path::new("/run/user/1000/codexhost/desktop-runtime-v1.json"),
++            None,
++            Some(overrides.clone()),
++        );
++
++        assert!(environment.contains(&(OsString::from(CODEX_CONFIG_OVERRIDES_ENV), overrides,)));
++    }
++
+     #[test]
+     fn managed_desktop_data_directory_rejects_a_remote_profile_value() {
+         let remote_data = Some(OsString::from("/home/codex/.codexhost/remote/data"));
+@@ -1646,6 +1747,7 @@ mod tests {
+                 Path::new(r"C:\codexhost.exe"),
+                 Path::new(r"C:\Users\Codex\AppData\Local\codexhost\desktop-runtime-v1.json"),
+                 None,
++                None,
+             )
+             .into_iter()
+             .find(|(name, _)| name == PI_COMMAND_ENV)
+diff --git a/crates/launcher/src/runtime_instance.rs b/crates/launcher/src/runtime_instance.rs
+index cdfa045..f885576 100644
+--- a/crates/launcher/src/runtime_instance.rs
++++ b/crates/launcher/src/runtime_instance.rs
+@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
+ const RUNTIME_DESCRIPTOR_VERSION: u8 = 1;
+ const RUNTIME_DESCRIPTOR_FILE: &str = "desktop-runtime-v1.json";
+ const LAUNCHER_GUARD_FILE: &str = "launcher-v1.lock";
++#[cfg(target_os = "windows")]
++const DATA_DIRECTORY_ENV: &str = "CODEXHOST_DATA_DIR";
+ #[cfg(target_os = "linux")]
+ const MAX_RUNTIME_DESCRIPTOR_BYTES: usize = 4 * 1024;
+ 
+@@ -116,11 +118,35 @@ pub fn default_descriptor_path() -> io::Result<PathBuf> {
+ }
+ 
+ #[cfg(target_os = "windows")]
+-pub fn default_descriptor_path() -> io::Result<PathBuf> {
+-    let root = env::var_os("LOCALAPPDATA")
++fn windows_state_directory(
++    data_directory: Option<std::ffi::OsString>,
++    local_app_data: Option<std::ffi::OsString>,
++) -> io::Result<PathBuf> {
++    if let Some(data_directory) = data_directory {
++        let path = PathBuf::from(data_directory);
++        if !path.is_absolute() {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "CODEXHOST_DATA_DIR must be an absolute path",
++            ));
++        }
++        return Ok(path);
++    }
++
++    local_app_data
+         .map(PathBuf::from)
+-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable"))?;
+-    Ok(root.join("codexhost").join(RUNTIME_DESCRIPTOR_FILE))
++        .map(|root| root.join("codexhost"))
++        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable"))
++}
++
++#[cfg(target_os = "windows")]
++pub fn default_descriptor_path() -> io::Result<PathBuf> {
++    // descriptor、Launcher guard 和 update state 都从此入口派生；优先采用
++    // Profile 专属目录可避免两套 Codex Desktop 竞争同一份运行状态。
++    Ok(
++        windows_state_directory(env::var_os(DATA_DIRECTORY_ENV), env::var_os("LOCALAPPDATA"))?
++            .join(RUNTIME_DESCRIPTOR_FILE),
++    )
+ }
+ 
+ #[cfg(target_os = "macos")]
+@@ -416,6 +442,26 @@ mod tests {
+         fs::remove_dir_all(path.parent().expect("fixture parent")).expect("remove fixture");
+     }
+ 
++    #[cfg(target_os = "windows")]
++    #[test]
++    fn windows_runtime_state_prefers_an_absolute_profile_data_directory() {
++        assert_eq!(
++            windows_state_directory(
++                Some(std::ffi::OsString::from(r"D:\EveryoneCodex\codexhost")),
++                Some(std::ffi::OsString::from(r"C:\Users\Codex\AppData\Local")),
++            )
++            .expect("absolute profile state"),
++            PathBuf::from(r"D:\EveryoneCodex\codexhost")
++        );
++        assert!(
++            windows_state_directory(
++                Some(std::ffi::OsString::from("relative-state")),
++                Some(std::ffi::OsString::from(r"C:\Users\Codex\AppData\Local")),
++            )
++            .is_err()
++        );
++    }
++
+     #[test]
+     fn descriptor_guard_removes_only_its_published_value() {
+         let path = fixture_path("runtime-guard");
+diff --git a/crates/shim/src/lib.rs b/crates/shim/src/lib.rs
+index 3c98a1c..b493ac1 100644
+--- a/crates/shim/src/lib.rs
++++ b/crates/shim/src/lib.rs
+@@ -27,6 +27,7 @@ pub const HOST_NODE_PATH_ENV: &str = "CODEXHOST_HOST_NODE_PATH";
+ pub const HOST_RUNTIME_PATH_ENV: &str = "CODEXHOST_HOST_RUNTIME_PATH";
+ pub const REMOTE_SSH_MANAGED_ENV: &str = "CODEXHOST_REMOTE_SSH_MANAGED";
+ const DATA_DIRECTORY_ENV: &str = "CODEXHOST_DATA_DIR";
++const CODEX_CONFIG_OVERRIDES_ENV: &str = "CODEXHOST_CODEX_CONFIG_OVERRIDES";
+ const LAUNCHER_PID_ENV: &str = "CODEXHOST_LAUNCHER_PID";
+ const NPM_NODE_PATH_ENV: &str = "CODEXHOST_NPM_NODE_PATH";
+ const NPM_PACKAGE_ROOT_ENV: &str = "CODEXHOST_NPM_PACKAGE_ROOT";
+@@ -290,6 +291,104 @@ pub fn app_server_subcommand_index(arguments: &[OsString]) -> Option<usize> {
+     None
+ }
+ 
++fn codex_config_override_arguments(
++    arguments: &[OsString],
++    encoded: Option<OsString>,
++) -> ShimResult<Vec<OsString>> {
++    let Some(app_server_index) = app_server_subcommand_index(arguments) else {
++        return Ok(arguments.to_vec());
++    };
++    let Some(encoded) = encoded else {
++        return Ok(arguments.to_vec());
++    };
++    let text = encoded
++        .to_str()
++        .ok_or("CODEXHOST_CODEX_CONFIG_OVERRIDES must be UTF-8")?;
++    if text.is_empty()
++        || text.len() > 8192
++        || text
++            .chars()
++            .any(|character| matches!(character, '\r' | '\n' | '\0'))
++    {
++        return Err("CODEXHOST_CODEX_CONFIG_OVERRIDES has an invalid shape".into());
++    }
++    let required = [
++        "model_provider",
++        "model_catalog_json",
++        "model_providers.everyone-in-codex.name",
++        "model_providers.everyone-in-codex.base_url",
++        "model_providers.everyone-in-codex.wire_api",
++        "model_providers.everyone-in-codex.requires_openai_auth",
++        "model_providers.everyone-in-codex.env_key",
++    ];
++    let overrides = text.split('\u{1f}').collect::<Vec<_>>();
++    if overrides.len() != required.len() {
++        return Err("CODEXHOST_CODEX_CONFIG_OVERRIDES must contain all required keys".into());
++    }
++    let mut seen = std::collections::HashSet::new();
++    for assignment in &overrides {
++        let Some((key, value)) = assignment.split_once('=') else {
++            return Err("CODEXHOST_CODEX_CONFIG_OVERRIDES contains an invalid assignment".into());
++        };
++        if !required.contains(&key) || !seen.insert(key) {
++            return Err("CODEXHOST_CODEX_CONFIG_OVERRIDES contains a duplicate key".into());
++        }
++        let valid = match key {
++            "model_provider" => value == r#""everyone-in-codex""#,
++            "model_catalog_json" => valid_catalog_override_path(value),
++            "model_providers.everyone-in-codex.name" => value == r#""Everyone in Codex""#,
++            "model_providers.everyone-in-codex.base_url" => valid_gateway_base_url(value),
++            "model_providers.everyone-in-codex.wire_api" => value == r#""responses""#,
++            "model_providers.everyone-in-codex.requires_openai_auth" => value == "false",
++            "model_providers.everyone-in-codex.env_key" => {
++                value == r#""EVERYONE_CODEX_LEASE_CAPABILITY""#
++            }
++            _ => false,
++        };
++        if !valid {
++            return Err("CODEXHOST_CODEX_CONFIG_OVERRIDES contains an unsafe value".into());
++        }
++    }
++    let mut routed = arguments.to_vec();
++    let injected = overrides
++        .into_iter()
++        .flat_map(|value| [OsString::from("-c"), OsString::from(value)])
++        .collect::<Vec<_>>();
++    routed.splice(app_server_index..app_server_index, injected);
++    Ok(routed)
++}
++
++fn valid_catalog_override_path(value: &str) -> bool {
++    let Some(path_text) = value
++        .strip_prefix('"')
++        .and_then(|text| text.strip_suffix('"'))
++    else {
++        return false;
++    };
++    let bytes = path_text.as_bytes();
++    let windows_absolute =
++        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/';
++    let unix_absolute = path_text.starts_with('/');
++    (windows_absolute || unix_absolute)
++        && !path_text.contains('\\')
++        && !path_text.split('/').any(|segment| segment == "..")
++        && !path_text
++            .chars()
++            .any(|character| character.is_control() || character == '"')
++}
++
++fn valid_gateway_base_url(value: &str) -> bool {
++    let Some(port) = value
++        .strip_prefix(r#""http://127.0.0.1:"#)
++        .and_then(|text| text.strip_suffix(r#"/v1""#))
++    else {
++        return false;
++    };
++    !port.is_empty()
++        && port.bytes().all(|byte| byte.is_ascii_digit())
++        && port.parse::<u16>().is_ok_and(|number| number > 0)
++}
++
+ /// Returns whether this invocation starts an app-server instance owned by the Host Runtime.
+ ///
+ /// App-server management commands such as `proxy` and `daemon` must stay on the stock Codex CLI.
+@@ -564,6 +663,8 @@ fn child_command(
+     current_executable: &Path,
+     stock_codex_path: &Path,
+ ) -> ShimResult<Command> {
++    let arguments =
++        codex_config_override_arguments(arguments, env::var_os(CODEX_CONFIG_OVERRIDES_ENV))?;
+     let launcher_managed = env::var_os(LAUNCHER_PID_ENV).is_some();
+     let inherited_remote_profile = launcher_managed
+         && env::var_os(REMOTE_SSH_MANAGED_ENV).as_deref() == Some(std::ffi::OsStr::new("1"));
+@@ -580,7 +681,7 @@ fn child_command(
+         } else {
+             Vec::new()
+         };
+-    if should_start_host_runtime(arguments) {
++    if should_start_host_runtime(&arguments) {
+         match host_paths {
+             (Some(node_path), Some(runtime_path)) => {
+                 let node_path =
+@@ -589,11 +690,12 @@ fn child_command(
+                 let mut command = Command::new(&node_path);
+                 command
+                     .arg(node_entrypoint_path(&runtime_path))
+-                    .args(arguments)
++                    .args(&arguments)
+                     .env(STOCK_CODEX_PATH_ENV, stock_codex_path)
+                     .env(HOST_NODE_PATH_ENV, &node_path)
+                     .env(HOST_RUNTIME_PATH_ENV, &runtime_path)
+                     .env_remove(CODEX_CLI_PATH_ENV)
++                    .env_remove(CODEX_CONFIG_OVERRIDES_ENV)
+                     .env_remove(REMOTE_SSH_MANAGED_ENV)
+                     .env_remove(REMOTE_LISTENER_CHILD_ENV);
+                 if inherited_remote_profile {
+@@ -615,10 +717,11 @@ fn child_command(
+ 
+     let mut command = Command::new(stock_codex_path);
+     command
+-        .args(arguments)
++        .args(&arguments)
+         .env_remove(CODEX_CLI_PATH_ENV)
+         .env_remove(HOST_NODE_PATH_ENV)
+         .env_remove(HOST_RUNTIME_PATH_ENV)
++        .env_remove(CODEX_CONFIG_OVERRIDES_ENV)
+         .env_remove(REMOTE_SSH_MANAGED_ENV)
+         .env_remove(REMOTE_LISTENER_CHILD_ENV);
+     command.envs(remote_proxy_environment);
+@@ -754,8 +857,8 @@ mod tests {
+     #[cfg(any(target_os = "macos", target_os = "linux"))]
+     use super::ShutdownSignals;
+     use super::{
+-        app_server_subcommand_index, is_default_remote_unix_listener, select_host_paths,
+-        should_start_host_runtime,
++        app_server_subcommand_index, codex_config_override_arguments,
++        is_default_remote_unix_listener, select_host_paths, should_start_host_runtime,
+     };
+ 
+     fn arguments(values: &[&str]) -> Vec<OsString> {
+@@ -788,6 +891,70 @@ mod tests {
+         assert_eq!(app_server_subcommand_index(&arguments(&["-c"])), None);
+     }
+ 
++    #[test]
++    fn injects_only_allowlisted_codex_config_overrides_before_app_server() {
++        let encoded = [
++            r#"model_provider="everyone-in-codex""#,
++            r#"model_catalog_json="C:/safe/models.json""#,
++            r#"model_providers.everyone-in-codex.name="Everyone in Codex""#,
++            r#"model_providers.everyone-in-codex.base_url="http://127.0.0.1:45679/v1""#,
++            r#"model_providers.everyone-in-codex.wire_api="responses""#,
++            "model_providers.everyone-in-codex.requires_openai_auth=false",
++            r#"model_providers.everyone-in-codex.env_key="EVERYONE_CODEX_LEASE_CAPABILITY""#,
++        ]
++        .join("\u{1f}");
++        assert_eq!(
++            codex_config_override_arguments(
++                &arguments(&[
++                    "-c",
++                    "features.code_mode_host=true",
++                    "app-server",
++                    "--stdio"
++                ]),
++                Some(encoded.clone().into()),
++            )
++            .expect("inject config overrides"),
++            arguments(&[
++                "-c",
++                "features.code_mode_host=true",
++                "-c",
++                r#"model_provider="everyone-in-codex""#,
++                "-c",
++                r#"model_catalog_json="C:/safe/models.json""#,
++                "-c",
++                r#"model_providers.everyone-in-codex.name="Everyone in Codex""#,
++                "-c",
++                r#"model_providers.everyone-in-codex.base_url="http://127.0.0.1:45679/v1""#,
++                "-c",
++                r#"model_providers.everyone-in-codex.wire_api="responses""#,
++                "-c",
++                "model_providers.everyone-in-codex.requires_openai_auth=false",
++                "-c",
++                r#"model_providers.everyone-in-codex.env_key="EVERYONE_CODEX_LEASE_CAPABILITY""#,
++                "app-server",
++                "--stdio",
++            ])
++        );
++        assert!(
++            codex_config_override_arguments(
++                &arguments(&["app-server"]),
++                Some("model=\"forbidden\"".into()),
++            )
++            .is_err()
++        );
++        assert!(
++            codex_config_override_arguments(
++                &arguments(&["app-server"]),
++                Some(
++                    encoded
++                        .replace("127.0.0.1", "router.example.invalid")
++                        .into()
++                ),
++            )
++            .is_err()
++        );
++    }
++
+     #[test]
+     fn starts_host_runtime_for_servers_but_not_app_server_management_commands() {
+         assert!(should_start_host_runtime(&arguments(&[
+diff --git a/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts b/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts
+index 1d66da1..d2993ad 100644
+--- a/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts
++++ b/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts
+@@ -95,6 +95,7 @@ import {
+ 
+ export interface DeepSeekHarnessAdapterOptions extends DeepSeekHostConnectionOptions {
+   toolOutputLimit?: number;
++  allowedProviders?: readonly string[];
+ }
+ 
+ export interface DeepSeekHostConnectionLike {
+@@ -1082,6 +1083,7 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+   readonly #connection: DeepSeekHostConnectionLike;
+   readonly #dependencies: DeepSeekHarnessAdapterDependencies;
+   readonly #options: DeepSeekHarnessAdapterOptions;
++  readonly #allowedProviders: ReadonlySet<string> | null;
+   readonly #sessions = new Set<DeepSeekHarnessSession>();
+   readonly #toolOutputLimit: number;
+   #closePromise: Promise<void> | null = null;
+@@ -1091,6 +1093,13 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+     dependencies?: DeepSeekHarnessAdapterDependencies,
+   ) {
+     this.#options = options;
++    const allowedProviders = options.allowedProviders
++      ? new Set(options.allowedProviders.map((provider) => provider.trim()).filter(Boolean))
++      : null;
++    if (options.allowedProviders && allowedProviders?.size === 0) {
++      throw new Error("DeepSeek Harness allowedProviders must not be empty");
++    }
++    this.#allowedProviders = allowedProviders;
+     this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT;
+     this.#dependencies = dependencies ?? {
+       randomUUID,
+@@ -1121,12 +1130,24 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+           "DeepSeek Harness Host has no default Model selection",
+         );
+       }
++      const groups = this.#allowedProviders
++        ? models.groups.filter((group) => this.#allowedProviders?.has(group.id))
++        : models.groups;
++      const firstGroup = groups[0];
++      const firstModel = firstGroup?.models[0];
++      if (!firstGroup || !firstModel) {
++        throw new DeepSeekHarnessTransportError(
++          "protocolError",
++          "DeepSeek Harness has no allowlisted Models",
++        );
++      }
++      const selectedGroup = groups.find((group) => group.id === host.provider);
++      const selection = selectedGroup?.models.some((model) => model.id === host.model)
++        ? { provider: host.provider, model: host.model }
++        : { provider: firstGroup.id, model: firstModel.id };
+       return {
+         status: "ready",
+-        catalog: normalizeDeepSeekModelCatalog(models.groups, {
+-          provider: host.provider,
+-          model: host.model,
+-        }),
++        catalog: normalizeDeepSeekModelCatalog(groups, selection),
+         capabilities: {
+           configuration: {
+             selectModel: true,
+@@ -1175,6 +1196,33 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+         error: unsupported("DeepSeek Harness does not select Thinking or Permission Mode"),
+       };
+     }
++    let requestedCreateModel: ReturnType<typeof decodeDeepSeekHarnessModelRef> | null = null;
++    if (input.kind === "create" && input.model) {
++      try {
++        requestedCreateModel = decodeDeepSeekHarnessModelRef(input.model);
++      } catch (error) {
++        return { ok: false, error: normalizedError(error, "invalidRequest") };
++      }
++      if (this.#allowedProviders && !this.#allowedProviders.has(requestedCreateModel.provider)) {
++        return {
++          ok: false,
++          error: {
++            code: "invalidRequest",
++            message: "DeepSeek Harness Model provider is not allowed by this Fusion lease",
++            retryable: false,
++          },
++        };
++      }
++    } else if (input.kind === "create" && this.#allowedProviders) {
++      return {
++        ok: false,
++        error: {
++          code: "invalidRequest",
++          message: "DeepSeek Harness Fusion Sessions require an explicit Model",
++          retryable: false,
++        },
++      };
++    }
+     try {
+       await this.#connection.connect();
+       const cwd = path.resolve(input.cwd);
+@@ -1217,13 +1265,12 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+               "DeepSeek Harness created an unexpected Session identity",
+             );
+           }
+-          if (input.model) {
+-            const requested = decodeDeepSeekHarnessModelRef(input.model);
++          if (requestedCreateModel) {
+             unwrapRpc(
+               await this.#connection.client.sessions.selectModel({
+                 sessionId: sessionId as SessionId,
+-                provider: requested.provider,
+-                model: requested.model,
++                provider: requestedCreateModel.provider,
++                model: requestedCreateModel.model,
+               }),
+               "session.selectModel",
+             );
+@@ -1234,6 +1281,12 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+           this.#connection.client.sessions.models({ sessionId: sessionId as SessionId }),
+         ]);
+         const models = unwrapRpc(modelState, "session.models");
++        if (this.#allowedProviders && !this.#allowedProviders.has(models.current.provider)) {
++          throw new DeepSeekHarnessTransportError(
++            "protocolError",
++            "DeepSeek Harness Session selected a non-allowlisted Model provider",
++          );
++        }
+         const model = encodeDeepSeekHarnessModelRef(models.current);
+         const projection = projectDeepSeekHistory({
+           harnessId: this.harnessId,
+diff --git a/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts b/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts
+index 819603c..9c17b9e 100644
+--- a/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts
++++ b/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts
+@@ -158,7 +158,7 @@ class FakeConnection implements DeepSeekHostConnectionLike {
+   }
+ }
+ 
+-function fixture(): {
++function fixture(options: ConstructorParameters<typeof DeepSeekHarnessAdapter>[0] = {}): {
+   adapter: DeepSeekHarnessAdapter;
+   connection: FakeConnection;
+ } {
+@@ -167,7 +167,7 @@ function fixture(): {
+     randomUUID: () => "native-1",
+     createConnection: () => connection,
+   };
+-  return { adapter: new DeepSeekHarnessAdapter({}, dependencies), connection };
++  return { adapter: new DeepSeekHarnessAdapter(options, dependencies), connection };
+ }
+ 
+ async function collectUntilTurn(session: Awaited<ReturnType<typeof openCreated>>) {
+@@ -203,6 +203,44 @@ describe("DeepSeekHarnessAdapter local Host", () => {
+     await adapter.close();
+   });
+ 
++  it("publishes and accepts only the Fusion provider allowlist", async () => {
++    const { adapter, connection } = fixture({ allowedProviders: ["everyone-in-codex"] });
++    vi.mocked(connection.client.llm.models).mockResolvedValue(
++      success({
++        groups: [
++          ...MODEL_GROUPS,
++          {
++            id: "everyone-in-codex",
++            name: "Everyone in Codex",
++            models: [
++              { id: "zai-api-cn/glm-5.3-flash", name: "GLM-5.3-Flash" },
++              { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash" },
++            ],
++          },
++        ],
++        failures: [],
++      }),
++    );
++
++    await expect(adapter.inspect()).resolves.toMatchObject({
++      status: "ready",
++      catalog: {
++        models: [
++          expect.objectContaining({ label: "Everyone in Codex / GLM-5.3-Flash" }),
++          expect.objectContaining({ label: "Everyone in Codex / DeepSeek V4 Flash" }),
++        ],
++      },
++    });
++    await expect(
++      adapter.open({
++        kind: "create",
++        cwd: "/workspace",
++        model: encodeDeepSeekHarnessModelRef(CURRENT_MODEL),
++      }),
++    ).resolves.toMatchObject({ ok: false, error: { code: "invalidRequest" } });
++    await adapter.close();
++  });
++
+   it("creates an official Session, selects the requested Model, and projects a live Tool Turn", async () => {
+     const { adapter, connection } = fixture();
+     const model = encodeDeepSeekHarnessModelRef({
+diff --git a/packages/adapters/grok/src/acp-transport.ts b/packages/adapters/grok/src/acp-transport.ts
+index 6c896c6..7441132 100644
+--- a/packages/adapters/grok/src/acp-transport.ts
++++ b/packages/adapters/grok/src/acp-transport.ts
+@@ -131,6 +131,7 @@ export interface GrokAcpTransportOptions {
+   cwd: string;
+   command?: string;
+   environment?: NodeJS.ProcessEnv;
++  modelAliases?: Readonly<Record<string, string>>;
+   commandTimeoutMs?: number;
+   closeTimeoutMs?: number;
+   onFault?: (error: GrokTransportError) => void;
+@@ -333,8 +334,15 @@ function transportEvent(
+   }
+ }
+ 
++/** 显式 Adapter 环境是完整安全边界；只有未提供时才继承 Host。 */
++export function grokProcessEnvironment(
++  environment: NodeJS.ProcessEnv | undefined,
++): NodeJS.ProcessEnv {
++  return { ...(environment ?? process.env) };
++}
++
+ function grokHomeDir(options: Pick<GrokAcpTransportOptions, "environment">): string {
+-  const environment = { ...process.env, ...options.environment };
++  const environment = grokProcessEnvironment(options.environment);
+   const home = environment.HOME ?? environment.USERPROFILE ?? os.homedir();
+   return environment.GROK_HOME ?? path.join(home, ".grok");
+ }
+@@ -714,14 +722,15 @@ export class GrokAcpTransport {
+   async #ensureInitialized(): Promise<InitializeResponse> {
+     if (this.#initialize) return this.#initialize;
+     if (this.#child || this.#closed) throw new Error("Grok ACP Transport cannot be started twice");
++    const environment = grokProcessEnvironment(this.#options.environment);
+     const executable = resolveGrokExecutable({
+       ...(this.#options.command ? { command: this.#options.command } : {}),
+-      environment: this.#options.environment ?? process.env,
++      environment,
+     });
+-    const invocation = grokInvocation(executable);
++    const invocation = grokInvocation(executable, process.platform, environment);
+     const child = spawn(invocation.command, invocation.arguments, {
+       cwd: this.#options.cwd,
+-      env: { ...process.env, ...this.#options.environment },
++      env: environment,
+       detached: process.platform !== "win32",
+       stdio: ["pipe", "pipe", "pipe"],
+       windowsHide: true,
+@@ -862,7 +871,7 @@ export class GrokAcpTransport {
+       throw new GrokTransportError("protocolError", "Grok rejected Model configuration");
+     }
+     const selected = response._meta.model.Ok;
+-    if (selected !== modelId) {
++    if (selected !== modelId && selected !== this.#options.modelAliases?.[modelId]) {
+       throw new GrokTransportError("protocolError", "Grok activated a different Model");
+     }
+   }
+diff --git a/packages/adapters/grok/src/command.ts b/packages/adapters/grok/src/command.ts
+index 8f573a9..48b2696 100644
+--- a/packages/adapters/grok/src/command.ts
++++ b/packages/adapters/grok/src/command.ts
+@@ -52,10 +52,11 @@ export function resolveGrokExecutable(
+ export function grokInvocation(
+   command: string,
+   platform = process.platform,
++  environment: NodeJS.ProcessEnv = process.env,
+ ): {
+   command: string;
+   arguments: string[];
+   windowsVerbatimArguments: boolean;
+ } {
+-  return commandInvocation(command, ["agent", "--no-leader", "stdio"], process.env, platform);
++  return commandInvocation(command, ["agent", "--no-leader", "stdio"], environment, platform);
+ }
+diff --git a/packages/adapters/grok/src/grok-adapter.ts b/packages/adapters/grok/src/grok-adapter.ts
+index 6d41bb5..23e92f8 100644
+--- a/packages/adapters/grok/src/grok-adapter.ts
++++ b/packages/adapters/grok/src/grok-adapter.ts
+@@ -95,9 +95,11 @@ import {
+   type GrokProjectedToolItem,
+ } from "./grok-tool-output.js";
+ import {
++  configuredGrokModelState,
+   modelStateFromInitialize,
+   modelStateFromSessionResponse,
+   stateForGrokModel,
++  type GrokConfiguredModel,
+   type GrokModelState,
+ } from "./grok-models.js";
+ import { fetchGrokCredits, type GrokCreditsSnapshot } from "./grok-credits.js";
+@@ -113,6 +115,7 @@ import {
+ export interface GrokAdapterOptions {
+   command?: string;
+   environment?: NodeJS.ProcessEnv;
++  configuredModels?: readonly GrokConfiguredModel[];
+   commandTimeoutMs?: number;
+   closeTimeoutMs?: number;
+   toolOutputLimit?: number;
+@@ -1213,6 +1216,7 @@ export class GrokAdapter implements HarnessAdapter {
+   readonly #inspectionCache = new Map<string, Extract<HarnessInspection, { status: "ready" }>>();
+   readonly #sessions = new Set<GrokHarnessSession>();
+   readonly #toolOutputLimit: number;
++  readonly #configuredModels: readonly GrokConfiguredModel[] | null;
+   #closePromise: Promise<void> | null = null;
+   #credits: GrokCreditsSnapshot | null = null;
+   #creditsRefresh: Promise<GrokCreditsSnapshot | null> | null = null;
+@@ -1220,11 +1224,24 @@ export class GrokAdapter implements HarnessAdapter {
+   constructor(options: GrokAdapterOptions = {}, dependencies?: GrokAdapterDependencies) {
+     this.#closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
+     this.#environment = options.environment;
++    this.#configuredModels = options.configuredModels ? [...options.configuredModels] : null;
++    if (this.#configuredModels) configuredGrokModelState(this.#configuredModels);
+     this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_GROK_TOOL_OUTPUT_LIMIT;
++    const modelAliases = this.#configuredModels
++      ? Object.fromEntries(
++          this.#configuredModels.flatMap((model) =>
++            model.upstreamId ? [[model.id, model.upstreamId] as const] : [],
++          ),
++        )
++      : undefined;
+     this.#dependencies = dependencies ?? {
+       randomUUID,
+       createTransport: (transportOptions) =>
+-        new GrokAcpTransport({ ...options, ...transportOptions }),
++        new GrokAcpTransport({
++          ...options,
++          ...(modelAliases ? { modelAliases } : {}),
++          ...transportOptions,
++        }),
+     };
+     this.#fetchCredits =
+       this.#dependencies.fetchCredits ??
+@@ -1242,6 +1259,10 @@ export class GrokAdapter implements HarnessAdapter {
+     return this.#credits;
+   }
+ 
++  #projectModelState(native: GrokModelState): GrokModelState {
++    return this.#configuredModels ? configuredGrokModelState(this.#configuredModels) : native;
++  }
++
+   refreshCredits(): Promise<GrokCreditsSnapshot | null> {
+     if (this.#closePromise) return Promise.resolve(this.#credits);
+     if (this.#creditsRefresh) return this.#creditsRefresh;
+@@ -1283,9 +1304,10 @@ export class GrokAdapter implements HarnessAdapter {
+       stage = "startup";
+       const initialize = await transport.inspect();
+       stage = "model-catalog";
+-      const modelState = modelStateFromInitialize(initialize);
+-      if (!modelState)
++      const nativeModelState = modelStateFromInitialize(initialize);
++      if (!nativeModelState)
+         throw new GrokTransportError("protocolError", "Grok returned an invalid Model catalog");
++      const modelState = this.#projectModelState(nativeModelState);
+       await transport.close();
+       const ready: Extract<HarnessInspection, { status: "ready" }> = {
+         status: "ready",
+@@ -1452,11 +1474,12 @@ export class GrokAdapter implements HarnessAdapter {
+           },
+         };
+       }
+-      const modelState =
++      const nativeModelState =
+         modelStateFromSessionResponse(opened.session) ??
+         modelStateFromInitialize(opened.initialize);
+-      if (!modelState)
++      if (!nativeModelState)
+         throw new GrokTransportError("protocolError", "Grok returned an invalid Model catalog");
++      const modelState = this.#projectModelState(nativeModelState);
+       const retainedConfiguration = sourceConfiguration;
+       if ((input.kind === "rollbackLastTurn" || input.kind === "fork") && retainedConfiguration) {
+         const operation = input.kind === "rollbackLastTurn" ? "Rewind" : "Fork";
+diff --git a/packages/adapters/grok/src/grok-models.ts b/packages/adapters/grok/src/grok-models.ts
+index 3ec7ce2..e45918d 100644
+--- a/packages/adapters/grok/src/grok-models.ts
++++ b/packages/adapters/grok/src/grok-models.ts
+@@ -7,7 +7,11 @@ import type {
+   HarnessThinkingOption,
+   HarnessThinkingOptionId,
+ } from "@codexhost/harness-adapter";
+-import { harnessModelRefSchema, harnessThinkingOptionIdSchema } from "@codexhost/shared-contracts";
++import {
++  harnessModelCatalogSchema,
++  harnessModelRefSchema,
++  harnessThinkingOptionIdSchema,
++} from "@codexhost/shared-contracts";
+ 
+ export interface GrokModelState {
+   catalog: HarnessModelCatalog;
+@@ -16,6 +20,24 @@ export interface GrokModelState {
+   contextWindowTokensByModel: ReadonlyMap<string, number>;
+ }
+ 
++export interface GrokConfiguredModel {
++  id: string;
++  name: string;
++  upstreamId?: string;
++  contextWindow?: number;
++  reasoningLevels?: readonly string[];
++}
++
++const configuredThinkingLabels: Readonly<Record<string, string>> = {
++  off: "Off",
++  minimal: "Minimal",
++  low: "Low",
++  medium: "Medium",
++  high: "High",
++  xhigh: "Extra High",
++  max: "Max",
++};
++
+ function isRecord(value: unknown): value is Record<string, unknown> {
+   return typeof value === "object" && value !== null && !Array.isArray(value);
+ }
+@@ -102,6 +124,52 @@ export function modelStateFromSessionResponse(response: unknown): GrokModelState
+   return parseGrokModelState(isRecord(response) ? response.models : undefined);
+ }
+ 
++/**
++ * Grok 1.0.13 能请求 config.toml 中的自定义 Responses 模型，但 ACP initialize
++ * 仍只上报原生 Grok 条目。Fusion 用无凭据目录替换这份选择器元数据；请求本身
++ * 继续交给 Grok 的 set_model 与 Responses transport。
++ */
++export function configuredGrokModelState(models: readonly GrokConfiguredModel[]): GrokModelState {
++  if (models.length === 0) throw new Error("Configured Grok Model catalog must not be empty");
++  const seen = new Set<string>();
++  const thinkingById = new Map<string, HarnessThinkingOption>();
++  const contextWindowTokensByModel = new Map<string, number>();
++  const catalogModels: HarnessModelCatalog["models"] = models.map((model) => {
++    const ref = harnessModelRefSchema.parse({ id: model.id });
++    if (seen.has(ref.id) || !model.name.trim()) {
++      throw new Error("Configured Grok Model catalog contains an invalid or duplicate Model");
++    }
++    seen.add(ref.id);
++    if (model.contextWindow !== undefined) {
++      if (!Number.isSafeInteger(model.contextWindow) || model.contextWindow < 1) {
++        throw new Error("Configured Grok Model context window is invalid");
++      }
++      contextWindowTokensByModel.set(ref.id, model.contextWindow);
++    }
++    const supportedThinkingOptionIds = (model.reasoningLevels ?? []).map((level) => {
++      const id = harnessThinkingOptionIdSchema.parse(level);
++      thinkingById.set(id, { id, label: configuredThinkingLabels[id] ?? id });
++      return id;
++    });
++    return {
++      ref,
++      label: model.name,
++      ...(supportedThinkingOptionIds.length > 0 ? { supportedThinkingOptionIds } : {}),
++    };
++  });
++  const defaultModel = catalogModels[0]?.ref;
++  if (!defaultModel) throw new Error("Configured Grok Model catalog has no default Model");
++  return {
++    currentModel: defaultModel,
++    contextWindowTokensByModel,
++    catalog: harnessModelCatalogSchema.parse({
++      models: catalogModels,
++      defaultModel,
++      thinkingOptions: [...thinkingById.values()],
++    }),
++  };
++}
++
+ export function stateForGrokModel(
+   modelState: GrokModelState,
+   nativeState: Pick<HarnessSessionState, "nativeRef">,
+diff --git a/packages/adapters/grok/src/index.ts b/packages/adapters/grok/src/index.ts
+index 9395f68..655667b 100644
+--- a/packages/adapters/grok/src/index.ts
++++ b/packages/adapters/grok/src/index.ts
+@@ -11,6 +11,7 @@ export type { GrokCreditsSnapshot, GrokProductUsage } from "./grok-credits.js";
+ export {
+   GrokAcpTransport,
+   GrokTransportError,
++  grokProcessEnvironment,
+   locateGrokNativeSession,
+   readGrokNativeHistory,
+ } from "./acp-transport.js";
+diff --git a/packages/adapters/grok/test/grok-adapter.test.ts b/packages/adapters/grok/test/grok-adapter.test.ts
+index b7bf34c..187fc39 100644
+--- a/packages/adapters/grok/test/grok-adapter.test.ts
++++ b/packages/adapters/grok/test/grok-adapter.test.ts
+@@ -314,6 +314,42 @@ describe("Grok Adapter ACP projection", () => {
+     await adapter.close();
+   });
+ 
++  it("replaces incomplete ACP metadata with the Fusion configured Model catalog", async () => {
++    const transport = new FakeGrokTransport();
++    const adapter = new GrokAdapter(
++      {
++        configuredModels: [
++          {
++            id: "everyone-in-codex~glm-5.3-flash",
++            name: "GLM-5.3-Flash",
++            upstreamId: "zai-api-cn/glm-5.3-flash",
++            contextWindow: 1_000_000,
++            reasoningLevels: ["low", "high", "max"],
++          },
++        ],
++      },
++      {
++        randomUUID: () => "grok-id",
++        createTransport: () => transport,
++        fetchCredits: async () => null,
++      },
++    );
++
++    await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
++      status: "ready",
++      catalog: {
++        models: [
++          {
++            ref: { id: "everyone-in-codex~glm-5.3-flash" },
++            supportedThinkingOptionIds: ["low", "high", "max"],
++          },
++        ],
++        defaultModel: { id: "everyone-in-codex~glm-5.3-flash" },
++      },
++    });
++    await adapter.close();
++  });
++
+   it("seeds and changes the native Grok Permission Mode", async () => {
+     const transport = new FakeGrokTransport();
+     const adapter = new GrokAdapter(
+diff --git a/packages/adapters/grok/test/grok-environment.test.ts b/packages/adapters/grok/test/grok-environment.test.ts
+new file mode 100644
+index 0000000..b5e3a93
+--- /dev/null
++++ b/packages/adapters/grok/test/grok-environment.test.ts
+@@ -0,0 +1,23 @@
++import { describe, expect, it } from "vitest";
++
++import { grokProcessEnvironment } from "../src/index.js";
++
++describe("Grok process environment", () => {
++  it("does not merge process.env into an explicit Adapter environment", () => {
++    const inheritedName = "CODEXHOST_TEST_INHERITED_CAPABILITY";
++    const previous = process.env[inheritedName];
++    process.env[inheritedName] = "must-not-reach-grok";
++
++    try {
++      const explicit = { PATH: "/synthetic/bin", GROK_HOME: "/fusion/grok" };
++      const environment = grokProcessEnvironment(explicit);
++
++      expect(environment).toEqual(explicit);
++      expect(environment).not.toHaveProperty(inheritedName);
++      expect(environment).not.toBe(explicit);
++    } finally {
++      if (previous === undefined) Reflect.deleteProperty(process.env, inheritedName);
++      else process.env[inheritedName] = previous;
++    }
++  });
++});
+diff --git a/packages/adapters/omp/src/omp-adapter.ts b/packages/adapters/omp/src/omp-adapter.ts
+index 2a30e97..5221117 100644
+--- a/packages/adapters/omp/src/omp-adapter.ts
++++ b/packages/adapters/omp/src/omp-adapter.ts
+@@ -93,6 +93,8 @@ import { OmpSubagentLifecycle } from "./omp-subagent-lifecycle.js";
+ export interface OmpAdapterOptions {
+   command?: string;
+   environment?: NodeJS.ProcessEnv;
++  readOnly?: boolean;
++  allowedProviders?: readonly string[];
+   commandTimeoutMs?: number;
+   compactionTimeoutMs?: number;
+   cancelTimeoutMs?: number;
+@@ -1668,6 +1670,7 @@ export class OmpAdapter implements HarnessAdapter {
+   readonly #inspections = new Set<OmpTurnTransport>();
+   readonly #sessions = new Set<OmpHarnessSession>();
+   readonly #toolOutputLimit: number;
++  readonly #allowedProviders: ReadonlySet<string> | null;
+   #closePromise: Promise<void> | null = null;
+   #thinkingSelectionSupported: boolean | null = null;
+ 
+@@ -1677,7 +1680,18 @@ export class OmpAdapter implements HarnessAdapter {
+       createTransport: (sessionOptions) => new OmpRpcSession({ ...options, ...sessionOptions }),
+     },
+   ) {
+-    this.#createTransport = dependencies.createTransport;
++    this.#createTransport = (sessionOptions) =>
++      dependencies.createTransport({
++        ...sessionOptions,
++        ...(options.readOnly !== undefined ? { readOnly: options.readOnly } : {}),
++      });
++    const allowedProviders = options.allowedProviders
++      ? new Set(options.allowedProviders.map((provider) => provider.trim()).filter(Boolean))
++      : null;
++    if (options.allowedProviders && allowedProviders?.size === 0) {
++      throw new Error("Omp allowedProviders must not be empty");
++    }
++    this.#allowedProviders = allowedProviders;
+     this.#closeTimeoutMs = options.closeTimeoutMs ?? 2_000;
+     this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT;
+   }
+@@ -1723,12 +1737,23 @@ export class OmpAdapter implements HarnessAdapter {
+       await transport.start();
+       stage = "model-catalog";
+       const models = await transport.getAvailableModels();
++      const allowedModels = this.#allowedProviders
++        ? models.filter((model) => this.#allowedProviders?.has(model.provider))
++        : models;
++      const firstAllowedModel = allowedModels[0];
++      if (!firstAllowedModel) throw new Error("Omp has no allowlisted Models");
+       stage = "capabilities";
+       const thinkingLevels = await transport.getAvailableThinkingLevels();
+       this.#thinkingSelectionSupported = thinkingLevels !== null;
++      const reportedModel = nativeModelFromState(transport.state);
++      const effectiveModel =
++        reportedModel &&
++        (!this.#allowedProviders || this.#allowedProviders.has(reportedModel.provider))
++          ? reportedModel
++          : { provider: firstAllowedModel.provider, id: firstAllowedModel.id };
+       const catalog = normalizeOmpModelCatalog(
+-        models,
+-        nativeModelFromState(transport.state),
++        allowedModels,
++        effectiveModel,
+         thinkingLevels,
+         transport.state.thinkingLevel,
+       );
+@@ -1792,10 +1817,22 @@ export class OmpAdapter implements HarnessAdapter {
+       }
+       if (input.model) {
+         try {
+-          decodeOmpModelRef(input.model);
++          const decoded = decodeOmpModelRef(input.model);
++          if (this.#allowedProviders && !this.#allowedProviders.has(decoded.provider)) {
++            throw new Error("Omp Model provider is not allowed by this Fusion lease");
++          }
+         } catch (error) {
+           return { ok: false, error: normalizedError(error, "invalidRequest") };
+         }
++      } else if (this.#allowedProviders) {
++        return {
++          ok: false,
++          error: {
++            code: "invalidRequest",
++            message: "Omp Fusion Sessions require an explicit Model",
++            retryable: false,
++          },
++        };
+       }
+       const thinkingOptionId = input.thinkingOptionId
+         ? harnessThinkingOptionIdSchema.safeParse(input.thinkingOptionId)
+diff --git a/packages/adapters/omp/src/omp-rpc-session.ts b/packages/adapters/omp/src/omp-rpc-session.ts
+index ddcba8f..45ca612 100644
+--- a/packages/adapters/omp/src/omp-rpc-session.ts
++++ b/packages/adapters/omp/src/omp-rpc-session.ts
+@@ -130,6 +130,7 @@ export interface OmpRpcSessionOptions {
+   cwd: string;
+   command?: string;
+   environment?: NodeJS.ProcessEnv;
++  readOnly?: boolean;
+   sessionFile?: string;
+   forkSessionFile?: string;
+   model?: OmpNativeModelRef;
+@@ -145,6 +146,7 @@ export interface OmpRpcProcessOptions {
+   cwd: string;
+   command?: string;
+   environment: NodeJS.ProcessEnv;
++  readOnly?: boolean;
+   sessionFile?: string;
+   forkSessionFile?: string;
+   model?: OmpNativeModelRef;
+@@ -413,7 +415,9 @@ export function ompRpcProcessCommand(
+   const modelArguments = options.model
+     ? ["--provider", options.model.provider, "--model", options.model.id]
+     : [];
+-  const arguments_ = ["--mode", "rpc", ...modelArguments, ...sessionArguments];
++  // Fusion 的 OMP 首版只允许读取；单一原生开关可避免 Host 投影遗漏写工具。
++  const toolArguments = options.readOnly ? ["--tools=read"] : [];
++  const arguments_ = ["--mode", "rpc", ...toolArguments, ...modelArguments, ...sessionArguments];
+   const extension = path.win32.extname(command).toLowerCase();
+   if (platform !== "win32" || ![".cmd", ".bat"].includes(extension)) {
+     return { command, arguments: arguments_, windowsVerbatimArguments: false };
+@@ -504,11 +508,11 @@ export class OmpRpcSession {
+       cwd: this.#options.cwd,
+       ...(this.#options.command ? { command: this.#options.command } : {}),
+       environment: withNodeRuntimeOnPath({
+-        ...process.env,
+-        ...this.#options.environment,
++        ...(this.#options.environment ?? process.env),
+         OMP_SKIP_VERSION_CHECK: "1",
+         OMP_TELEMETRY: "0",
+       }),
++      ...(this.#options.readOnly !== undefined ? { readOnly: this.#options.readOnly } : {}),
+       ...(this.#options.sessionFile ? { sessionFile: this.#options.sessionFile } : {}),
+       ...(this.#options.forkSessionFile ? { forkSessionFile: this.#options.forkSessionFile } : {}),
+       ...(this.#options.model ? { model: this.#options.model } : {}),
+diff --git a/packages/adapters/omp/test/omp-adapter.test.ts b/packages/adapters/omp/test/omp-adapter.test.ts
+index f75baac..ea77d69 100644
+--- a/packages/adapters/omp/test/omp-adapter.test.ts
++++ b/packages/adapters/omp/test/omp-adapter.test.ts
+@@ -23,7 +23,7 @@ import type {
+   OmpTurnEvent,
+   OmpTurnResult,
+ } from "../src/omp-rpc-session.js";
+-import type { OmpNativeModel } from "../src/omp-model-catalog.js";
++import { encodeOmpModelRef, type OmpNativeModel } from "../src/omp-model-catalog.js";
+ 
+ class FakeOmpTransport implements OmpTurnTransport {
+   state: OmpSessionState = {
+@@ -170,6 +170,40 @@ class FakeOmpTransport implements OmpTurnTransport {
+   async close(): Promise<void> {}
+ }
+ 
++describe("OMP Fusion provider allowlist", () => {
++  it("publishes only allowlisted Models and rejects a hidden provider", async () => {
++    const transport = new FakeOmpTransport();
++    transport.state = { ...transport.state, provider: "ollama", modelId: "local-model" };
++    transport.getAvailableModels = async () => [
++      { provider: "ollama", id: "local-model", reasoning: false },
++      { provider: "everyone-in-codex", id: "zai-api-cn/glm-5.3-flash", reasoning: true },
++      { provider: "everyone-in-codex", id: "deepseek/deepseek-v4-flash", reasoning: true },
++    ];
++    const adapter = new OmpAdapter(
++      { allowedProviders: ["everyone-in-codex"] },
++      { createTransport: () => transport },
++    );
++
++    await expect(adapter.inspect({ cwd: "/synthetic", refresh: true })).resolves.toMatchObject({
++      status: "ready",
++      catalog: {
++        models: [
++          expect.objectContaining({ label: "everyone-in-codex / deepseek/deepseek-v4-flash" }),
++          expect.objectContaining({ label: "everyone-in-codex / zai-api-cn/glm-5.3-flash" }),
++        ],
++      },
++    });
++    await expect(
++      adapter.open({
++        kind: "create",
++        cwd: "/synthetic",
++        model: encodeOmpModelRef({ provider: "ollama", id: "local-model" }),
++      }),
++    ).resolves.toMatchObject({ ok: false, error: { code: "invalidRequest" } });
++    await adapter.close();
++  });
++});
++
+ function historyTurn(input: {
+   assistantId: string;
+   parentId: string | null;
+@@ -291,6 +325,20 @@ function outputs(session: { outputs: AsyncIterable<HarnessOutput> }): HarnessOut
+ }
+ 
+ describe("OMP Adapter Subagents", () => {
++  it("forwards the InferenceOnly readOnly policy to every OMP transport", async () => {
++    const transport = new FakeOmpTransport();
++    const createTransport = vi.fn(() => transport);
++    const adapter = new OmpAdapter({ readOnly: true }, { createTransport });
++
++    await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
++      status: "ready",
++    });
++    expect(createTransport).toHaveBeenCalledWith(
++      expect.objectContaining({ cwd: "/synthetic", readOnly: true }),
++    );
++    await adapter.close();
++  });
++
+   it("projects native Subagent lifecycle into a Host delegation Item", async () => {
+     const transport = new FakeOmpTransport();
+     const dependencies: OmpAdapterDependencies = {
+diff --git a/packages/adapters/omp/test/omp-rpc-session.test.ts b/packages/adapters/omp/test/omp-rpc-session.test.ts
+index 329297b..98f7ee0 100644
+--- a/packages/adapters/omp/test/omp-rpc-session.test.ts
++++ b/packages/adapters/omp/test/omp-rpc-session.test.ts
+@@ -10,6 +10,7 @@ import {
+   OmpRpcSession,
+   ompRpcProcessCommand,
+   type OmpRpcProcessAdapter,
++  type OmpRpcProcessOptions,
+   type OmpTurnEvent,
+ } from "../src/omp-rpc-session.js";
+ 
+@@ -205,6 +206,53 @@ describe("OMP RPC session", () => {
+     ).toMatchObject({ arguments: ["--mode", "rpc", "--fork", "/tmp/omp.jsonl"] });
+   });
+ 
++  it("restricts an InferenceOnly OMP RPC process to the read tool", () => {
++    const invocation = ompRpcProcessCommand(
++      { cwd: "/synthetic", environment: {}, readOnly: true },
++      {
++        platform: "darwin",
++        homeDirectory: "/Users/test",
++        isExecutable: () => true,
++      },
++    );
++
++    expect(invocation.arguments).toEqual(["--mode", "rpc", "--tools=read"]);
++    expect(invocation.arguments.join(" ")).not.toMatch(/(?:bash|edit|write)/u);
++  });
++
++  it("does not merge the Host process environment into an explicit OMP environment", async () => {
++    const inheritedName = "CODEXHOST_TEST_INHERITED_CAPABILITY";
++    const previous = process.env[inheritedName];
++    process.env[inheritedName] = "must-not-reach-omp";
++    const fakeProcess = new FakeOmpProcess();
++    const spawnProcess = vi.fn((options: OmpRpcProcessOptions) => {
++      void options;
++      return fakeProcess as never;
++    });
++    const session = new OmpRpcSession(
++      {
++        cwd: "/synthetic",
++        environment: { PATH: process.env.PATH, PI_CODING_AGENT_DIR: "/fusion/omp" },
++        commandTimeoutMs: 2_000,
++      },
++      { spawn: spawnProcess },
++    );
++
++    try {
++      await session.start();
++      expect(spawnProcess.mock.calls[0]?.[0].environment).toMatchObject({
++        PI_CODING_AGENT_DIR: "/fusion/omp",
++        OMP_SKIP_VERSION_CHECK: "1",
++        OMP_TELEMETRY: "0",
++      });
++      expect(spawnProcess.mock.calls[0]?.[0].environment).not.toHaveProperty(inheritedName);
++    } finally {
++      await session.close();
++      if (previous === undefined) Reflect.deleteProperty(process.env, inheritedName);
++      else process.env[inheritedName] = previous;
++    }
++  });
++
+   it("starts through ready/negotiation and settles a streamed text turn on agent_end", async () => {
+     const process = new FakeOmpProcess();
+     const adapter: OmpRpcProcessAdapter = { spawn: () => process as never };
+diff --git a/packages/adapters/pi/src/pi-rpc-session.ts b/packages/adapters/pi/src/pi-rpc-session.ts
+index 19092c1..c89f146 100644
+--- a/packages/adapters/pi/src/pi-rpc-session.ts
++++ b/packages/adapters/pi/src/pi-rpc-session.ts
+@@ -492,8 +492,7 @@ export class PiRpcSession {
+       cwd: this.#options.cwd,
+       ...(this.#options.command ? { command: this.#options.command } : {}),
+       environment: withNodeRuntimeOnPath({
+-        ...process.env,
+-        ...this.#options.environment,
++        ...(this.#options.environment ?? process.env),
+         PI_SKIP_VERSION_CHECK: "1",
+         PI_TELEMETRY: "0",
+       }),
+diff --git a/packages/adapters/pi/test/pi-rpc-session.test.ts b/packages/adapters/pi/test/pi-rpc-session.test.ts
+index 4575cc8..dda1047 100644
+--- a/packages/adapters/pi/test/pi-rpc-session.test.ts
++++ b/packages/adapters/pi/test/pi-rpc-session.test.ts
+@@ -685,6 +685,39 @@ describe("Pi RPC Turn aggregation", () => {
+     await rpc.close();
+   });
+ 
++  it("does not merge the Host process environment into an explicit Pi environment", async () => {
++    const inheritedName = "CODEXHOST_TEST_INHERITED_CAPABILITY";
++    const previous = process.env[inheritedName];
++    process.env[inheritedName] = "must-not-reach-pi";
++    const spawnProcess = vi.fn((options: PiRpcProcessOptions) => {
++      void options;
++      return new FakePiRpcProcess("final-only") as unknown as ChildProcessWithoutNullStreams;
++    });
++    const rpc = new PiRpcSession(
++      {
++        cwd: process.cwd(),
++        environment: { PATH: process.env.PATH, PI_CODING_AGENT_DIR: "/fusion/pi" },
++        commandTimeoutMs: 2_000,
++        closeTimeoutMs: 500,
++      },
++      { spawn: spawnProcess },
++    );
++
++    try {
++      await rpc.start();
++      expect(spawnProcess.mock.calls[0]?.[0].environment).toMatchObject({
++        PI_CODING_AGENT_DIR: "/fusion/pi",
++        PI_SKIP_VERSION_CHECK: "1",
++        PI_TELEMETRY: "0",
++      });
++      expect(spawnProcess.mock.calls[0]?.[0].environment).not.toHaveProperty(inheritedName);
++    } finally {
++      await rpc.close();
++      if (previous === undefined) Reflect.deleteProperty(process.env, inheritedName);
++      else process.env[inheritedName] = previous;
++    }
++  });
++
+   it("rejects native state without stable Session identity", async () => {
+     const rpc = session("missing-session-id");
+ 
+diff --git a/packages/host-runtime/src/adapter-composition.ts b/packages/host-runtime/src/adapter-composition.ts
+index 69558ca..cf58833 100644
+--- a/packages/host-runtime/src/adapter-composition.ts
++++ b/packages/host-runtime/src/adapter-composition.ts
+@@ -12,9 +12,144 @@ export const DEEPSEEK_HARNESS_ENDPOINT_ENV = "CODEXHOST_DEEPSEEK_HARNESS_ENDPOIN
+ export const PI_COMMAND_ENV = "CODEXHOST_PI_COMMAND";
+ export const GROK_COMMAND_ENV = "CODEXHOST_GROK_COMMAND";
+ export const OMP_COMMAND_ENV = "CODEXHOST_OMP_COMMAND";
++export const CODEXHOST_PI_DATA_DIR_ENV = "CODEXHOST_PI_DATA_DIR";
++export const CODEXHOST_OMP_DATA_DIR_ENV = "CODEXHOST_OMP_DATA_DIR";
++export const CODEXHOST_DSH_HOME_ENV = "CODEXHOST_DSH_HOME";
++export const CODEXHOST_GROK_HOME_ENV = "CODEXHOST_GROK_HOME";
++export const CODEXHOST_GROK_MODELS_JSON_ENV = "CODEXHOST_GROK_MODELS_JSON";
++export const EVERYONE_CODEX_LEASE_CAPABILITY_ENV = "EVERYONE_CODEX_LEASE_CAPABILITY";
++export const EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV =
++  "EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY";
++
++const harnessDataDirectoryEnvironment = [
++  CODEXHOST_PI_DATA_DIR_ENV,
++  CODEXHOST_OMP_DATA_DIR_ENV,
++  CODEXHOST_DSH_HOME_ENV,
++  CODEXHOST_GROK_HOME_ENV,
++] as const;
+ 
+ type InspectableHarnessAdapter = Pick<HarnessAdapter, "inspect">;
+ 
++function environmentValue(environment: NodeJS.ProcessEnv, name: string): string | undefined {
++  return Object.entries(environment).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
++}
++
++function deleteEnvironmentValue(environment: NodeJS.ProcessEnv, name: string): void {
++  for (const key of Object.keys(environment)) {
++    if (key.toLowerCase() === name.toLowerCase()) Reflect.deleteProperty(environment, key);
++  }
++}
++
++function configuredGrokModels(value: string | undefined):
++  | Array<{
++      id: string;
++      name: string;
++      upstreamId?: string;
++      contextWindow?: number;
++      reasoningLevels?: string[];
++    }>
++  | undefined {
++  if (value === undefined) return undefined;
++  if (value.length === 0 || value.length > 64 * 1024) {
++    throw new Error("CODEXHOST_GROK_MODELS_JSON has an invalid size");
++  }
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(value);
++  } catch {
++    throw new Error("CODEXHOST_GROK_MODELS_JSON is invalid JSON");
++  }
++  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 50) {
++    throw new Error("CODEXHOST_GROK_MODELS_JSON must contain a bounded Model array");
++  }
++  const seen = new Set<string>();
++  return parsed.map((entry) => {
++    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
++      throw new Error("CODEXHOST_GROK_MODELS_JSON contains an invalid Model");
++    }
++    const model = entry as Record<string, unknown>;
++    const id = typeof model.id === "string" ? model.id.trim() : "";
++    const name = typeof model.displayName === "string" ? model.displayName.trim() : "";
++    const upstreamId = typeof model.upstreamId === "string" ? model.upstreamId.trim() : "";
++    if (!id || id.length > 256 || !name || name.length > 256 || seen.has(id)) {
++      throw new Error("CODEXHOST_GROK_MODELS_JSON contains an invalid or duplicate Model");
++    }
++    if (model.upstreamId !== undefined && (!upstreamId || upstreamId.length > 256)) {
++      throw new Error("CODEXHOST_GROK_MODELS_JSON contains an invalid upstream Model id");
++    }
++    seen.add(id);
++    const contextWindow = model.contextWindow;
++    if (
++      contextWindow !== undefined &&
++      (!Number.isSafeInteger(contextWindow) || (contextWindow as number) < 1)
++    ) {
++      throw new Error("CODEXHOST_GROK_MODELS_JSON contains an invalid context window");
++    }
++    const reasoningLevels = model.reasoningLevels;
++    if (
++      !Array.isArray(reasoningLevels) ||
++      reasoningLevels.some((level) => typeof level !== "string" || !level)
++    ) {
++      throw new Error("CODEXHOST_GROK_MODELS_JSON contains invalid reasoning levels");
++    }
++    return {
++      id,
++      name,
++      ...(upstreamId ? { upstreamId } : {}),
++      ...(contextWindow === undefined ? {} : { contextWindow: contextWindow as number }),
++      reasoningLevels: [...new Set(reasoningLevels as string[])],
++    };
++  });
++}
++
++/**
++ * 为单个 Harness 创建独立环境。Codex 专用 lease 永不下沉；外部 lease 也不会进入
++ * Claude Code，避免其原生 OAuth 会话意外获得 Fusion Gateway 权限。
++ */
++export function externalHarnessEnvironment(
++  source: NodeJS.ProcessEnv,
++  harnessId: ExternalHarnessId,
++): NodeJS.ProcessEnv {
++  const environment = { ...source };
++  const configuredDirectories = Object.fromEntries(
++    harnessDataDirectoryEnvironment.map((name) => [name, environmentValue(source, name)]),
++  );
++
++  deleteEnvironmentValue(environment, EVERYONE_CODEX_LEASE_CAPABILITY_ENV);
++  for (const name of harnessDataDirectoryEnvironment) deleteEnvironmentValue(environment, name);
++  deleteEnvironmentValue(environment, CODEXHOST_GROK_MODELS_JSON_ENV);
++
++  if (harnessId === "claude-code") {
++    deleteEnvironmentValue(environment, EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV);
++    return environment;
++  }
++
++  const mapDirectory = (
++    sourceName: (typeof harnessDataDirectoryEnvironment)[number],
++    target: string,
++  ) => {
++    const directory = configuredDirectories[sourceName];
++    if (!directory) return;
++    deleteEnvironmentValue(environment, target);
++    environment[target] = directory;
++  };
++  switch (harnessId) {
++    case "pi":
++      mapDirectory(CODEXHOST_PI_DATA_DIR_ENV, "PI_CODING_AGENT_DIR");
++      break;
++    case "omp":
++      mapDirectory(CODEXHOST_OMP_DATA_DIR_ENV, "PI_CODING_AGENT_DIR");
++      break;
++    case "deepseek-harness":
++      mapDirectory(CODEXHOST_DSH_HOME_ENV, "DSH_HOME");
++      break;
++    case "grok":
++      mapDirectory(CODEXHOST_GROK_HOME_ENV, "GROK_HOME");
++      break;
++  }
++  return environment;
++}
++
+ export async function prefetchClaudeCodeModelCatalog(
+   adapters: ReadonlyMap<ExternalHarnessId, InspectableHarnessAdapter>,
+ ): Promise<void> {
+@@ -28,12 +163,20 @@ export async function prefetchClaudeCodeModelCatalog(
+ export function createExternalHarnessAdapters(
+   environment: NodeJS.ProcessEnv,
+ ): ReadonlyMap<ExternalHarnessId, HarnessAdapter> {
++  const piEnvironment = externalHarnessEnvironment(environment, "pi");
++  const claudeEnvironment = externalHarnessEnvironment(environment, "claude-code");
++  const deepSeekEnvironment = externalHarnessEnvironment(environment, "deepseek-harness");
++  const grokEnvironment = externalHarnessEnvironment(environment, "grok");
++  const ompEnvironment = externalHarnessEnvironment(environment, "omp");
++  const grokModels = configuredGrokModels(
++    environmentValue(environment, CODEXHOST_GROK_MODELS_JSON_ENV),
++  );
+   return new Map<ExternalHarnessId, HarnessAdapter>([
+     [
+       "pi",
+       new PiAdapter({
+         ...(environment[PI_COMMAND_ENV] ? { command: environment[PI_COMMAND_ENV] } : {}),
+-        environment,
++        environment: piEnvironment,
+       }),
+     ],
+     [
+@@ -42,7 +185,7 @@ export function createExternalHarnessAdapters(
+         ...(environment[CLAUDE_CODE_COMMAND_ENV]
+           ? { command: environment[CLAUDE_CODE_COMMAND_ENV] }
+           : {}),
+-        environment,
++        environment: claudeEnvironment,
+       }),
+     ],
+     [
+@@ -54,21 +197,27 @@ export function createExternalHarnessAdapters(
+         ...(environment[DEEPSEEK_HARNESS_ENDPOINT_ENV]
+           ? { endpoint: environment[DEEPSEEK_HARNESS_ENDPOINT_ENV] }
+           : {}),
+-        environment,
++        allowedProviders: ["everyone-in-codex"],
++        // 首次隔离 HOME 需要物化 DSH Web profile；20 秒默认值会误报 unavailable。
++        startupTimeoutMs: 60_000,
++        environment: deepSeekEnvironment,
+       }),
+     ],
+     [
+       "grok",
+       new GrokAdapter({
+         ...(environment[GROK_COMMAND_ENV] ? { command: environment[GROK_COMMAND_ENV] } : {}),
+-        environment,
++        ...(grokModels ? { configuredModels: grokModels } : {}),
++        environment: grokEnvironment,
+       }),
+     ],
+     [
+       "omp",
+       new OmpAdapter({
+         ...(environment[OMP_COMMAND_ENV] ? { command: environment[OMP_COMMAND_ENV] } : {}),
+-        environment,
++        environment: ompEnvironment,
++        readOnly: true,
++        allowedProviders: ["everyone-in-codex"],
+       }),
+     ],
+   ]);
+diff --git a/packages/host-runtime/src/index.ts b/packages/host-runtime/src/index.ts
+index da208c8..e48ac0f 100644
+--- a/packages/host-runtime/src/index.ts
++++ b/packages/host-runtime/src/index.ts
+@@ -12,12 +12,20 @@ import { packageMetadata as updateManager } from "@codexhost/update-manager";
+ 
+ export {
+   CLAUDE_CODE_COMMAND_ENV,
++  CODEXHOST_DSH_HOME_ENV,
++  CODEXHOST_GROK_HOME_ENV,
++  CODEXHOST_GROK_MODELS_JSON_ENV,
++  CODEXHOST_OMP_DATA_DIR_ENV,
++  CODEXHOST_PI_DATA_DIR_ENV,
+   DEEPSEEK_HARNESS_COMMAND_ENV,
+   DEEPSEEK_HARNESS_ENDPOINT_ENV,
++  EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV,
++  EVERYONE_CODEX_LEASE_CAPABILITY_ENV,
+   GROK_COMMAND_ENV,
+   OMP_COMMAND_ENV,
+   PI_COMMAND_ENV,
+   createExternalHarnessAdapters,
++  externalHarnessEnvironment,
+   prefetchClaudeCodeModelCatalog,
+ } from "./adapter-composition.js";
+ export { AppServerHost, classifyCreateRequestRoute } from "./app-server-host.js";
+diff --git a/packages/host-runtime/test/adapter-composition.test.ts b/packages/host-runtime/test/adapter-composition.test.ts
+index d93032c..af903cd 100644
+--- a/packages/host-runtime/test/adapter-composition.test.ts
++++ b/packages/host-runtime/test/adapter-composition.test.ts
+@@ -3,8 +3,16 @@ import { describe, expect, it, vi } from "vitest";
+ import type { HarnessInspection } from "@codexhost/harness-adapter";
+ import {
+   CLAUDE_CODE_COMMAND_ENV,
++  CODEXHOST_DSH_HOME_ENV,
++  CODEXHOST_GROK_HOME_ENV,
++  CODEXHOST_GROK_MODELS_JSON_ENV,
++  CODEXHOST_OMP_DATA_DIR_ENV,
++  CODEXHOST_PI_DATA_DIR_ENV,
++  EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV,
++  EVERYONE_CODEX_LEASE_CAPABILITY_ENV,
+   GROK_COMMAND_ENV,
+   createExternalHarnessAdapters,
++  externalHarnessEnvironment,
+   prefetchClaudeCodeModelCatalog,
+ } from "../src/index.js";
+ 
+@@ -46,6 +54,65 @@ describe("Host external Harness composition", () => {
+     await Promise.all([...adapters.values()].map((adapter) => adapter.close()));
+   });
+ 
++  it("isolates Fusion lease capabilities and Harness data directories", () => {
++    const source = {
++      PATH: "/synthetic/bin",
++      [EVERYONE_CODEX_LEASE_CAPABILITY_ENV]: "codex-only-capability",
++      [EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV]: "external-only-capability",
++      [CODEXHOST_PI_DATA_DIR_ENV]: "/fusion/pi",
++      [CODEXHOST_OMP_DATA_DIR_ENV]: "/fusion/omp",
++      [CODEXHOST_DSH_HOME_ENV]: "/fusion/dsh",
++      [CODEXHOST_GROK_HOME_ENV]: "/fusion/grok",
++      [CODEXHOST_GROK_MODELS_JSON_ENV]: JSON.stringify([
++        {
++          id: "everyone-in-codex~glm-5.3-flash",
++          upstreamId: "zai-api-cn/glm-5.3-flash",
++          displayName: "GLM-5.3-Flash",
++          contextWindow: 1_000_000,
++          reasoningLevels: ["low", "high", "max"],
++        },
++      ]),
++    };
++
++    const pi = externalHarnessEnvironment(source, "pi");
++    const omp = externalHarnessEnvironment(source, "omp");
++    const deepSeek = externalHarnessEnvironment(source, "deepseek-harness");
++    const grok = externalHarnessEnvironment(source, "grok");
++    const claude = externalHarnessEnvironment(source, "claude-code");
++
++    expect(pi).toMatchObject({
++      PATH: "/synthetic/bin",
++      [EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV]: "external-only-capability",
++      PI_CODING_AGENT_DIR: "/fusion/pi",
++    });
++    expect(omp).toMatchObject({
++      [EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV]: "external-only-capability",
++      PI_CODING_AGENT_DIR: "/fusion/omp",
++    });
++    expect(pi.PI_CODING_AGENT_DIR).not.toBe(omp.PI_CODING_AGENT_DIR);
++    expect(deepSeek).toMatchObject({
++      [EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV]: "external-only-capability",
++      DSH_HOME: "/fusion/dsh",
++    });
++    expect(grok).toMatchObject({
++      [EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV]: "external-only-capability",
++      GROK_HOME: "/fusion/grok",
++    });
++
++    for (const environment of [pi, omp, deepSeek, grok]) {
++      expect(environment).not.toHaveProperty(EVERYONE_CODEX_LEASE_CAPABILITY_ENV);
++    }
++    expect(claude).not.toHaveProperty(EVERYONE_CODEX_LEASE_CAPABILITY_ENV);
++    expect(claude).not.toHaveProperty(EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV);
++    for (const environment of [pi, omp, deepSeek, grok, claude]) {
++      expect(environment).not.toHaveProperty(CODEXHOST_PI_DATA_DIR_ENV);
++      expect(environment).not.toHaveProperty(CODEXHOST_OMP_DATA_DIR_ENV);
++      expect(environment).not.toHaveProperty(CODEXHOST_DSH_HOME_ENV);
++      expect(environment).not.toHaveProperty(CODEXHOST_GROK_HOME_ENV);
++      expect(environment).not.toHaveProperty(CODEXHOST_GROK_MODELS_JSON_ENV);
++    }
++  });
++
+   it("preserves an explicit user-installed Grok command", async () => {
+     const adapters = createExternalHarnessAdapters({
+       PATH: "",

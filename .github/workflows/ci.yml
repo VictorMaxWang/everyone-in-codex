@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Use locked Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+          architecture: x64
+
+      - name: Run focused tests
+        run: npm test
+
+      - name: Check source and script syntax
+        run: npm run check
+
+      - name: Patch materialization dry-run placeholder
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $materializer = Join-Path $PWD 'scripts/materialize-upstreams.ps1'
+          if (Test-Path -LiteralPath $materializer -PathType Leaf) {
+            $command = Get-Command $materializer -ErrorAction Stop
+            if ($command.Parameters.ContainsKey('DryRun')) {
+              & $materializer -DryRun
+              if (-not $?) { throw 'Patch materialization dry-run failed.' }
+            } else {
+              $patches = @(Get-ChildItem -LiteralPath ./patches -Filter *.patch -File -Recurse)
+              if ($patches.Count -eq 0) { throw 'No upstream patches were found for the dry-run placeholder.' }
+              foreach ($patch in $patches) {
+                & git apply --numstat -- $patch.FullName | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "Patch parse failed: $($patch.Name)" }
+              }
+            }
+          } else {
+            Write-Host 'No upstream materializer is checked in yet; placeholder passed without network access.'
+          }
+
+      - name: Adopt setup-node into repo-local runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nodeRoot = Split-Path -Parent (Get-Command node.exe -ErrorAction Stop).Source
+          & ./scripts/bootstrap.ps1 -RepoRoot $PWD -NodeRoot $nodeRoot
+          if (-not $?) { throw 'Repo-local toolchain bootstrap failed.' }
+
+      - name: Build and audit portable ZIP
+        run: npm run package:win
+
+      - name: Upload portable smoke artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: everyone-codex-windows-x64
+          path: |
+            artifacts/everyone-codex-*-windows-x64.zip
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7

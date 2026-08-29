@@ -1,0 +1,67 @@
+From 67642a36cb240c26afafef7aac2625b01b251a24 Mon Sep 17 00:00:00 2001
+From: Everyone in Codex <noreply@everyone-in-codex.invalid>
+Date: Sat, 29 Aug 2026 18:10:40 +0800
+Subject: [PATCH 01/11] docs: record v4.0.5 migration plan
+
+
+diff --git a/docs/superpowers/plans/2026-08-29-webgpt-v405-pro-repair.md b/docs/superpowers/plans/2026-08-29-webgpt-v405-pro-repair.md
+new file mode 100644
+index 0000000..5325593
+--- /dev/null
++++ b/docs/superpowers/plans/2026-08-29-webgpt-v405-pro-repair.md
+@@ -0,0 +1,53 @@
++# WebGPT v4.0.5 与 Pro Advisor 修复实施计划
++
++> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task.
++
++**Goal:** 以官方 v4.0.5 为基线恢复 Pro Advisor，并保留 external Router、Bigger Context、Advisor MCP 和 Windows 安全加固。
++
++**Architecture:** 官方 v4.0.5 负责连续对话、原生压缩、当前 effort 与 Personalization DOM；本地补丁只负责 external Router 所有权、不可逆提交握手、Advisor runtime、一次发送前网络重试及受保护部署。生产使用版本化 runtime 和整体回滚 cohort。
++
++**Tech Stack:** Bun 1.4.0、TypeScript、Playwright、Electron 41.10.7、Codex plugin MCP、tunnel-client 0.0.12。
++
++## 全局约束
++
++- 禁止 stock installer 接管 Codex route；生产必须保持 `full/external/native/launcher`。
++- 不重启 Router，不固定模型，不读取或导出 cookie/凭据。
++- Bigger Context 保持开启，五个 WebGPT 目录条目及上下文数值不变。
++- 不可逆提交后禁止自动重试；未知、重复、乱序 wire 字段失败关闭。
++- 生产切换前必须确认全部 turn 空闲并创建集中备份。
++
++### Task 1: 外部 Router 与 v4 核心兼容层
++
++- [ ] 保留现有失败用例 `installed launcher discovery has explicit platform candidates`，修复 Windows launcher discovery，使显式传入的 `environment.LOCALAPPDATA` 优先于真实进程环境；该用例必须由 FAIL 转为 PASS。
++- [ ] 以 v3 分支提交 `b93d916`、`4fc28db` 为行为参考，将 `codexIntegration: "external"`、`--no-codex-route` 和生产 tuple `full/external/native/launcher` 迁移到 v4；不得直接整文件复制。
++- [ ] external setup、repair、startup、Bigger Context 切换和 uninstall 均不得调用 Codex route connect/disconnect、创建 route journal、修改 `openai_base_url` 或覆盖 Router 配置。
++- [ ] launcher 的 setup/repair/UI 状态必须识别 external 所有权；stock `--replace-codex-route` 在 external 路径下失败关闭，自动更新保持禁用。
++- [ ] 保留 v4 retained conversation、native compaction、Personalization、effort slider、continuous task 与 helper wire，不回退相关实现。
++- [ ] 移植/更新 `tests/external-integration.test.ts`，证明 setup、Bigger Context、刷新和 uninstall 前后 Codex/Router 文件字节不变，且只报告需要 Router catalog refresh 与完整 Codex restart。
++- [ ] 定向运行 `tests/dev-profile.test.ts`、`tests/external-integration.test.ts`、`tests/cli.test.ts`、`tests/setup-lifecycle.test.ts` 和 launcher runtime/state 测试；随后运行核心全套测试和 typecheck。
++
++### Task 2: Bigger Context 与不可逆提交协议
++
++- [ ] 迁移 inline/两段/三段、ACK、final commit、冷却弹窗续跑和 retained lease 安全逻辑。
++- [ ] 合并 v4 `prepared_selected`、`send_activated`、`submitted`，保持本地授权为最终 Enter 防线。
++- [ ] 证明 Pro compaction 复用同一 Pro/max retained chat，丢失时才 fallback。
++
++### Task 3: Pro UI 与一次发送前网络重试
++
++- [ ] 增加真实行为测试覆盖当前 neutral effort trigger 和多语言结构化 Personalization。
++- [ ] 在初始 Temporary Chat 导航处产生品牌化可重试错误。
++- [ ] helper 仅对三个允许码等待 5 秒并用新 surface 重试一次；发送后、retained、maintenance 和取消不重试。
++- [ ] 删除 Advisor 自身的叠加重试。
++
++### Task 4: Advisor MCP、runtime 与 tunnel 加固
++
++- [ ] 移植六个 Advisor 工具、5 活动/50 队列、600 分钟等待、30 分钟保留、附件与 artifact 边界。
++- [ ] 保留 0.0.12 tunnel 事务升级、代理隔离、Windows 有界探测、全树 digest 和 reparse-point 拒绝。
++- [ ] runtime manifest 必须包含 Advisor entrypoint，版本化包可搬迁验证通过。
++
++### Task 5: 离线验证、插件与生产切换
++
++- [ ] 运行定向套件、typecheck、launcher test/audit、`bun run verify`、Windows package 和 relocatable smoke。
++- [ ] 创建整体回滚备份后事务安装 `versions/4.0.5-win32-x64` 和定制 launcher。
++- [ ] 使用 cachebuster helper 更新并重装 `chatgpt-pro-advisor@personal`，不手改 marketplace。
++- [ ] 验证 `/healthz`、Router 健康、目录不变；完整重启 Codex 后运行 Pro、四并发 Advisor 和 110k/205k/286k canary。
+-- 
+2.55.0.windows.2

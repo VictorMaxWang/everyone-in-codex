@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "allowedCodexHomes": [
+    "<absolute-path-to-isolated-codex-home>"
+  ],
+  "allowedDesktopRoots": [
+    "<absolute-path-to-managed-codex-desktop-version>",
+    "<absolute-path-to-isolated-electron-user-data>"
+  ],
+  "protectedCodexHomes": [
+    "<absolute-path-to-primary-codex-home>"
+  ],
+  "protectedDesktopRoots": [
+    "C:\\Program Files\\WindowsApps"
+  ]
+}

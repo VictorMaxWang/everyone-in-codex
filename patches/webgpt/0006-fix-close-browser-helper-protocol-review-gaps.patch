@@ -1,0 +1,1463 @@
+From aba44aea9cb4284ec28836ba5bc3d9dab9e2ae1c Mon Sep 17 00:00:00 2001
+From: Everyone in Codex <noreply@everyone-in-codex.invalid>
+Date: Sat, 29 Aug 2026 21:14:58 +0800
+Subject: [PATCH 06/11] fix: close browser helper protocol review gaps
+
+
+diff --git a/.superpowers/sdd/2026-08-29-webgpt-v405-pro-repair/task-2-report.md b/.superpowers/sdd/2026-08-29-webgpt-v405-pro-repair/task-2-report.md
+deleted file mode 100644
+index 6bf771b..0000000
+--- a/.superpowers/sdd/2026-08-29-webgpt-v405-pro-repair/task-2-report.md
++++ /dev/null
+@@ -1,135 +0,0 @@
+-# Task 2 报告：Bigger Context 与不可逆提交协议
+-
+-## 状态
+-
+-完成。实现基于 v4.0.5 的 retained conversation、native compaction、fresh/resume prompt 选择、effort slider、隐藏 viewport、重连与 DOM virtualization；仅将 v3 `a01780d`、`3536f30`、`63fd33a` 的逐阶段授权与 cooldown 行为迁入现有 v4 接缝，没有复制覆盖整个重叠文件，也没有触碰生产服务、Router、live config、凭据或模型选择。
+-
+-## 实现
+-
+-### 1. helper / 父进程逐阶段授权
+-
+-- 新增严格四字段 `submission_attempt` / `submission_authorized` 帧：`type`、`id`、`transport`、`submission`。任何额外、缺失、错误 turn、错误 transport 或错误 stage/final 都失败关闭。
+-- helper 在实际 `Enter` 前登记 waiter 并发出 attempt；只有父进程对当前 turn + transport + stage/final 的一次精确授权才能继续。timeout、abort、shutdown 都清理 waiter。
+-- 父进程以 `prepared_selected(_ack)` 选中的真实 `inline` / `multipart-2` / `multipart-3` 为权威，先推进不可重试屏障，再写 authorization；pipe 写入是否到达不明时不会安全重放。
+-- 保留并串联 v4 `prepared_selected(_ack)`、`send_activated(_ack)`、`submitted`。父/helper 两侧状态机拒绝重复、乱序、transport 变化、stage 越界、ACK 提前、final 提前和未知字段。
+-- helper 的 stage accepted / ACK 证据写失败会抛错；重复 prompt 选择会中止 turn，而不是静默覆盖。
+-
+-### 2. 浏览器本地不可逆状态机
+-
+-- `ChatGptMultipartSubmissionState` 固定 `attempt -> accepted -> exact ACK -> next` 单向跃迁；两段 staging 与 final 各最多一次。
+-- stage ACK 缺失、错误或超时会阻断所有后续 stage 与 final。
+-- `sendAttachedPrompt` 在按钮可见、可用且 cooldown 健康之后请求授权，授权后才进入既有 Send activation，再按 `Enter`。
+-- final 之前仍按 v4 顺序完成 staging、恢复目标 effort、compaction composer retry、connector 与附件；图片/附件/connector 没有进入 staging。
+-- 任何 attempt 之后的普通或 retryable 失败均规范化为 `multipart_submission_ambiguous`、`retryable:false`；已明确非重试的结构化终态按原错误保留。
+-
+-### 3. turn 级 cooldown controller
+-
+-- 已知英、简中、繁中、日文弹窗采用严格正文组合和严格按钮 `Got it` / `知道了` / `明白了` / `了解`。
+-- 点击后必须证明 dialog hidden 才递增 generation；按钮缺失、正文未知或弹窗不消失返回结构化可重试 429，并让 controller 失败关闭。
+-- controller 在 turn 生命周期内持续监听，次数不限，直到 abort、页面关闭或 turn 完成。
+-- effort/menu、stage send、stage ACK、final send/response、compaction 后继续阶段均原地恢复；generation 不清除 submission 状态，也不重新提交已接受 stage/final。
+-- launcher 同页 rebind 时停止旧 controller、在新 Page 上重建，保留 v4 DOM virtualization / reconnect 逻辑。
+-
+-### 4. v4 权威行为保持
+-
+-- `conversationKey`、`connectorIdentity`、`requireRetainedConversation`、`retain`、`connectorBound` 的 launcher 交互未被替换。
+-- fresh/resume 仍由 launcher lease 的 `reused` 决定，并由父进程选择 `prepare` 或 `prepareResume`。
+-- retained compaction 测试继续证明同一 Pro/max retained chat；仅 source unavailable / disappeared 时 canonical fallback。
+-- effort slider、hidden viewport、五 tab 限制、DOM rebind、stream replay、附件终态和 native tool broker 的既有测试保持通过。
+-
+-## TDD 证据
+-
+-所有功能切片先加入行为测试并观察预期 RED，再写最小实现：
+-
+-1. 授权 gate
+-   - RED：`npx --yes bun@1.4.0 test tests/helper-submission-authorization.test.ts`
+-   - 结果：找不到 `helper-submission-authorization`；0 pass、1 fail、1 error。
+-   - GREEN：同命令；1 pass、0 fail、7 expects。
+-2. 浏览器 multipart 状态
+-   - RED：`npx --yes bun@1.4.0 test tests/browser-submission-state.test.ts`
+-   - 结果：缺少 `ChatGptMultipartSubmissionState` export；0 pass、1 fail、1 error。
+-   - GREEN：初始 1 pass；最终扩展为 3 pass，覆盖跨阶段 cooldown、ACK 防线、重复 final 与不可重试歧义。
+-3. 父进程 turn 协议
+-   - RED：`npx --yes bun@1.4.0 test tests/helper-turn-protocol-state.test.ts`
+-   - 结果：缺少 `ChatGptHelperTurnProtocolState` export；0 pass、1 fail、1 error。
+-   - GREEN：2 pass、0 fail、8 expects。
+-4. 真实 helper client wire
+-   - RED：`npx --yes bun@1.4.0 test tests/launcher-helper-client.test.ts -t "Bun daemon streams"`
+-   - 结果：父进程把 `submission_attempt` 当成 unknown message，1 fail。
+-   - GREEN：1 pass、0 fail、7 expects；之后增加 resume-selected multipart-3 全握手。
+-5. cooldown 原地恢复
+-   - RED：`npx --yes bun@1.4.0 test tests/browser-worker-contract.test.ts -t "current wait resumes"`
+-   - 结果：已点击弹窗后仍抛 structured 429，1 fail。
+-   - GREEN：当前 phase 继续，1 pass。
+-6. turn controller
+-   - RED：筛选 `turn cooldown controller`；缺少 `ChatGptRateLimitDialogController` export。
+-   - GREEN：generation 仅在 hidden 后发布；重复三次弹窗直到 abort 的测试通过。
+-7. prompt 选择只允许一次
+-   - RED：`npx --yes bun@1.4.0 test tests/browser-helper-prompt-selection.test.ts`；重复 select 未抛错。
+-   - GREEN：1 pass、0 fail、2 expects。
+-8. unknown wire field
+-   - RED：筛选 `unknown field`；带额外字段的 ready 帧仍保留 child，1 fail。
+-   - GREEN：协议立即终止 child，1 pass。
+-9. 不可逆失败规范化
+-   - RED：缺少 `protectChatGptIrreversibleSubmissionFailure` export；0 pass、1 fail、1 error。
+-   - GREEN：attempt 后普通错误变为 502 / `multipart_submission_ambiguous` / `retryable:false`。
+-
+-## 验证命令与结果
+-
+-- 协议/worker/helper 聚焦：
+-  - `npx --yes bun@1.4.0 test tests/helper-submission-authorization.test.ts tests/helper-turn-protocol-state.test.ts tests/browser-helper-prompt-selection.test.ts tests/browser-submission-state.test.ts tests/launcher-helper-client.test.ts tests/browser-worker-contract.test.ts`
+-  - 97 pass、0 fail、441 expects，6 files。
+-- retained / broker / launcher host 定向：
+-  - `npx --yes bun@1.4.0 test tests/retained-compaction.test.ts tests/turn-broker-lifecycle.test.ts tests/launcher-browser-host.test.ts`
+-  - 40 pass、0 fail、147 expects，3 files。
+-- core 全量：
+-  - `npx --yes bun@1.4.0 run test -- --timeout 20000`
+-  - 438 pass、0 fail、1983 expects，42 files，54.94s。
+-- launcher 全量：
+-  - `npx --yes bun@1.4.0 run --cwd launcher test -- tests/browser-host.test.cjs tests/control-server.test.cjs tests/runtime-host.test.cjs tests/runtime-supervisor.test.cjs`
+-  - launcher script 自带 `tests/*.test.cjs`，实际跑完全套；210 pass、0 fail、2 skip（平台限定），212 tests。
+-- core typecheck：`npx --yes bun@1.4.0 run typecheck`，exit 0。
+-- launcher typecheck：`npx --yes bun@1.4.0 run --cwd launcher typecheck`，exit 0。
+-- `git diff --check`：exit 0。
+-
+-环境说明：仓库锁定 Bun 1.4.0，但 `bun` 未在当前 PATH，因此所有验证通过 `npx --yes bun@1.4.0` 运行。最初裸 `bun` 的 PATH 失败不属于功能 RED。
+-
+-## 变更文件
+-
+-- `src/adapters/chatgpt-web/helper-submission-authorization.ts`
+-- `src/adapters/chatgpt-web/browser-helper-main.ts`
+-- `src/adapters/chatgpt-web/browser-helper-prompt-selection.ts`
+-- `src/adapters/chatgpt-web/browser-worker.ts`
+-- `src/adapters/chatgpt-web/launcher-helper-client.ts`
+-- `tests/helper-submission-authorization.test.ts`
+-- `tests/helper-turn-protocol-state.test.ts`
+-- `tests/browser-helper-prompt-selection.test.ts`
+-- `tests/browser-submission-state.test.ts`
+-- `tests/browser-worker-contract.test.ts`
+-- `tests/launcher-helper-client.test.ts`
+-- `.superpowers/sdd/2026-08-29-webgpt-v405-pro-repair/task-2-report.md`
+-
+-## 自审
+-
+-### 规范轴
+-
+-- 只修改 Task 2 协议与测试；没有服务重启、生产配置、Router route、cookie/凭据读取、模型固定、备份或 installer 操作。
+-- 所有编辑通过 `apply_patch`；没有覆盖用户已有无关改动。
+-- 中文注释集中解释不可逆边界、pipe 歧义、generation hidden proof、cooldown 原地恢复与 rebind 设计原因；没有逐行复述显然代码。
+-- 新测试调用真实状态机和 wire client 行为；已有少量 source-contract 测试保留，但不作为新协议的主要证明。
+-
+-### brief 轴
+-
+-- inline / multipart-2 / multipart-3、stage/final 一次性授权：已覆盖。
+-- ACK 缺失/乱序阻止下一段和 final：已覆盖。
+-- fresh/resume 与既有 prepared/send/submitted 握手共存：已覆盖真实 helper client。
+-- 重复、未知字段、错误 transport / stage 失败关闭：已覆盖。
+-- 已知多语言 cooldown、严格按钮、hidden proof、无限重复直到 abort：已覆盖。
+-- stage send、accepted、ACK、effort、compaction、final send、final response 的 cooldown 原地恢复且发送计数始终为 1：已覆盖。
+-- retained Pro compaction 与 canonical fallback 边界：定向套件通过。
+-- core/launcher 全量与两套 typecheck：通过。
+-
+-## 关注点
+-
+-- `tests/chatgpt-web-harness.test.ts` 单文件隔离运行在 Windows 上两次停在既有 `revoking a turn rejects pending invocations and invalidates its binding`：broker 已打印 delivered，`revoke()` 已执行，但 pending named-pipe invocation 未及时向客户端结算。该测试与 `turn-broker.ts` 均未被 Task 2 修改；同一用例在 core 42 文件全量运行中通过，`turn-broker-lifecycle` 定向套件也通过。因此记录为非阻塞的既有/时序敏感 harness 关注点，未跨任务修改 broker 架构。
+-- 未启动真实 ChatGPT/launcher/Router 生产实例；验证限定为仓库状态机、helper 子进程、broker/launcher 生命周期与全量自动化测试，符合任务对 live config/production services 的排除。
+diff --git a/src/adapters/chatgpt-web/browser-helper-main.ts b/src/adapters/chatgpt-web/browser-helper-main.ts
+index 169aea2..6a54255 100644
+--- a/src/adapters/chatgpt-web/browser-helper-main.ts
++++ b/src/adapters/chatgpt-web/browser-helper-main.ts
+@@ -3,71 +3,23 @@ import { stdin, stderr, stdout } from "node:process";
+ import type { CodexProviderConfig } from "../../types";
+ import { ChatGptBrowserWorker, closeChatGptBrowserWorkers, type BrowserTurn } from "./browser-worker";
+ import { ChatGptWebAdapterError } from "./adapter-error";
+-import type { ChatGptWebCapabilities } from "./model";
+ import { createProcessLineWriter } from "./process-line-writer";
+ import { createBrowserHelperPromptSelection } from "./browser-helper-prompt-selection";
+ import type { CompiledChatGptWebPrompt } from "./prompt";
+ import {
+   ChatGptHelperSubmissionAuthorizationGate,
+-  type ChatGptHelperSubmissionAuthorization,
+   type ChatGptHelperSubmissionTransport,
+ } from "./helper-submission-authorization";
+-
+-interface RunMessage {
+-  type: "run";
+-  id: string;
+-  config: {
+-    appName: string;
+-    browserHostDescriptorPath: string;
+-    browserDiagnosticsPath?: string;
+-    turnTimeoutMs: number;
+-    autoApproveToolCalls: boolean;
+-  };
+-  turn: {
+-    traceId: string;
+-    modelId: string;
+-    reasoning?: string;
+-    capabilities: ChatGptWebCapabilities;
+-    nativeConnector?: boolean;
+-    resumeAvailable?: boolean;
+-    retainConversation?: boolean;
+-    requireRetainedConversation?: boolean;
+-    conversationKey?: string;
+-    compaction?: boolean;
+-    captureLunaCheckpoint?: boolean;
+-  };
+-}
+-
+-interface VerifyMessage {
+-  type: "verify";
+-  id: string;
+-  config: {
+-    appName: string;
+-    browserHostDescriptorPath: string;
+-  };
+-}
+-
+-interface InspectMessage {
+-  type: "inspect";
+-  id: string;
+-  config: VerifyMessage["config"];
+-  detectCapabilities: boolean;
+-}
+-
+-interface SmokeMessage {
+-  type: "smoke";
+-  id: string;
+-  config: VerifyMessage["config"];
+-}
+-
+-type MaintenanceMessage = VerifyMessage | InspectMessage | SmokeMessage;
+-type InputMessage = RunMessage
+-  | MaintenanceMessage
+-  | ChatGptHelperSubmissionAuthorization
+-  | { type: "prepared_selected_ack"; id: string; prepared: CompiledChatGptWebPrompt }
+-  | { type: "send_activation_ack"; id: string }
+-  | { type: "abort"; id: string }
+-  | { type: "shutdown" };
++import {
++  BrowserHelperInboundProtocolState,
++  parseBrowserHelperInputMessage,
++  type BrowserHelperInputMessage as InputMessage,
++  type BrowserHelperInspectMessage as InspectMessage,
++  type BrowserHelperMaintenanceMessage as MaintenanceMessage,
++  type BrowserHelperRunMessage as RunMessage,
++  type BrowserHelperSmokeMessage as SmokeMessage,
++  type BrowserHelperVerifyMessage as VerifyMessage,
++} from "./browser-helper-protocol";
+ 
+ let outputFailure: Error | undefined;
+ const handleOutputFailure = (error: Error): void => {
+@@ -97,6 +49,7 @@ const sendActivationWaiters = new Map<string, {
+   resolve: () => void;
+   reject: (error: Error) => void;
+ }>();
++const inboundProtocol = new BrowserHelperInboundProtocolState();
+ let shuttingDown = false;
+ let shutdownPromise: Promise<void> | undefined;
+ 
+@@ -207,6 +160,7 @@ async function run(message: RunMessage): Promise<void> {
+     ...(message.turn.compaction ? { compaction: true } : {}),
+     onHeartbeat: () => writeProtocol({ type: "event", id: message.id, event: "heartbeat" }),
+     onPreparedSelected: reused => {
++      inboundProtocol.expectPreparedSelectedAck(message.id);
+       if (!writeProtocol({ type: "event", id: message.id, event: "prepared_selected", reused })) {
+         throw new Error("Browser helper could not request prompt selection");
+       }
+@@ -214,6 +168,7 @@ async function run(message: RunMessage): Promise<void> {
+     },
+     onStageSubmissionAttempt: (stageIndex, signal) => {
+       if (stageIndex !== 1 && stageIndex !== 2) throw new Error("Browser helper submission stage is invalid");
++      inboundProtocol.assertAuthorizedTurn(message.id);
+       return submissionAuthorizations.request({
+         type: "submission_attempt",
+         id: message.id,
+@@ -243,17 +198,21 @@ async function run(message: RunMessage): Promise<void> {
+         throw new Error("Browser helper could not persist multipart acknowledgement evidence");
+       }
+     },
+-    onFinalSubmissionAttempt: signal => submissionAuthorizations.request({
+-      type: "submission_attempt",
+-      id: message.id,
+-      transport: requireSelectedTransport(),
+-      submission: "final",
+-    }, signal),
++    onFinalSubmissionAttempt: signal => {
++      inboundProtocol.assertAuthorizedTurn(message.id);
++      return submissionAuthorizations.request({
++        type: "submission_attempt",
++        id: message.id,
++        transport: requireSelectedTransport(),
++        submission: "final",
++      }, signal);
++    },
+     onSendActivated: () => new Promise<void>((resolve, reject) => {
+       if (sendActivationWaiters.has(message.id)) {
+         reject(new Error("Browser helper Send activation already awaits acknowledgement"));
+         return;
+       }
++      inboundProtocol.expectSendActivationAck(message.id);
+       sendActivationWaiters.set(message.id, { resolve, reject });
+       if (!writeProtocol({ type: "event", id: message.id, event: "send_activated" })) {
+         sendActivationWaiters.delete(message.id);
+@@ -371,42 +330,29 @@ const input = createInterface({ input: stdin, crlfDelay: Infinity });
+ input.on("line", line => {
+   if (shuttingDown) return;
+   let message: InputMessage;
+-  try { message = JSON.parse(line) as InputMessage; }
+-  catch {
+-    writeProtocol({ type: "error", id: "protocol", message: "Browser helper received invalid JSON" });
++  try { message = parseBrowserHelperInputMessage(JSON.parse(line) as unknown); }
++  catch (error) {
++    const detail = error instanceof Error ? error.message : String(error);
++    writeProtocol({ type: "error", id: "protocol", message: detail });
++    diagnostic(`Browser helper input protocol failed: ${detail}`);
++    void requestShutdown();
+     return;
+   }
+   if (message.type === "submission_authorized") {
+-    try { submissionAuthorizations.authorize(message); }
++    try {
++      inboundProtocol.assertAuthorizedTurn(message.id);
++      submissionAuthorizations.authorize(message);
++    }
+     catch (error) {
+       diagnostic(`Browser helper submission authorization failed: ${error instanceof Error ? error.message : String(error)}`);
+       void requestShutdown();
+     }
+   } else if (message.type === "prepared_selected_ack") {
+-    const prepared = message.prepared;
+-    if (!prepared || typeof prepared.text !== "string" || !Array.isArray(prepared.images)) {
+-      writeProtocol({ type: "error", id: message.id, message: "Browser helper prompt selection is invalid" });
+-      abortControllers.get(message.id)?.abort();
+-      return;
+-    }
+-    if (prepared.multipart !== undefined) {
+-      const multipart = prepared.multipart;
+-      if (!multipart || !Array.isArray(multipart.parts)
+-        || (multipart.parts.length !== 2 && multipart.parts.length !== 3)
+-        || multipart.parts.some(part => typeof part !== "string")
+-        || typeof multipart.commit !== "string") {
+-        writeProtocol({ type: "error", id: message.id, message: "Browser helper multipart prompt is invalid" });
+-        abortControllers.get(message.id)?.abort();
+-        return;
+-      }
+-    }
+-    const selection = preparedSelections.get(message.id);
+-    if (!selection) {
+-      writeProtocol({ type: "error", id: message.id, message: "Browser helper has no pending prompt selection" });
+-      return;
+-    }
+     try {
+-      selection.select(prepared);
++      inboundProtocol.observePreparedSelectedAck(message.id);
++      const selection = preparedSelections.get(message.id);
++      if (!selection) throw new Error("Browser helper has no pending prompt selection");
++      selection.select(message.prepared);
+     } catch (error) {
+       writeProtocol({
+         type: "error",
+@@ -414,16 +360,30 @@ input.on("line", line => {
+         message: error instanceof Error ? error.message : String(error),
+       });
+       abortControllers.get(message.id)?.abort();
++      void requestShutdown();
+     }
+   } else if (message.type === "send_activation_ack") {
+-    const waiter = sendActivationWaiters.get(message.id);
+-    if (!waiter) {
+-      writeProtocol({ type: "error", id: message.id, message: "Browser helper has no pending Send activation" });
+-      return;
++    try {
++      inboundProtocol.observeSendActivationAck(message.id);
++      const waiter = sendActivationWaiters.get(message.id);
++      if (!waiter) throw new Error("Browser helper has no pending Send activation");
++      sendActivationWaiters.delete(message.id);
++      waiter.resolve();
++    } catch (error) {
++      writeProtocol({
++        type: "error",
++        id: message.id,
++        message: error instanceof Error ? error.message : String(error),
++      });
++      void requestShutdown();
+     }
+-    sendActivationWaiters.delete(message.id);
+-    waiter.resolve();
+   } else if (message.type === "abort") {
++    try { inboundProtocol.observeAbort(message.id); }
++    catch (error) {
++      writeProtocol({ type: "error", id: message.id, message: error instanceof Error ? error.message : String(error) });
++      void requestShutdown();
++      return;
++    }
+     submissionAuthorizations.rejectTurn(
+       message.id,
+       new DOMException("Launcher browser helper turn aborted", "AbortError"),
+@@ -437,23 +397,35 @@ input.on("line", line => {
+   else if (message.type === "shutdown") {
+     void requestShutdown();
+   } else if (message.type === "verify") {
++    try { inboundProtocol.beginOperation(message.id); }
++    catch (error) {
++      diagnostic(`Browser helper operation protocol failed: ${error instanceof Error ? error.message : String(error)}`);
++      void requestShutdown();
++      return;
++    }
+     void verify(message).catch(error => writeProtocol({
+-      type: "error",
+-      id: message.id,
+-      message: error instanceof Error ? error.message : String(error),
+-    }));
++      type: "error", id: message.id, message: error instanceof Error ? error.message : String(error),
++    })).finally(() => inboundProtocol.endOperation(message.id));
+   } else if (message.type === "inspect" || message.type === "smoke") {
++    try { inboundProtocol.beginOperation(message.id); }
++    catch (error) {
++      diagnostic(`Browser helper operation protocol failed: ${error instanceof Error ? error.message : String(error)}`);
++      void requestShutdown();
++      return;
++    }
+     void maintain(message).catch(error => writeProtocol({
+-      type: "error",
+-      id: message.id,
+-      message: error instanceof Error ? error.message : String(error),
+-    }));
++      type: "error", id: message.id, message: error instanceof Error ? error.message : String(error),
++    })).finally(() => inboundProtocol.endOperation(message.id));
+   } else {
++    try { inboundProtocol.beginTurn(message.id); }
++    catch (error) {
++      diagnostic(`Browser helper turn protocol failed: ${error instanceof Error ? error.message : String(error)}`);
++      void requestShutdown();
++      return;
++    }
+     void run(message).catch(error => writeProtocol({
+-      type: "error",
+-      id: message.id,
+-      message: error instanceof Error ? error.message : String(error),
+-    }));
++      type: "error", id: message.id, message: error instanceof Error ? error.message : String(error),
++    })).finally(() => inboundProtocol.endTurn(message.id));
+   }
+ });
+ input.on("close", () => {
+diff --git a/src/adapters/chatgpt-web/browser-helper-protocol.ts b/src/adapters/chatgpt-web/browser-helper-protocol.ts
+new file mode 100644
+index 0000000..8d827b6
+--- /dev/null
++++ b/src/adapters/chatgpt-web/browser-helper-protocol.ts
+@@ -0,0 +1,346 @@
++import type { ChatGptWebCapabilities } from "./model";
++import type { CompiledChatGptWebPrompt } from "./prompt";
++import {
++  parseChatGptHelperSubmissionAuthorization,
++  type ChatGptHelperSubmissionAuthorization,
++} from "./helper-submission-authorization";
++
++export interface BrowserHelperRunMessage {
++  type: "run";
++  id: string;
++  config: {
++    appName: string;
++    browserHostDescriptorPath: string;
++    browserDiagnosticsPath?: string;
++    turnTimeoutMs?: number;
++    autoApproveToolCalls: boolean;
++  };
++  turn: {
++    traceId: string;
++    modelId: string;
++    reasoning?: string;
++    capabilities: ChatGptWebCapabilities;
++    nativeConnector?: boolean;
++    resumeAvailable?: boolean;
++    retainConversation?: boolean;
++    requireRetainedConversation?: boolean;
++    conversationKey?: string;
++    compaction?: boolean;
++    captureLunaCheckpoint?: boolean;
++  };
++}
++
++export interface BrowserHelperVerifyMessage {
++  type: "verify";
++  id: string;
++  config: { appName: string; browserHostDescriptorPath: string };
++}
++
++export interface BrowserHelperInspectMessage extends Omit<BrowserHelperVerifyMessage, "type"> {
++  type: "inspect";
++  detectCapabilities: boolean;
++}
++
++export interface BrowserHelperSmokeMessage extends Omit<BrowserHelperVerifyMessage, "type"> {
++  type: "smoke";
++}
++
++export type BrowserHelperMaintenanceMessage =
++  | BrowserHelperVerifyMessage
++  | BrowserHelperInspectMessage
++  | BrowserHelperSmokeMessage;
++
++export type BrowserHelperInputMessage =
++  | BrowserHelperRunMessage
++  | BrowserHelperMaintenanceMessage
++  | ChatGptHelperSubmissionAuthorization
++  | { type: "prepared_selected_ack"; id: string; prepared: CompiledChatGptWebPrompt }
++  | { type: "send_activation_ack"; id: string }
++  | { type: "abort"; id: string }
++  | { type: "shutdown" };
++
++function record(value: unknown, label: string): Record<string, unknown> {
++  if (!value || typeof value !== "object" || Array.isArray(value)) {
++    throw new Error(`Browser helper ${label} is not an object`);
++  }
++  return value as Record<string, unknown>;
++}
++
++function assertKeys(
++  value: Record<string, unknown>,
++  required: readonly string[],
++  optional: readonly string[] = [],
++): void {
++  const keys = Object.keys(value);
++  const allowed = new Set([...required, ...optional]);
++  if (required.some(key => !Object.hasOwn(value, key)) || keys.some(key => !allowed.has(key))) {
++    throw new Error("Browser helper input frame has unknown or missing fields");
++  }
++}
++
++function turnId(value: unknown): string {
++  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{6,128}$/.test(value)) {
++    throw new Error("Browser helper input turn identity is invalid");
++  }
++  return value;
++}
++
++function stringField(value: unknown, label: string): string {
++  if (typeof value !== "string" || !value.trim()) throw new Error(`Browser helper ${label} is invalid`);
++  return value;
++}
++
++function parseMaintenanceConfig(value: unknown): BrowserHelperVerifyMessage["config"] {
++  const config = record(value, "maintenance config");
++  assertKeys(config, ["appName", "browserHostDescriptorPath"]);
++  return {
++    appName: stringField(config.appName, "app name"),
++    browserHostDescriptorPath: stringField(config.browserHostDescriptorPath, "host descriptor path"),
++  };
++}
++
++function parsePrepared(value: unknown): CompiledChatGptWebPrompt {
++  const prepared = record(value, "prepared prompt");
++  assertKeys(prepared, ["text", "images"], ["multipart", "trimmedCompactionMessages"]);
++  if (typeof prepared.text !== "string" || !Array.isArray(prepared.images)) {
++    throw new Error("Browser helper prepared prompt is invalid");
++  }
++  let multipart: CompiledChatGptWebPrompt["multipart"];
++  if (prepared.multipart !== undefined) {
++    const rawMultipart = record(prepared.multipart, "multipart prompt");
++    assertKeys(rawMultipart, ["parts", "commit"]);
++    if (!Array.isArray(rawMultipart.parts)
++      || (rawMultipart.parts.length !== 2 && rawMultipart.parts.length !== 3)
++      || rawMultipart.parts.some(part => typeof part !== "string")
++      || typeof rawMultipart.commit !== "string") {
++      throw new Error("Browser helper multipart prompt is invalid");
++    }
++    multipart = {
++      parts: rawMultipart.parts as unknown as NonNullable<CompiledChatGptWebPrompt["multipart"]>["parts"],
++      commit: rawMultipart.commit,
++    };
++  }
++  if (prepared.trimmedCompactionMessages !== undefined
++    && (!Number.isInteger(prepared.trimmedCompactionMessages)
++      || (prepared.trimmedCompactionMessages as number) < 0)) {
++    throw new Error("Browser helper compaction trim count is invalid");
++  }
++  return {
++    text: prepared.text,
++    images: prepared.images as CompiledChatGptWebPrompt["images"],
++    ...(multipart ? { multipart } : {}),
++    ...(prepared.trimmedCompactionMessages !== undefined
++      ? { trimmedCompactionMessages: prepared.trimmedCompactionMessages as number }
++      : {}),
++  };
++}
++
++function parseRun(message: Record<string, unknown>): BrowserHelperRunMessage {
++  assertKeys(message, ["type", "id", "config", "turn"]);
++  const id = turnId(message.id);
++  const config = record(message.config, "run config");
++  assertKeys(
++    config,
++    ["appName", "browserHostDescriptorPath", "autoApproveToolCalls"],
++    ["browserDiagnosticsPath", "turnTimeoutMs"],
++  );
++  const turn = record(message.turn, "run turn");
++  assertKeys(
++    turn,
++    ["traceId", "modelId", "capabilities"],
++    [
++      "reasoning", "nativeConnector", "resumeAvailable", "retainConversation",
++      "requireRetainedConversation", "conversationKey", "compaction", "captureLunaCheckpoint",
++    ],
++  );
++  const capabilities = record(turn.capabilities, "capabilities");
++  assertKeys(capabilities, ["localToolsEnabled", "solAvailable", "proAvailable"]);
++  if ([capabilities.localToolsEnabled, capabilities.solAvailable, capabilities.proAvailable]
++    .some(flag => typeof flag !== "boolean")) {
++    throw new Error("Browser helper capabilities are invalid");
++  }
++  if (turn.traceId !== id) throw new Error("Browser helper run changed turn identity");
++  if (config.turnTimeoutMs !== undefined
++    && (typeof config.turnTimeoutMs !== "number" || !Number.isFinite(config.turnTimeoutMs)
++      || config.turnTimeoutMs <= 0)) {
++    throw new Error("Browser helper run config is invalid");
++  }
++  if (typeof config.autoApproveToolCalls !== "boolean") {
++    throw new Error("Browser helper run config is invalid");
++  }
++  if (config.browserDiagnosticsPath !== undefined && typeof config.browserDiagnosticsPath !== "string") {
++    throw new Error("Browser helper diagnostics path is invalid");
++  }
++  for (const key of [
++    "nativeConnector", "resumeAvailable", "retainConversation", "requireRetainedConversation",
++    "compaction", "captureLunaCheckpoint",
++  ] as const) {
++    if (turn[key] !== undefined && typeof turn[key] !== "boolean") {
++      throw new Error(`Browser helper ${key} flag is invalid`);
++    }
++  }
++  if (turn.reasoning !== undefined && typeof turn.reasoning !== "string") {
++    throw new Error("Browser helper reasoning is invalid");
++  }
++  if (turn.conversationKey !== undefined
++    && (typeof turn.conversationKey !== "string" || !/^[a-f0-9]{64}$/.test(turn.conversationKey))) {
++    throw new Error("Browser helper conversation key is invalid");
++  }
++  return {
++    type: "run",
++    id,
++    config: {
++      appName: stringField(config.appName, "app name"),
++      browserHostDescriptorPath: stringField(config.browserHostDescriptorPath, "host descriptor path"),
++      ...(config.browserDiagnosticsPath !== undefined
++        ? { browserDiagnosticsPath: config.browserDiagnosticsPath }
++        : {}),
++      ...(config.turnTimeoutMs !== undefined ? { turnTimeoutMs: config.turnTimeoutMs } : {}),
++      autoApproveToolCalls: config.autoApproveToolCalls,
++    },
++    turn: {
++      traceId: id,
++      modelId: stringField(turn.modelId, "model id"),
++      capabilities: capabilities as unknown as ChatGptWebCapabilities,
++      ...(turn.reasoning !== undefined ? { reasoning: turn.reasoning } : {}),
++      ...(turn.nativeConnector !== undefined ? { nativeConnector: turn.nativeConnector } : {}),
++      ...(turn.resumeAvailable !== undefined ? { resumeAvailable: turn.resumeAvailable } : {}),
++      ...(turn.retainConversation !== undefined ? { retainConversation: turn.retainConversation } : {}),
++      ...(turn.requireRetainedConversation !== undefined
++        ? { requireRetainedConversation: turn.requireRetainedConversation }
++        : {}),
++      ...(turn.conversationKey !== undefined ? { conversationKey: turn.conversationKey } : {}),
++      ...(turn.compaction !== undefined ? { compaction: turn.compaction } : {}),
++      ...(turn.captureLunaCheckpoint !== undefined
++        ? { captureLunaCheckpoint: turn.captureLunaCheckpoint }
++        : {}),
++    },
++  } as BrowserHelperRunMessage;
++}
++
++/** 所有 stdin 帧在进入 helper 状态前完成封闭字段与基础类型校验。 */
++export function parseBrowserHelperInputMessage(value: unknown): BrowserHelperInputMessage {
++  const message = record(value, "input frame");
++  if (message.type === "run") return parseRun(message);
++  if (message.type === "submission_authorized") {
++    return parseChatGptHelperSubmissionAuthorization(message);
++  }
++  if (message.type === "prepared_selected_ack") {
++    assertKeys(message, ["type", "id", "prepared"]);
++    return { type: "prepared_selected_ack", id: turnId(message.id), prepared: parsePrepared(message.prepared) };
++  }
++  if (message.type === "send_activation_ack" || message.type === "abort") {
++    assertKeys(message, ["type", "id"]);
++    return { type: message.type, id: turnId(message.id) };
++  }
++  if (message.type === "shutdown") {
++    assertKeys(message, ["type"]);
++    return { type: "shutdown" };
++  }
++  if (message.type === "verify" || message.type === "smoke") {
++    assertKeys(message, ["type", "id", "config"]);
++    return { type: message.type, id: turnId(message.id), config: parseMaintenanceConfig(message.config) };
++  }
++  if (message.type === "inspect") {
++    assertKeys(message, ["type", "id", "config", "detectCapabilities"]);
++    if (typeof message.detectCapabilities !== "boolean") {
++      throw new Error("Browser helper capability detection flag is invalid");
++    }
++    return {
++      type: "inspect",
++      id: turnId(message.id),
++      config: parseMaintenanceConfig(message.config),
++      detectCapabilities: message.detectCapabilities,
++    };
++  }
++  throw new Error("Browser helper input frame has an unknown message type");
++}
++
++interface InboundTurnPhase {
++  preparedSelectionPending: boolean;
++  preparedAcknowledged: boolean;
++  sendActivationPending: boolean;
++}
++
++/** helper stdin 的 turn phase 独立于浏览器 DOM；错误 turn、重复或乱序 ACK 一律不能落到运行逻辑。 */
++export class BrowserHelperInboundProtocolState {
++  private readonly turns = new Map<string, InboundTurnPhase>();
++  private readonly operations = new Set<string>();
++
++  beginTurn(id: string): void {
++    turnId(id);
++    if (this.turns.has(id)) throw new Error(`Browser helper turn ${id} is duplicate`);
++    this.turns.set(id, {
++      preparedSelectionPending: false,
++      preparedAcknowledged: false,
++      sendActivationPending: false,
++    });
++  }
++
++  expectPreparedSelectedAck(id: string): void {
++    const phase = this.requireTurn(id);
++    if (phase.preparedSelectionPending || phase.preparedAcknowledged) {
++      throw new Error("Browser helper prompt acknowledgement phase is invalid");
++    }
++    phase.preparedSelectionPending = true;
++  }
++
++  observePreparedSelectedAck(id: string): void {
++    const phase = this.requireTurn(id);
++    if (phase.preparedAcknowledged) throw new Error("Browser helper prompt acknowledgement is duplicate");
++    if (!phase.preparedSelectionPending) {
++      throw new Error("Browser helper prompt acknowledgement is not pending");
++    }
++    phase.preparedSelectionPending = false;
++    phase.preparedAcknowledged = true;
++  }
++
++  assertAuthorizedTurn(id: string): void {
++    const phase = this.requireTurn(id);
++    if (!phase.preparedAcknowledged) {
++      throw new Error("Browser helper submission authorization preceded prompt acknowledgement");
++    }
++  }
++
++  expectSendActivationAck(id: string): void {
++    const phase = this.requireTurn(id);
++    if (!phase.preparedAcknowledged || phase.sendActivationPending) {
++      throw new Error("Browser helper Send activation phase is invalid");
++    }
++    phase.sendActivationPending = true;
++  }
++
++  observeSendActivationAck(id: string): void {
++    const phase = this.requireTurn(id);
++    if (!phase.sendActivationPending) throw new Error("Browser helper Send acknowledgement is not pending");
++    phase.sendActivationPending = false;
++  }
++
++  observeAbort(id: string): void {
++    if (!this.turns.has(id) && !this.operations.has(id)) {
++      throw new Error(`Browser helper turn ${id} is not active`);
++    }
++  }
++
++  endTurn(id: string): void {
++    this.turns.delete(id);
++  }
++
++  beginOperation(id: string): void {
++    turnId(id);
++    if (this.operations.has(id) || this.turns.has(id)) {
++      throw new Error(`Browser helper operation ${id} is duplicate`);
++    }
++    this.operations.add(id);
++  }
++
++  endOperation(id: string): void {
++    this.operations.delete(id);
++  }
++
++  private requireTurn(id: string): InboundTurnPhase {
++    const phase = this.turns.get(id);
++    if (!phase) throw new Error(`Browser helper turn ${id} is not active`);
++    return phase;
++  }
++}
+diff --git a/src/adapters/chatgpt-web/browser-worker.ts b/src/adapters/chatgpt-web/browser-worker.ts
+index 007dadf..4f3d27c 100644
+--- a/src/adapters/chatgpt-web/browser-worker.ts
++++ b/src/adapters/chatgpt-web/browser-worker.ts
+@@ -382,6 +382,49 @@ export interface ChatGptRateLimitDialogObserver {
+   assertHealthy(): void;
+ }
+ 
++async function assertChatGptIrreversibleBoundaryClear(
++  page: Page,
++  rateLimitObserver?: ChatGptRateLimitDialogObserver,
++): Promise<void> {
++  rateLimitObserver?.assertHealthy();
++  await throwIfChatGptSessionFailureAlert(page);
++  await throwIfChatGptRateLimitDialog(page);
++  rateLimitObserver?.assertHealthy();
++  await throwIfChatGptSessionFailureAlert(page);
++  const visibleDialogs = page
++    .locator('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')
++    .filter({ visible: true });
++  if (await visibleDialogs.count() === 0) return;
++  throw new ChatGptWebAdapterError(
++    "ChatGPT exposed an unexpected dialog at the irreversible Send boundary. Resolve it in the launcher before retrying.",
++    {
++      status: 409,
++      errorType: "invalid_request_error",
++      code: "unexpected_chatgpt_dialog",
++      retryable: false,
++    },
++  );
++}
++
++/**
++ * 将授权与真实 Enter 放在同一可执行边界；未知 dialog 在授权前或授权等待期间出现都不会被点击或发送。
++ */
++export async function crossChatGptIrreversibleSendBoundary(
++  page: Page,
++  sendButton: Pick<Locator, "press">,
++  lifecycle: {
++    authorize(): Promise<void> | void;
++    activate(): Promise<void> | void;
++  },
++  rateLimitObserver?: ChatGptRateLimitDialogObserver,
++): Promise<void> {
++  await assertChatGptIrreversibleBoundaryClear(page, rateLimitObserver);
++  await lifecycle.authorize();
++  await assertChatGptIrreversibleBoundaryClear(page, rateLimitObserver);
++  await lifecycle.activate();
++  await sendButton.press("Enter");
++}
++
+ interface ChatGptRateLimitDismissalWaiter {
+   afterGeneration: number;
+   signal: AbortSignal;
+@@ -397,6 +440,7 @@ export class ChatGptRateLimitDialogController implements ChatGptRateLimitDialogO
+   private readonly waiters = new Set<ChatGptRateLimitDismissalWaiter>();
+   private generation = 0;
+   private monitorFailure: unknown;
++  private stopped = false;
+ 
+   constructor(
+     page: Page,
+@@ -427,7 +471,9 @@ export class ChatGptRateLimitDialogController implements ChatGptRateLimitDialogO
+   async waitForDismissal(afterGeneration: number, signal: AbortSignal): Promise<void> {
+     this.assertHealthy();
+     if (this.generation > afterGeneration) return;
+-    if (signal.aborted) throw new DOMException("ChatGPT rate-limit wait aborted", "AbortError");
++    if (this.stopped || signal.aborted) {
++      throw new DOMException("ChatGPT rate-limit wait aborted", "AbortError");
++    }
+     await new Promise<void>((resolve, reject) => {
+       const waiter: ChatGptRateLimitDismissalWaiter = {
+         afterGeneration,
+@@ -447,8 +493,13 @@ export class ChatGptRateLimitDialogController implements ChatGptRateLimitDialogO
+   }
+ 
+   async stop(assertHealthy = true): Promise<void> {
++    this.stopped = true;
+     this.stopController.abort();
+     await this.task;
++    // monitor 在正常 abort 时会无错误返回；仍须结算所有等待 generation 的阶段，避免 turn 清理后悬挂。
++    this.releaseWaiters(
++      this.monitorFailure ?? new DOMException("ChatGPT rate-limit wait aborted", "AbortError"),
++    );
+     if (assertHealthy) this.assertHealthy();
+   }
+ 
+@@ -463,6 +514,29 @@ export class ChatGptRateLimitDialogController implements ChatGptRateLimitDialogO
+   }
+ }
+ 
++/** 新连接就绪后仍须停止并复查旧监控；获取期间出现的 cooldown 故障不能被换页掩盖。 */
++export async function acquireChatGptRebindAfterControllerStop<T>(
++  controller: Pick<ChatGptRateLimitDialogController, "assertHealthy" | "stop"> | undefined,
++  acquire: () => Promise<T>,
++  discard: (acquired: T) => Promise<void>,
++): Promise<T> {
++  controller?.assertHealthy();
++  const acquired = await acquire();
++  try {
++    await controller?.stop();
++  } catch (error) {
++    try {
++      await discard(acquired);
++    } catch (cleanupError) {
++      if (error instanceof Error) {
++        Object.defineProperty(error, "cause", { configurable: true, value: cleanupError });
++      }
++    }
++    throw error;
++  }
++  return acquired;
++}
++
+ const chatGptTemporaryChatOnboardingDialog = (page: Page): Locator => page
+   .locator('[role="dialog"]')
+   .filter({ hasText: "Not in history" })
+@@ -2614,16 +2688,12 @@ export class ChatGptBrowserWorker {
+     }
+     await settleChatGptUi();
+     await captureDiagnostic?.("send-ready");
+-    // 授权前最后一次确认 cooldown 已结束；一旦发出 attempt，后续任何歧义都必须按不可逆提交处理。
+-    rateLimitObserver?.assertHealthy();
+-    await throwIfChatGptRateLimitDialog(page);
+-    rateLimitObserver?.assertHealthy();
+-    await throwIfChatGptSessionFailureAlert(page);
+     const initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0;
+-    // 授权紧贴真实按键：之后页面关闭、pipe 失败或超时都只能按“可能已提交”处理。
+-    await onSubmissionAttempt?.();
+-    await submissionLifecycle?.onSendActivated?.();
+-    await sendButton.press("Enter");
++    await crossChatGptIrreversibleSendBoundary(page, sendButton, {
++      // attempt 与 Send activation 紧贴真实按键；之后的歧义只能按不可逆提交处理。
++      authorize: () => onSubmissionAttempt?.(),
++      activate: () => submissionLifecycle?.onSendActivated?.(),
++    }, rateLimitObserver);
+     const evidence = await this.waitForSubmissionAccepted(
+       page,
+       baseline,
+@@ -3520,25 +3590,28 @@ export class ChatGptBrowserWorker {
+           + ` ${redactChatGptUiDiagnostic(cause.message)}`,
+         );
+         const previousConnection = turnConnection;
+-        const connection = await this.runStage(
+-          turn.traceId,
+-          `response_page_rebind_${attempt}`,
+-          browserStageTimeouts.browserPage,
+-          async (stageSignal) => {
+-            const signal = turn.abortSignal
+-              ? AbortSignal.any([stageSignal, turn.abortSignal])
+-              : stageSignal;
+-            const rebound = await connectLauncherBrowserHost(
+-              this.config.browserHostDescriptorPath!,
+-              browserStageTimeouts.browserPage,
+-              launcherSurfaceId,
+-              signal,
+-            );
+-            await waitForOperationalChatGptViewport(rebound.page, signal);
+-            return rebound;
+-          },
++        const connection = await acquireChatGptRebindAfterControllerStop(
++          rateLimitController,
++          () => this.runStage(
++            turn.traceId,
++            `response_page_rebind_${attempt}`,
++            browserStageTimeouts.browserPage,
++            async (stageSignal) => {
++              const signal = turn.abortSignal
++                ? AbortSignal.any([stageSignal, turn.abortSignal])
++                : stageSignal;
++              const rebound = await connectLauncherBrowserHost(
++                this.config.browserHostDescriptorPath!,
++                browserStageTimeouts.browserPage,
++                launcherSurfaceId,
++                signal,
++              );
++              await waitForOperationalChatGptViewport(rebound.page, signal);
++              return rebound;
++            },
++          ),
++          connection => connection.browser.close(),
+         );
+-        await rateLimitController?.stop(false);
+         turnConnection = connection.browser;
+         page = connection.page;
+         diagnosticPage = page;
+diff --git a/src/adapters/chatgpt-web/launcher-helper-client.ts b/src/adapters/chatgpt-web/launcher-helper-client.ts
+index 9c36b17..ccb67dc 100644
+--- a/src/adapters/chatgpt-web/launcher-helper-client.ts
++++ b/src/adapters/chatgpt-web/launcher-helper-client.ts
+@@ -226,6 +226,25 @@ function protectHelperIrreversibleFailure(pending: PendingTurn, error: Error): E
+   return chatGptHelperSubmissionAmbiguousError(error.message);
+ }
+ 
++function attachHelperCleanupFailure(primary: Error, cleanup: unknown, message: string): Error {
++  const cleanupError = cleanup instanceof Error ? cleanup : new Error(String(cleanup));
++  if (!(primary instanceof ChatGptWebAdapterError) || primary.retryable) {
++    return new AggregateError([primary, cleanupError], message);
++  }
++
++  // 不可逆提交错误是调用方禁止自动重试的结构化边界；清理失败只能作为诊断附着，
++  // 不能把顶层错误替换成普通 AggregateError，否则上游会丢失 retryable:false。
++  const previousCause = (primary as Error & { cause?: unknown }).cause;
++  Object.defineProperty(primary, "cause", {
++    configurable: true,
++    value: new AggregateError(
++      previousCause === undefined ? [cleanupError] : [previousCause, cleanupError],
++      message,
++    ),
++  });
++  return primary;
++}
++
+ interface PendingTurn {
+   turn: BrowserTurn;
+   resolve: (value: string) => void;
+@@ -422,6 +441,7 @@ export class LauncherBrowserHelperClient {
+   private ready?: Promise<void>;
+   private readyResolve?: () => void;
+   private readyReject?: (error: Error) => void;
++  private readyReceived = false;
+   private readonly pending = new Map<string, PendingTurn>();
+ 
+   constructor(private readonly config: ResolvedBrowserConfig) {}
+@@ -504,6 +524,7 @@ export class LauncherBrowserHelperClient {
+     this.ready = undefined;
+     this.readyResolve = undefined;
+     this.readyReject = undefined;
++    this.readyReceived = false;
+     for (const id of [...this.pending.keys()]) {
+       const pending = this.pending.get(id);
+       const error = new DOMException("Launcher browser helper is closing", "AbortError");
+@@ -537,6 +558,7 @@ export class LauncherBrowserHelperClient {
+       },
+     );
+     this.child = child;
++    this.readyReceived = false;
+     this.ready = new Promise<void>((resolveReady, rejectReady) => {
+       this.readyResolve = resolveReady;
+       this.readyReject = rejectReady;
+@@ -574,6 +596,7 @@ export class LauncherBrowserHelperClient {
+         this.ready = undefined;
+         this.readyResolve = undefined;
+         this.readyReject = undefined;
++        this.readyReceived = false;
+       }
+       try {
+         await this.terminateChild(child, 500);
+@@ -598,6 +621,11 @@ export class LauncherBrowserHelperClient {
+       return;
+     }
+     if (message.type === "ready") {
++      if (this.readyReceived) {
++        this.failProtocol(child, "Launcher browser helper duplicated its ready frame");
++        return;
++      }
++      this.readyReceived = true;
+       this.readyResolve?.();
+       this.readyResolve = undefined;
+       this.readyReject = undefined;
+@@ -605,9 +633,7 @@ export class LauncherBrowserHelperClient {
+     }
+     const pending = this.pending.get(message.id);
+     if (!pending) {
+-      if (message.type === "submission_attempt") {
+-        this.failProtocol(child, "Launcher browser helper attempt has no pending turn");
+-      }
++      this.failProtocol(child, "Launcher browser helper frame has no pending turn");
+       return;
+     }
+     if (message.type === "submission_attempt") {
+@@ -753,8 +779,9 @@ export class LauncherBrowserHelperClient {
+       if (this.pending.get(id) !== pending) return;
+       this.finishWithError(
+         id,
+-        new AggregateError(
+-          [error, sendError instanceof Error ? sendError : new Error(String(sendError))],
++        attachHelperCleanupFailure(
++          pending.localFailure!,
++          sendError,
+           "Launcher browser helper could not abort after a local protocol failure",
+         ),
+       );
+@@ -784,6 +811,7 @@ export class LauncherBrowserHelperClient {
+     this.readyReject?.(error);
+     this.readyReject = undefined;
+     this.readyResolve = undefined;
++    this.readyReceived = false;
+     this.ready = undefined;
+     this.child = undefined;
+     for (const id of [...this.pending.keys()]) {
+@@ -799,11 +827,9 @@ export class LauncherBrowserHelperClient {
+         () => this.finishWithError(id, pending.localFailure ?? protectHelperIrreversibleFailure(pending, error)),
+         controlError => this.finishWithError(
+           id,
+-          new AggregateError(
+-            [
+-              pending.localFailure ?? protectHelperIrreversibleFailure(pending, error),
+-              controlError instanceof Error ? controlError : new Error(String(controlError)),
+-            ],
++          attachHelperCleanupFailure(
++            pending.localFailure ?? protectHelperIrreversibleFailure(pending, error),
++            controlError,
+             `Launcher browser helper exited and failed to release turn ${id}`,
+           ),
+         ),
+diff --git a/tests/browser-helper-protocol.test.ts b/tests/browser-helper-protocol.test.ts
+new file mode 100644
+index 0000000..952f83f
+--- /dev/null
++++ b/tests/browser-helper-protocol.test.ts
+@@ -0,0 +1,54 @@
++import { expect, test } from "bun:test";
++import {
++  BrowserHelperInboundProtocolState,
++  parseBrowserHelperInputMessage,
++} from "../src/adapters/chatgpt-web/browser-helper-protocol";
++
++test("browser helper rejects extra Send acknowledgement fields and unknown frame types", () => {
++  expect(() => parseBrowserHelperInputMessage({
++    type: "send_activation_ack",
++    id: "turn_wire_123",
++    stage: "final",
++  })).toThrow("unknown or missing fields");
++  expect(() => parseBrowserHelperInputMessage({
++    type: "submission_rewound",
++    id: "turn_wire_123",
++  })).toThrow("unknown message type");
++});
++
++test("browser helper preserves the default run contract without an absolute turn deadline", () => {
++  const message = parseBrowserHelperInputMessage({
++    type: "run",
++    id: "turn_default_123",
++    config: {
++      appName: "Codex Native",
++      browserHostDescriptorPath: "/durable/launcher.json",
++      autoApproveToolCalls: false,
++    },
++    turn: {
++      traceId: "turn_default_123",
++      modelId: "gpt-5.6-sol",
++      capabilities: { localToolsEnabled: true, solAvailable: true, proAvailable: true },
++    },
++  });
++
++  expect(message.type).toBe("run");
++  if (message.type !== "run") throw new Error("Expected a parsed run message");
++  expect(message.config.turnTimeoutMs).toBeUndefined();
++});
++
++test("browser helper inbound phases reject wrong-turn, duplicate, and out-of-order acknowledgements", () => {
++  const state = new BrowserHelperInboundProtocolState();
++  state.beginTurn("turn_phase_123");
++  expect(() => state.observePreparedSelectedAck("other_turn_123")).toThrow("not active");
++  expect(() => state.observePreparedSelectedAck("turn_phase_123")).toThrow("not pending");
++  state.expectPreparedSelectedAck("turn_phase_123");
++  state.observePreparedSelectedAck("turn_phase_123");
++  expect(() => state.observePreparedSelectedAck("turn_phase_123")).toThrow("duplicate");
++  expect(() => state.observeSendActivationAck("turn_phase_123")).toThrow("not pending");
++  state.expectSendActivationAck("turn_phase_123");
++  state.observeSendActivationAck("turn_phase_123");
++  expect(() => state.observeSendActivationAck("turn_phase_123")).toThrow("not pending");
++  state.endTurn("turn_phase_123");
++  expect(() => state.observeAbort("turn_phase_123")).toThrow("not active");
++});
+diff --git a/tests/browser-worker-contract.test.ts b/tests/browser-worker-contract.test.ts
+index 5473dcc..88cd515 100644
+--- a/tests/browser-worker-contract.test.ts
++++ b/tests/browser-worker-contract.test.ts
+@@ -1,7 +1,7 @@
+ import { expect, test } from "bun:test";
+ import { readFileSync } from "node:fs";
+ import type { Page } from "playwright-core";
+-import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptRateLimitDialogController, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptConnectorAttachmentMode, chatGptEffortSelectionRequired, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, monitorChatGptRateLimitDialogs, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout } from "../src/adapters/chatgpt-web/browser-worker";
++import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptRateLimitDialogController, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, acquireChatGptRebindAfterControllerStop, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptConnectorAttachmentMode, chatGptEffortSelectionRequired, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, crossChatGptIrreversibleSendBoundary, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, monitorChatGptRateLimitDialogs, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout } from "../src/adapters/chatgpt-web/browser-worker";
+ import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
+ import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
+ import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
+@@ -20,28 +20,13 @@ function personalizedTemporaryChatRole(
+   return locator;
+ }
+ 
+-test("browser turn orchestration retains owned prompt insertion and semantic submission", () => {
++test("browser turn orchestration retains compaction and multipart phases", () => {
+   const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+   const runBrowserTurn = workerSource.slice(workerSource.indexOf("  private async runBrowserTurn("));
+ 
+   expect(runBrowserTurn).toContain("return this.attachPromptWithCompactionRetry(");
+   expect(runBrowserTurn).toContain("connectorAttemptBudget");
+   expect(workerSource).toContain('.locator("xpath=ancestor::form[1]")');
+-  expect(workerSource).toContain('.getByTestId("send-button")');
+-  expect(workerSource).toContain('await sendButton.press("Enter")');
+-  expect(workerSource).toContain("await this.waitForSubmissionAccepted(");
+-  const sendAttachedPrompt = workerSource.slice(
+-    workerSource.indexOf("  private async sendAttachedPrompt("),
+-    workerSource.indexOf("  private async waitForMultipartAcknowledgement("),
+-  );
+-  const sendActivated = sendAttachedPrompt.indexOf("submissionLifecycle?.onSendActivated?.()");
+-  const sendPressed = sendAttachedPrompt.indexOf('await sendButton.press("Enter")');
+-  const submissionWait = sendAttachedPrompt.indexOf("await this.waitForSubmissionAccepted(");
+-  const submitted = sendAttachedPrompt.indexOf("submissionLifecycle?.onSubmitted?.()");
+-  expect(sendActivated).toBeGreaterThan(-1);
+-  expect(sendActivated).toBeLessThan(sendPressed);
+-  expect(sendAttachedPrompt).toContain("await submissionLifecycle?.onSendActivated?.()");
+-  expect(submitted).toBeGreaterThan(submissionWait);
+   expect(runBrowserTurn).toContain("this.sendAttachedPrompt(");
+   expect(runBrowserTurn).toContain("formatChatGptWebMultipartStage(");
+   expect(runBrowserTurn).toContain("waitForMultipartAcknowledgement(");
+@@ -1270,11 +1255,53 @@ test("a known cooldown fails closed when acknowledgement does not hide it", asyn
+   expect(fixture.pressed).toEqual(["Enter"]);
+ });
+ 
+-test("unrelated ChatGPT dialogs are left untouched", async () => {
+-  const fixture = dialogPage("Confirm another action");
++function sendBoundaryPage(unknownDialogVisible = false): Page {
++  const invisible = {
++    filter: () => invisible,
++    last: () => invisible,
++    isVisible: async () => false,
++  };
++  const unknownDialogs = {
++    filter: () => unknownDialogs,
++    count: async () => unknownDialogVisible ? 1 : 0,
++  };
++  return {
++    locator: (selector: string) => selector.includes("[aria-modal=\"true\"]")
++      ? unknownDialogs
++      : invisible,
++  } as unknown as Page;
++}
+ 
+-  await throwIfChatGptRateLimitDialog(fixture.page);
+-  expect(fixture.pressed).toEqual([]);
++test("irreversible send waits for exact authorization before pressing Enter once", async () => {
++  let releaseAuthorization!: () => void;
++  const authorization = new Promise<void>(resolve => { releaseAuthorization = resolve; });
++  const pressed: string[] = [];
++  const send = crossChatGptIrreversibleSendBoundary(
++    sendBoundaryPage(),
++    { press: async (key: string) => { pressed.push(key); } } as never,
++    { authorize: () => authorization, activate: () => {} },
++  );
++
++  await Promise.resolve();
++  expect(pressed).toHaveLength(0);
++  expect(pressed).toEqual([]);
++  releaseAuthorization();
++  await send;
++  expect(pressed).toHaveLength(1);
++  expect(pressed).toEqual(["Enter"]);
++});
++
++test("an unrelated visible dialog blocks authorization and leaves Enter untouched", async () => {
++  let authorizationCalls = 0;
++  const pressed: string[] = [];
++
++  await expect(crossChatGptIrreversibleSendBoundary(
++    sendBoundaryPage(true),
++    { press: async (key: string) => { pressed.push(key); } } as never,
++    { authorize: () => { authorizationCalls += 1; }, activate: () => {} },
++  )).rejects.toMatchObject({ code: "unexpected_chatgpt_dialog", retryable: false });
++  expect(authorizationCalls).toBe(0);
++  expect(pressed).toEqual([]);
+ });
+ 
+ test("the turn cooldown controller publishes a new generation only after the dialog disappears", async () => {
+@@ -1325,6 +1352,50 @@ test("the turn cooldown controller publishes a new generation only after the dia
+   await controller.stop();
+ });
+ 
++test("stopping the cooldown controller rejects an outstanding in-place waiter", async () => {
++  const dialog = {
++    filter: () => dialog,
++    last: () => dialog,
++    isVisible: async () => false,
++    waitFor: async ({ signal }: { signal?: AbortSignal }) => await new Promise<void>((_resolve, reject) => {
++      signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
++    }),
++    getByRole: () => ({ last() { return this; }, isVisible: async () => false }),
++  };
++  const controller = new ChatGptRateLimitDialogController(
++    { isClosed: () => false, locator: () => dialog } as unknown as Page,
++  );
++  const waitAbort = new AbortController();
++  let waiterFailure: unknown;
++  void controller.waitForDismissal(controller.currentGeneration(), waitAbort.signal)
++    .catch(error => { waiterFailure = error; });
++
++  await controller.stop(false);
++  await Promise.resolve();
++  expect(waiterFailure).toMatchObject({ name: "AbortError" });
++  waitAbort.abort();
++});
++
++test("a cooldown failure racing with page acquisition aborts rebind and discards the new connection", async () => {
++  const failure = new Error("cooldown monitor failed during acquisition");
++  let failed = false;
++  const controller = {
++    assertHealthy: () => { if (failed) throw failure; },
++    stop: async () => { if (failed) throw failure; },
++  };
++  const discarded: string[] = [];
++
++  await expect(acquireChatGptRebindAfterControllerStop(
++    controller,
++    async () => {
++      failed = true;
++      return "new-connection";
++    },
++    async connection => { discarded.push(connection); },
++  )).rejects.toBe(failure);
++  expect(discarded).toEqual(["new-connection"]);
++});
++
+ test("cooldown monitoring keeps handling repeated known dialogs until the turn aborts", async () => {
+   const abort = new AbortController();
+   const pressed: string[] = [];
+diff --git a/tests/launcher-helper-client.test.ts b/tests/launcher-helper-client.test.ts
+index 9fffde9..1dbea77 100644
+--- a/tests/launcher-helper-client.test.ts
++++ b/tests/launcher-helper-client.test.ts
+@@ -389,3 +389,159 @@ test("helper wire protocol fails closed when a frame carries an unknown field",
+ 
+   expect(internal.child).toBeUndefined();
+ });
++
++test.each([
++  { name: "event", frame: { type: "event", id: "unknown_turn_123", event: "heartbeat" } },
++  { name: "result", frame: { type: "result", id: "unknown_turn_123", text: "must not be ignored" } },
++])("helper wire protocol terminates on an unknown-turn $name frame", ({ frame }) => {
++  const client = new LauncherBrowserHelperClient({
++    appName: "Codex Native",
++    browserHost: "launcher",
++    browserHostDescriptorPath: "/durable/launcher.json",
++    storageStatePath: "/durable/unused-state.json",
++    chromeExecutablePath: "/durable/unused-chrome",
++    turnTimeoutMs: 60_000,
++    headed: true,
++    autoApproveToolCalls: false,
++  });
++  const internal = client as unknown as {
++    child?: unknown;
++    handleLine(child: unknown, line: string): void;
++    terminateChild(child: unknown, timeoutMs: number): Promise<void>;
++  };
++  const child = { pid: process.pid };
++  internal.child = child;
++  internal.terminateChild = async () => {};
++
++  internal.handleLine(child, JSON.stringify(frame));
++  expect(internal.child).toBeUndefined();
++});
++
++test("helper wire protocol terminates on a duplicate ready frame", () => {
++  const client = new LauncherBrowserHelperClient({
++    appName: "Codex Native",
++    browserHost: "launcher",
++    browserHostDescriptorPath: "/durable/launcher.json",
++    storageStatePath: "/durable/unused-state.json",
++    chromeExecutablePath: "/durable/unused-chrome",
++    turnTimeoutMs: 60_000,
++    headed: true,
++    autoApproveToolCalls: false,
++  });
++  const internal = client as unknown as {
++    child?: unknown;
++    readyResolve?: () => void;
++    readyReject?: (error: Error) => void;
++    handleLine(child: unknown, line: string): void;
++    terminateChild(child: unknown, timeoutMs: number): Promise<void>;
++  };
++  const child = { pid: process.pid };
++  internal.child = child;
++  internal.readyResolve = () => {};
++  internal.readyReject = () => {};
++  internal.terminateChild = async () => {};
++
++  internal.handleLine(child, JSON.stringify({ type: "ready" }));
++  expect(internal.child).toBe(child);
++  internal.handleLine(child, JSON.stringify({ type: "ready" }));
++  expect(internal.child).toBeUndefined();
++});
++
++test("abort cleanup preserves multipart ambiguity as the top-level adapter error", async () => {
++  const client = new LauncherBrowserHelperClient({
++    appName: "Codex Native",
++    browserHost: "launcher",
++    browserHostDescriptorPath: "/durable/launcher.json",
++    storageStatePath: "/durable/unused-state.json",
++    chromeExecutablePath: "/durable/unused-chrome",
++    turnTimeoutMs: 60_000,
++    headed: true,
++    autoApproveToolCalls: false,
++  });
++  const protocolState = new ChatGptHelperTurnProtocolState("cleanup_abort_123");
++  protocolState.observePreparedSelected(false);
++  protocolState.acknowledgePrepared("inline");
++  protocolState.observeAttempt({
++    type: "submission_attempt",
++    id: "cleanup_abort_123",
++    transport: "inline",
++    submission: "final",
++  });
++  let rejectResult!: (error: Error) => void;
++  const result = new Promise<never>((_resolve, reject) => { rejectResult = reject; });
++  const pending = {
++    turn: {
++      traceId: "cleanup_abort_123",
++      modelId: "gpt-5.6-sol",
++      capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
++      prepare: async () => ({ text: "inspect", images: [], release() {} }),
++      onTextDelta() {},
++    } satisfies BrowserTurn,
++    resolve() {},
++    reject: rejectResult,
++    protocolState,
++  };
++  const internal = client as unknown as {
++    pending: Map<string, typeof pending>;
++    send(message: unknown): Promise<void>;
++    abortWithLocalFailure(id: string, error: Error, active: typeof pending): void;
++  };
++  internal.pending.set("cleanup_abort_123", pending);
++  internal.send = async () => { throw new Error("abort pipe cleanup failed"); };
++
++  internal.abortWithLocalFailure("cleanup_abort_123", new Error("local callback failed"), pending);
++  const error = await result.catch(cause => cause);
++  expect(error).toBeInstanceOf(ChatGptWebAdapterError);
++  expect(error).toMatchObject({ code: "multipart_submission_ambiguous", retryable: false });
++  expect(error.cause).toBeInstanceOf(AggregateError);
++});
++
++test("launcher release cleanup preserves multipart ambiguity as the top-level adapter error", async () => {
++  const client = new LauncherBrowserHelperClient({
++    appName: "Codex Native",
++    browserHost: "launcher",
++    browserHostDescriptorPath: "/missing/launcher-release-descriptor.json",
++    storageStatePath: "/durable/unused-state.json",
++    chromeExecutablePath: "/durable/unused-chrome",
++    turnTimeoutMs: 60_000,
++    headed: true,
++    autoApproveToolCalls: false,
++  });
++  const protocolState = new ChatGptHelperTurnProtocolState("cleanup_release_123");
++  protocolState.observePreparedSelected(false);
++  protocolState.acknowledgePrepared("inline");
++  protocolState.observeAttempt({
++    type: "submission_attempt",
++    id: "cleanup_release_123",
++    transport: "inline",
++    submission: "final",
++  });
++  let rejectResult!: (error: Error) => void;
++  const result = new Promise<never>((_resolve, reject) => { rejectResult = reject; });
++  const pending = {
++    turn: {
++      traceId: "cleanup_release_123",
++      modelId: "gpt-5.6-sol",
++      capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
++      prepare: async () => ({ text: "inspect", images: [], release() {} }),
++      onTextDelta() {},
++    } satisfies BrowserTurn,
++    resolve() {},
++    reject: rejectResult,
++    protocolState,
++  };
++  const internal = client as unknown as {
++    child?: unknown;
++    pending: Map<string, typeof pending>;
++    handleExit(child: unknown, error: Error): void;
++  };
++  const child = { pid: process.pid };
++  internal.child = child;
++  internal.pending.set("cleanup_release_123", pending);
++
++  internal.handleExit(child, new Error("helper connection was lost"));
++  const error = await result.catch(cause => cause);
++  expect(error).toBeInstanceOf(ChatGptWebAdapterError);
++  expect(error).toMatchObject({ code: "multipart_submission_ambiguous", retryable: false });
++  expect(error.cause).toBeInstanceOf(AggregateError);
++});
+-- 
+2.55.0.windows.2
