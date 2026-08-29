@@ -8,6 +8,7 @@ import {
 import path from "node:path";
 
 import { HarnessRegistry } from "./harness-registry.mjs";
+import { createLocalFusionRuntime } from "./local-runtime.mjs";
 
 /** 返回当前用户 LOCALAPPDATA 下由融合层拥有的全部状态路径。 */
 export function defaultFusionPaths({ localAppData = process.env.LOCALAPPDATA } = {}) {
@@ -292,18 +293,28 @@ export class FusionController {
 /** 使用 LOCALAPPDATA 状态存储创建适合 CLI 的本机 Controller。 */
 export function createLocalFusionController({
   localAppData,
+  configPath,
+  runtime = null,
+  runtimeOptions = {},
   preparer,
   catalogBridge,
   launcher,
   validationPolicy,
 } = {}) {
   const stores = createDefaultStores({ localAppData });
+  // CLI 默认装配可运行的本机边界；显式注入仍优先，保持测试与嵌入调用的隔离能力。
+  const localRuntime = runtime ?? createLocalFusionRuntime({
+    ...runtimeOptions,
+    ...(configPath === undefined ? {} : { configPath }),
+    stateRoot: runtimeOptions.stateRoot ?? stores.paths.root,
+    harnesses: stores.harnesses,
+  });
   return new FusionController({
     profiles: stores.profiles,
     harnesses: stores.harnesses,
-    preparer,
-    catalogBridge,
-    launcher,
-    validationPolicy,
+    preparer: preparer ?? localRuntime.preparer,
+    catalogBridge: catalogBridge ?? localRuntime.catalogBridge,
+    launcher: launcher ?? localRuntime.launcher,
+    validationPolicy: validationPolicy ?? localRuntime.validationPolicy,
   });
 }

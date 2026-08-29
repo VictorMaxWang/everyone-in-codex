@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   FusionController,
   JsonProfileStore,
+  createLocalFusionController,
   createLocalValidationPolicy,
   defaultFusionPaths,
 } from "../src/fusion-controller.mjs";
@@ -146,5 +147,61 @@ test("FusionController 通过注入边界准备、同步、启动和精确恢复
     ["activate", { target: "external", profile }],
     ["launch", { profile }],
     ["restore", { leaseId: "fusion-1" }],
+  ]);
+});
+
+test("createLocalFusionController 默认装配 runtime 边界且保留显式依赖注入", async () => {
+  const localAppData = await mkdtemp(path.join(os.tmpdir(), "everyone-localappdata-"));
+  const calls = [];
+  const runtime = {
+    validationPolicy: { assert: async (profile) => profile },
+    preparer: {
+      prepare: async ({ profile }) => {
+        calls.push(["prepare", profile.name]);
+        return { prepared: true };
+      },
+    },
+    catalogBridge: {
+      inspect: async () => ({ codex: { modelCount: 2 } }),
+      activate: async ({ target }) => {
+        calls.push(["sync", target]);
+        return { target, modelCount: 2 };
+      },
+    },
+    launcher: {
+      inspect: async () => ({ running: false, leases: [] }),
+      launch: async ({ profile }) => {
+        calls.push(["launch", profile.name]);
+        return { leaseId: "local-runtime-1" };
+      },
+      restore: async ({ leaseId }) => {
+        calls.push(["restore", leaseId]);
+        return { restored: true, leaseId };
+      },
+    },
+  };
+  const controller = createLocalFusionController({ localAppData, runtime });
+  const profile = {
+    name: "second",
+    codexHome: "C:\\Profiles\\second",
+    sqliteHome: "C:\\Profiles\\second",
+    desktopRoot: "C:\\Desktop\\second",
+    desktopUserData: "C:\\Desktop\\ui\\second",
+  };
+  await controller.addProfile(profile);
+  await controller.useProfile(profile.name);
+
+  assert.deepEqual(await controller.prepare(), { prepared: true });
+  assert.deepEqual(await controller.syncModels(), { target: "codex", modelCount: 2 });
+  assert.deepEqual(await controller.launch(), { leaseId: "local-runtime-1" });
+  assert.deepEqual(await controller.restore({ leaseId: "local-runtime-1" }), {
+    restored: true,
+    leaseId: "local-runtime-1",
+  });
+  assert.deepEqual(calls, [
+    ["prepare", "second"],
+    ["sync", "codex"],
+    ["launch", "second"],
+    ["restore", "local-runtime-1"],
   ]);
 });
