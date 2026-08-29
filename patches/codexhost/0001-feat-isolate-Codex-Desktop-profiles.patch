@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Everyone in Codex <noreply@everyone-in-codex.invalid>
-Date: Sun, 30 Aug 2026 04:43:00 +0800
+Date: Sun, 30 Aug 2026 04:56:37 +0800
 Subject: [PATCH] feat: isolate Codex Desktop profiles
 
 ---
@@ -22,10 +22,10 @@ Subject: [PATCH] feat: isolate Codex Desktop profiles
  .../adapters/omp/test/omp-rpc-session.test.ts |  48 +++++
  packages/adapters/pi/src/pi-rpc-session.ts    |   3 +-
  .../adapters/pi/test/pi-rpc-session.test.ts   |  33 ++++
- .../host-runtime/src/adapter-composition.ts   | 148 ++++++++++++++-
+ .../host-runtime/src/adapter-composition.ts   | 150 ++++++++++++++-
  packages/host-runtime/src/index.ts            |   8 +
  .../test/adapter-composition.test.ts          |  66 +++++++
- 21 files changed, 989 insertions(+), 55 deletions(-)
+ 21 files changed, 991 insertions(+), 55 deletions(-)
  create mode 100644 packages/adapters/grok/test/grok-environment.test.ts
 
 diff --git a/crates/launcher/src/main.rs b/crates/launcher/src/main.rs
@@ -1514,7 +1514,7 @@ index 4575cc8..dda1047 100644
      const rpc = session("missing-session-id");
  
 diff --git a/packages/host-runtime/src/adapter-composition.ts b/packages/host-runtime/src/adapter-composition.ts
-index 69558ca..186bbf5 100644
+index 69558ca..a281169 100644
 --- a/packages/host-runtime/src/adapter-composition.ts
 +++ b/packages/host-runtime/src/adapter-composition.ts
 @@ -12,9 +12,135 @@ export const DEEPSEEK_HARNESS_ENDPOINT_ENV = "CODEXHOST_DEEPSEEK_HARNESS_ENDPOIN
@@ -1684,12 +1684,14 @@ index 69558ca..186bbf5 100644
        }),
      ],
      [
-@@ -54,21 +188,25 @@ export function createExternalHarnessAdapters(
+@@ -54,21 +188,27 @@ export function createExternalHarnessAdapters(
          ...(environment[DEEPSEEK_HARNESS_ENDPOINT_ENV]
            ? { endpoint: environment[DEEPSEEK_HARNESS_ENDPOINT_ENV] }
            : {}),
 -        environment,
 +        allowedProviders: ["everyone-in-codex"],
++        // 首次隔离 HOME 需要物化 DSH Web profile；20 秒默认值会误报 unavailable。
++        startupTimeoutMs: 60_000,
 +        environment: deepSeekEnvironment,
        }),
      ],
