@@ -19,7 +19,6 @@ import { RouterCatalogBridge } from "./router-catalog-bridge.mjs";
 
 const execFileAsync = promisify(execFile);
 const MODULE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PROFILE_NAME = "everyone-in-codex";
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const SECRET_PATTERN = /^[A-Za-z0-9_-]{32,}$/;
 const LEASE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
@@ -61,6 +60,31 @@ function normalizeLoopbackUrl(value, label) {
     throw new Error(`${label} 必须是无凭据的 127.0.0.1 HTTP URL`);
   }
   return url;
+}
+
+/**
+ * 为 Codex app-server 生成一次性配置覆盖。
+ *
+ * 命名 Profile 的 `-p` 只适用于部分运行命令，不能用于 Desktop 启动的
+ * `app-server`。这里仅投影融合层拥有的七个键，并用单个不可见分隔符交给
+ * CodexHost shim；shim 会再次按键名白名单校验后展开为重复的 `-c` 参数。
+ */
+function encodeCodexConfigOverrides({ gatewayBaseUrl, catalogPath }) {
+  const gateway = normalizeLoopbackUrl(gatewayBaseUrl, "Fusion Gateway 地址");
+  const normalizedCatalogPath = requireAbsolutePath(
+    catalogPath,
+    "Codex 2 模型目录",
+  ).replaceAll("\\", "/");
+  const quote = (value) => JSON.stringify(String(value));
+  return [
+    'model_provider="everyone-in-codex"',
+    `model_catalog_json=${quote(normalizedCatalogPath)}`,
+    'model_providers.everyone-in-codex.name="Everyone in Codex"',
+    `model_providers.everyone-in-codex.base_url=${quote(`${gateway.origin}/v1`)}`,
+    'model_providers.everyone-in-codex.wire_api="responses"',
+    "model_providers.everyone-in-codex.requires_openai_auth=false",
+    'model_providers.everyone-in-codex.env_key="EVERYONE_CODEX_LEASE_CAPABILITY"',
+  ].join("\u001f");
 }
 
 function defaultConfigPath() {
@@ -143,6 +167,41 @@ function normalizeFusionConfig(document, configPath) {
   });
 }
 
+function normalizePolicyPaths(values, label) {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error(`${label} 必须是非空绝对路径数组`);
+  }
+  const normalized = values.map((value, index) => requireAbsolutePath(value, `${label}[${index}]`));
+  if (new Set(normalized.map(normalizedPathKey)).size !== normalized.length) {
+    throw new Error(`${label} 包含重复路径`);
+  }
+  return Object.freeze(normalized);
+}
+
+function normalizeValidationPolicy(document) {
+  if (!document || document.schemaVersion !== 1) {
+    throw new Error("validation policy schemaVersion 不受支持");
+  }
+  return Object.freeze({
+    allowedCodexHomes: normalizePolicyPaths(
+      document.allowedCodexHomes,
+      "allowedCodexHomes",
+    ),
+    allowedDesktopRoots: normalizePolicyPaths(
+      document.allowedDesktopRoots,
+      "allowedDesktopRoots",
+    ),
+    protectedCodexHomes: normalizePolicyPaths(
+      document.protectedCodexHomes,
+      "protectedCodexHomes",
+    ),
+    protectedDesktopRoots: normalizePolicyPaths(
+      document.protectedDesktopRoots,
+      "protectedDesktopRoots",
+    ),
+  });
+}
+
 async function assertRegularFile(filePath, label) {
   const info = await lstat(filePath).catch((error) => {
     if (error?.code === "ENOENT") throw new Error(`${label} 不存在：${filePath}`);
@@ -161,6 +220,16 @@ async function assertDirectory(directory, label) {
   });
   if (!info.isDirectory() || info.isSymbolicLink()) {
     throw new Error(`${label} 必须是非链接目录`);
+  }
+  // 末级目录正常并不代表祖先安全；Windows Junction 也会改变真实写入边界。
+  const root = path.parse(directory).root;
+  let current = root;
+  for (const segment of path.relative(root, directory).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    const ancestor = await lstat(current);
+    if (ancestor.isSymbolicLink()) {
+      throw new Error(`${label} 的祖先包含 reparse/symlink：${current}`);
+    }
   }
   return directory;
 }
@@ -204,6 +273,12 @@ export async function readFusionConfig(configPath = defaultConfigPath()) {
   return normalizeFusionConfig(await readJsonRegular(resolved, "fusion config"), resolved);
 }
 
+/** 读取 Codex 1/2 路径隔离策略；本机策略必须显式存在，禁止隐式放宽。 */
+export async function readValidationPolicy(policyPath) {
+  const resolved = requireAbsolutePath(policyPath, "validation policyPath");
+  return normalizeValidationPolicy(await readJsonRegular(resolved, "validation policy"));
+}
+
 /** caller-secret 只在需要连接 Router 时短暂进入内存。 */
 export async function readRouterCallerSecret(stateDir) {
   const secretPath = path.join(requireAbsolutePath(stateDir, "router.stateDir"), "caller-secret");
@@ -242,6 +317,35 @@ function assertSameProfile(actual, expected) {
     throw new Error("codex_1_path_is_protected");
   }
   return actual;
+}
+
+function sameOrWithin(candidate, root) {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function assertProfileAllowed(profile, policy) {
+  const allowedCodex = new Set(policy.allowedCodexHomes.map(normalizedPathKey));
+  const allowedDesktop = new Set(policy.allowedDesktopRoots.map(normalizedPathKey));
+  if (
+    !allowedCodex.has(normalizedPathKey(profile.codexHome))
+    || !allowedCodex.has(normalizedPathKey(profile.sqliteHome))
+    || !allowedDesktop.has(normalizedPathKey(profile.desktopRoot))
+    || !allowedDesktop.has(normalizedPathKey(profile.desktopUserData))
+  ) {
+    throw new Error("profile_path_is_not_explicitly_allowlisted");
+  }
+  if (
+    [profile.codexHome, profile.sqliteHome].some((candidate) => (
+      policy.protectedCodexHomes.some((root) => sameOrWithin(candidate, root))
+    ))
+    || [profile.desktopRoot, profile.desktopUserData].some((candidate) => (
+      policy.protectedDesktopRoots.some((root) => sameOrWithin(candidate, root))
+    ))
+  ) {
+    throw new Error("codex_1_path_is_protected");
+  }
+  return profile;
 }
 
 function safeBaseEnvironment(source = process.env) {
@@ -378,20 +482,47 @@ async function defaultProcessInspector(pid) {
     "  commandLine = [string]$p.CommandLine",
     "}",
     "$value | ConvertTo-Json -Compress",
-  ].join("; ");
+  ].join("\n");
   try {
-    const { stdout } = await execFileAsync("pwsh.exe", [
-      "-NoLogo",
-      "-NoProfile",
-      "-NonInteractive",
-      "-Command",
-      script,
-    ], { windowsHide: true, encoding: "utf8", maxBuffer: 64 * 1024 });
+    const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+    const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
+    const candidates = [
+      path.join(programFiles, "PowerShell", "7", "pwsh.exe"),
+      "pwsh.exe",
+      path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ];
+    let stdout = null;
+    let lastMissingError = null;
+    const uniqueCandidates = candidates.filter((candidate, index) => (
+      candidates.findIndex((value) => value.toLowerCase() === candidate.toLowerCase()) === index
+    ));
+    for (const executable of uniqueCandidates) {
+      try {
+        ({ stdout } = await execFileAsync(executable, [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          script,
+        ], { windowsHide: true, encoding: "utf8", maxBuffer: 64 * 1024 }));
+        break;
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        lastMissingError = error;
+      }
+    }
+    if (stdout === null) throw lastMissingError ?? new Error("PowerShell runtime missing");
     return JSON.parse(stdout.trim());
   } catch (error) {
     if (Number(error?.code) === 3) return null;
     throw new Error("process_identity_query_failed", { cause: error });
   }
+}
+
+/** 公开只读的脱敏进程凭据；原始命令行始终只留在当前函数栈内。 */
+export async function inspectProcessIdentity(pid) {
+  const identity = await defaultProcessInspector(pid);
+  return identity ? publicProcessIdentity(identity) : null;
 }
 
 async function defaultProcessTerminator(identity) {
@@ -486,6 +617,7 @@ async function childKillBestEffort(child) {
 export class LocalFusionRuntime {
   constructor({
     configPath = defaultConfigPath(),
+    validationPolicyPath,
     stateRoot = defaultStateRoot(),
     fetchImpl = globalThis.fetch,
     spawnImpl = spawn,
@@ -503,6 +635,10 @@ export class LocalFusionRuntime {
       throw new Error("LocalFusionRuntime 需要 HarnessRegistry");
     }
     this.configPath = requireAbsolutePath(configPath, "fusion configPath");
+    this.validationPolicyPath = requireAbsolutePath(
+      validationPolicyPath ?? path.join(path.dirname(this.configPath), "validation-policy.local.json"),
+      "validation policyPath",
+    );
     this.stateRoot = requireAbsolutePath(stateRoot, "fusion stateRoot");
     this.leaseDirectory = path.join(this.stateRoot, "leases");
     this.fetchImpl = fetchImpl;
@@ -536,8 +672,18 @@ export class LocalFusionRuntime {
   }
 
   async #assertConfiguredProfile(profile) {
-    const config = await this.#config();
-    return assertSameProfile(profile, config.profile);
+    const [config, policy] = await Promise.all([
+      this.#config(),
+      readValidationPolicy(this.validationPolicyPath),
+    ]);
+    assertProfileAllowed(assertSameProfile(profile, config.profile), policy);
+    await Promise.all([
+      assertDirectory(profile.codexHome, "Codex 2 HOME"),
+      assertDirectory(profile.sqliteHome, "Codex 2 SQLite HOME"),
+      assertDirectory(profile.desktopRoot, "Codex 2 Desktop clone"),
+      assertDirectory(profile.desktopUserData, "Codex 2 Desktop user data"),
+    ]);
+    return profile;
   }
 
   #snapshotPath(target) {
@@ -550,7 +696,7 @@ export class LocalFusionRuntime {
 
   async #prepare(profile) {
     const config = await this.#config();
-    assertSameProfile(profile, config.profile);
+    await this.#assertConfiguredProfile(profile);
     await Promise.all([
       assertDirectory(profile.codexHome, "Codex 2 HOME"),
       assertDirectory(profile.sqliteHome, "Codex 2 SQLite HOME"),
@@ -579,7 +725,7 @@ export class LocalFusionRuntime {
       throw new Error(`未知模型发布目标：${target}`);
     }
     const config = await this.#config();
-    assertSameProfile(profile, config.profile);
+    await this.#assertConfiguredProfile(profile);
     const callerSecret = await readRouterCallerSecret(config.router.stateDir);
     const routerBaseUrl = routerCapabilityBaseUrl(config, callerSecret);
     const bridge = new RouterCatalogBridge({
@@ -669,9 +815,21 @@ export class LocalFusionRuntime {
     return { role, ...receipt };
   }
 
+  async #terminateLaunchProcess(child, expectedExecutable, captured) {
+    if (!Number.isInteger(child?.pid) || child.pid < 1) return;
+    const current = await this.processInspector(child.pid);
+    if (!current) return;
+    if (captured) {
+      assertOwnedProcess(current, captured);
+    } else if (!samePath(current.executablePath, expectedExecutable)) {
+      throw new Error(`launch_cleanup_process_ownership_conflict:${child.pid}`);
+    }
+    await this.processTerminator(current);
+  }
+
   async #launch(profile) {
     const config = await this.#config();
-    assertSameProfile(profile, config.profile);
+    await this.#assertConfiguredProfile(profile);
     if ((await this.#activeLeaseFiles()).length > 0) {
       throw new Error("fusion_lease_already_active");
     }
@@ -699,19 +857,22 @@ export class LocalFusionRuntime {
       windowsHide: true,
     });
     let hostChild = null;
+    let gatewayIdentity = null;
+    let hostIdentity = null;
     let profileManager = null;
     try {
-      const gatewayReady = await waitForGatewayReady(
+      const gatewayReadyPromise = waitForGatewayReady(
         gatewayChild,
         leaseId,
         this.readyTimeoutMs,
       );
-      const gatewayIdentity = await this.#captureProcess(
+      gatewayReadyPromise.catch(() => {});
+      gatewayIdentity = await this.#captureProcess(
         gatewayChild,
         config.runtime.nodeExecutable,
         "gateway",
       );
-
+      const gatewayReady = await gatewayReadyPromise;
       profileManager = new ProfileManager({ codexHome: profile.codexHome, stateDir: this.stateRoot });
       const profileReceipt = await profileManager.publish({
         gatewayBaseUrl: gatewayReady.baseUrl,
@@ -723,7 +884,10 @@ export class LocalFusionRuntime {
         CODEX_HOME: profile.codexHome,
         CODEX_SQLITE_HOME: profile.sqliteHome,
         CODEXHOST_DATA_DIR: path.join(this.stateRoot, "codexhost", profile.name),
-        CODEXHOST_CODEX_PROFILE: PROFILE_NAME,
+        CODEXHOST_CODEX_CONFIG_OVERRIDES: encodeCodexConfigOverrides({
+          gatewayBaseUrl: gatewayReady.baseUrl,
+          catalogPath: profileReceipt.catalogPath,
+        }),
         EVERYONE_CODEX_LEASE_CAPABILITY: gatewayReady.capability,
       };
       for (const harness of await this.harnesses.list()) {
@@ -749,12 +913,14 @@ export class LocalFusionRuntime {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
       });
-      await waitForCodexHostReady(hostChild, this.readyTimeoutMs);
-      const hostIdentity = await this.#captureProcess(
+      const hostReadyPromise = waitForCodexHostReady(hostChild, this.readyTimeoutMs);
+      hostReadyPromise.catch(() => {});
+      hostIdentity = await this.#captureProcess(
         hostChild,
         config.runtime.codexHostExecutable,
         "codexHost",
       );
+      await hostReadyPromise;
 
       const receiptPath = this.#leasePath(leaseId);
       const receipt = {
@@ -776,9 +942,30 @@ export class LocalFusionRuntime {
         processes: Object.freeze({ gateway: gatewayChild.pid, codexHost: hostChild.pid }),
       });
     } catch (error) {
-      await childKillBestEffort(hostChild);
-      await childKillBestEffort(gatewayChild);
-      await profileManager?.restore().catch(() => {});
+      const cleanupErrors = [];
+      for (const [child, expectedExecutable, captured] of [
+        [hostChild, config.runtime.codexHostExecutable, hostIdentity],
+        [gatewayChild, config.runtime.nodeExecutable, gatewayIdentity],
+      ]) {
+        try {
+          await this.#terminateLaunchProcess(child, expectedExecutable, captured);
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+          await childKillBestEffort(child);
+        }
+      }
+      try {
+        await profileManager?.restore();
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          "fusion_launch_failed_and_cleanup_was_incomplete",
+          { cause: error },
+        );
+      }
       throw error;
     }
   }

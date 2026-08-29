@@ -13,9 +13,25 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import { startGatewayDaemonService } from "../src/gateway-daemon.mjs";
-import { createLocalFusionRuntime } from "../src/local-runtime.mjs";
+import {
+  createLocalFusionRuntime,
+  inspectProcessIdentity,
+} from "../src/local-runtime.mjs";
 
 const ROUTER_SECRET = "router-caller-capability-value-1234567890";
+
+test(
+  "Windows默认Inspector可读取当前进程身份",
+  { skip: process.platform !== "win32" },
+  async () => {
+    const identity = await inspectProcessIdentity(process.pid);
+    assert.equal(identity.pid, process.pid);
+    assert.equal(path.isAbsolute(identity.executablePath), true);
+    assert.match(identity.creationDate, /^\d{4}-\d{2}-\d{2}T/);
+    assert.match(identity.commandLineSha256, /^[a-f0-9]{64}$/);
+    assert.equal(identity.commandLine, undefined);
+  },
+);
 
 class FakeChild extends EventEmitter {
   constructor(pid) {
@@ -63,6 +79,13 @@ async function fixture() {
     },
     webgpt: { healthUrl: "http://127.0.0.1:43124/healthz" },
     runtime: { codexHostExecutable },
+  }), "utf8");
+  await writeFile(path.join(root, "validation-policy.local.json"), JSON.stringify({
+    schemaVersion: 1,
+    allowedCodexHomes: [codexHome],
+    allowedDesktopRoots: [desktopRoot, desktopUserData],
+    protectedCodexHomes: [path.join(root, "codex-1-home")],
+    protectedDesktopRoots: [path.join(root, "windows-apps")],
   }), "utf8");
 
   const models = [
@@ -134,6 +157,27 @@ test("models sync 通过 capability path 查询 fake Router 且安全快照不�
   assert.equal(snapshot.schemaVersion, 1);
   assert.equal(snapshot.target, "codex");
   assert.deepEqual(snapshot.models.map((model) => model.id), receipt.allowedModelIds);
+});
+
+test("validation policy 必须显式允许 Codex 2 的四条路径", async () => {
+  const fx = await fixture();
+  await writeFile(path.join(fx.root, "validation-policy.local.json"), JSON.stringify({
+    schemaVersion: 1,
+    allowedCodexHomes: [fx.profile.codexHome],
+    allowedDesktopRoots: [fx.profile.desktopRoot],
+    protectedCodexHomes: [path.join(fx.root, "codex-1-home")],
+    protectedDesktopRoots: [path.join(fx.root, "windows-apps")],
+  }), "utf8");
+  const runtime = createLocalFusionRuntime({
+    configPath: fx.configPath,
+    stateRoot: fx.stateRoot,
+    harnesses: { list: async () => [] },
+  });
+
+  await assert.rejects(
+    runtime.validationPolicy.assert(fx.profile),
+    /profile_path_is_not_explicitly_allowlisted/,
+  );
 });
 
 test("Gateway daemon 自己读取 caller-secret 并只通过 IPC 返回 consumer capability", async () => {
@@ -274,7 +318,21 @@ test("launch 只把 consumer capability 交给 CodexHost，restore 精确终止 
   ]);
   assert.equal(hostSpawn.options.env.CODEX_HOME, fx.profile.codexHome);
   assert.equal(hostSpawn.options.env.CODEX_SQLITE_HOME, fx.profile.sqliteHome);
-  assert.equal(hostSpawn.options.env.CODEXHOST_CODEX_PROFILE, "everyone-in-codex");
+  assert.equal(hostSpawn.options.env.CODEXHOST_CODEX_PROFILE, undefined);
+  assert.deepEqual(
+    hostSpawn.options.env.CODEXHOST_CODEX_CONFIG_OVERRIDES.split("\u001f"),
+    [
+      'model_provider="everyone-in-codex"',
+      `model_catalog_json=${JSON.stringify(
+        path.join(fx.stateRoot, "codex2-models.json").replaceAll("\\", "/"),
+      )}`,
+      'model_providers.everyone-in-codex.name="Everyone in Codex"',
+      'model_providers.everyone-in-codex.base_url="http://127.0.0.1:45679/v1"',
+      'model_providers.everyone-in-codex.wire_api="responses"',
+      "model_providers.everyone-in-codex.requires_openai_auth=false",
+      'model_providers.everyone-in-codex.env_key="EVERYONE_CODEX_LEASE_CAPABILITY"',
+    ],
+  );
   assert.equal(hostSpawn.options.env.EVERYONE_CODEX_LEASE_CAPABILITY, "consumer-launch-capability");
   assert.equal(hostSpawn.options.env.CODEXHOST_PI_COMMAND, path.join(fx.root, "pi.cmd"));
 
@@ -303,6 +361,68 @@ test("launch 只把 consumer capability 交给 CodexHost，restore 精确终止 
     leaseId: "lease-runtime-1",
     stoppedPids: [],
   });
+});
+
+test("launch 就绪失败时按已捕获身份终止进程树并恢复 Profile", async () => {
+  const fx = await fixture();
+  const identities = new Map([
+    [7201, {
+      pid: 7201,
+      executablePath: process.execPath,
+      creationDate: "2026-08-30T00:10:01.000Z",
+      commandLine: "node gateway-daemon.mjs --lease lease-failure",
+    }],
+    [7202, {
+      pid: 7202,
+      executablePath: fx.codexHostExecutable,
+      creationDate: "2026-08-30T00:10:02.000Z",
+      commandLine: "codexhost.exe launch --custom-install codex-2",
+    }],
+  ]);
+  const terminated = [];
+  let nextPid = 7201;
+  const runtime = createLocalFusionRuntime({
+    configPath: fx.configPath,
+    stateRoot: fx.stateRoot,
+    fetchImpl: async () => new Response(JSON.stringify({
+      data: [{ id: "provider/api-model" }, { id: "chatgpt-web/light" }],
+    })),
+    spawnImpl: (command, args) => {
+      const child = new FakeChild(nextPid++);
+      if (args.some((arg) => String(arg).endsWith("gateway-daemon.mjs"))) {
+        const leaseId = args[args.indexOf("--lease") + 1];
+        queueMicrotask(() => child.emit("message", {
+          type: "ready",
+          leaseId,
+          pid: child.pid,
+          baseUrl: "http://127.0.0.1:45680",
+          capability: "failure-consumer-capability",
+        }));
+      } else {
+        queueMicrotask(() => child.emit("exit", 1, null));
+      }
+      return child;
+    },
+    processInspector: async (pid) => identities.get(pid) ?? null,
+    processTerminator: async (identity) => {
+      terminated.push(identity.pid);
+      identities.delete(identity.pid);
+      return { stopped: true };
+    },
+    randomId: () => "lease-failure",
+    harnesses: { list: async () => [] },
+  });
+  await runtime.catalogBridge.activate({ target: "codex", profile: fx.profile });
+
+  await assert.rejects(
+    runtime.launcher.launch({ profile: fx.profile }),
+    /codexhost_exited_before_ready/,
+  );
+  assert.deepEqual(terminated, [7202, 7201]);
+  await assert.rejects(
+    stat(path.join(fx.profile.codexHome, "everyone-in-codex.config.toml")),
+    /ENOENT/,
+  );
 });
 
 test("restore 检测 PID 复用并失败关闭，不按进程名终止", async () => {
