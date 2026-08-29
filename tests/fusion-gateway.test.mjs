@@ -104,3 +104,33 @@ test("Gateway 不向调用方透出 Router 错误正文或 capability", async (t
   assert.equal(body.includes("private-request-body"), false);
   assert.equal(JSON.parse(body).error.code, "router_request_failed");
 });
+
+test("Gateway 只为 Grok 补全 Responses SSE sequence_number", async (t) => {
+  const router = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('data: {"type":"response.created","response":{"id":"r1"}}\n');
+    response.write("\n");
+    response.end('data: {"type":"response.completed","sequence_number":7}\n\n');
+  });
+  const routerBaseUrl = `${await listen(router)}/_codex-router/upstream-secret-value/v1/`;
+  t.after(() => close(router));
+  const gateway = new FusionGateway({ routerBaseUrl });
+  const lease = await gateway.start({ models: [{ id: "provider/allowed" }] });
+  t.after(() => lease.close());
+
+  const response = await fetch(`${lease.baseUrl}/v1/responses`, {
+    method: "POST",
+    headers: {
+      ...lease.authorizationHeaders(),
+      "content-type": "application/json",
+      "x-everyone-codex-harness": "grok",
+    },
+    body: JSON.stringify({ model: "provider/allowed", input: "sentinel" }),
+  });
+  const events = (await response.text())
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => JSON.parse(line.slice("data:".length)));
+
+  assert.deepEqual(events.map((event) => event.sequence_number), [0, 7]);
+});

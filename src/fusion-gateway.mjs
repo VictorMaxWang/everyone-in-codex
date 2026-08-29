@@ -1,6 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 
 const DEFAULT_LEASE_TTL_MS = 30 * 60 * 1_000;
 const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024;
@@ -52,6 +52,46 @@ function normalizeModels(models) {
     if (!byId.has(model.id)) byId.set(model.id, Object.freeze({ ...model }));
   }
   return Object.freeze([...byId.values()]);
+}
+
+function grokSseSequenceTransform() {
+  let pending = "";
+  let sequenceNumber = 0;
+  const rewriteLine = (line) => {
+    if (!line.startsWith("data:")) return line;
+    const data = line.slice("data:".length).trimStart();
+    if (!data || data === "[DONE]") return line;
+    try {
+      const event = JSON.parse(data);
+      if (
+        !event
+        || typeof event !== "object"
+        || Array.isArray(event)
+        || typeof event.type !== "string"
+      ) return line;
+      if (Number.isInteger(event.sequence_number) && event.sequence_number >= 0) {
+        sequenceNumber = Math.max(sequenceNumber, event.sequence_number + 1);
+        return line;
+      }
+      return `data: ${JSON.stringify({ ...event, sequence_number: sequenceNumber++ })}`;
+    } catch {
+      return line;
+    }
+  };
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      pending += chunk.toString("utf8");
+      const lines = pending.split("\n");
+      pending = lines.pop() ?? "";
+      this.push(lines.map((line) => rewriteLine(line.replace(/\r$/u, ""))).join("\n"));
+      if (lines.length > 0) this.push("\n");
+      callback();
+    },
+    flush(callback) {
+      if (pending) this.push(rewriteLine(pending.replace(/\r$/u, "")));
+      callback();
+    },
+  });
 }
 
 class GatewayLease {
@@ -203,7 +243,14 @@ export class FusionGateway {
           response.end();
           return;
         }
-        Readable.fromWeb(upstream.body).pipe(response);
+        const upstreamStream = Readable.fromWeb(upstream.body);
+        const grokCompatibility = request.headers["x-everyone-codex-harness"] === "grok"
+          && upstream.headers.get("content-type")?.includes("text/event-stream");
+        if (grokCompatibility) {
+          upstreamStream.pipe(grokSseSequenceTransform()).pipe(response);
+        } else {
+          upstreamStream.pipe(response);
+        }
       } catch {
         if (!response.headersSent) {
           writeJson(response, 502, {

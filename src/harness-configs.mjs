@@ -185,6 +185,7 @@ function renderGrok(baseUrl, models) {
       `name = ${tomlString(model.displayName)}`,
       `env_key = ${tomlString(EXTERNAL_CAPABILITY_ENV)}`,
       'api_backend = "responses"',
+      'extra_headers = { "x-everyone-codex-harness" = "grok" }',
       ...(model.contextWindow ? [`context_window = ${model.contextWindow}`] : []),
     );
   }

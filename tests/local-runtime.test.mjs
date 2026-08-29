@@ -554,6 +554,7 @@ test("launch 只把 consumer capability 交给 CodexHost，restore 精确终止 
   );
   assert.match(configTexts.grok, /^model = "provider\/api-model"$/m);
   assert.match(configTexts.grok, /api_backend = "responses"/);
+  assert.match(configTexts.grok, /"x-everyone-codex-harness" = "grok"/);
 
   const profile = await readFile(
     path.join(fx.profile.codexHome, "everyone-in-codex.config.toml"),
