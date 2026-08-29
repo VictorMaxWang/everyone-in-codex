@@ -329,6 +329,7 @@ export async function publishHarnessConfigs({
       CODEXHOST_GROK_MODELS_JSON: JSON.stringify(normalizedModels.map((model) => ({
         ...model,
         id: grokTransportModelId(model.id),
+        upstreamId: model.id,
       }))),
       CODEXHOST_DEEPSEEK_HARNESS_ENDPOINT: `http://127.0.0.1:${dshPort}/`,
     }),

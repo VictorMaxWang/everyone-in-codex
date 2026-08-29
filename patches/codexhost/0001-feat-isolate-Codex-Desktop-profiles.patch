@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Everyone in Codex <noreply@everyone-in-codex.invalid>
-Date: Sun, 30 Aug 2026 04:56:37 +0800
+Date: Sun, 30 Aug 2026 05:20:30 +0800
 Subject: [PATCH] feat: isolate Codex Desktop profiles
 
 ---
@@ -9,12 +9,12 @@ Subject: [PATCH] feat: isolate Codex Desktop profiles
  crates/shim/src/lib.rs                        | 177 +++++++++++++++++-
  .../src/deepseek-harness-adapter.ts           |  69 ++++++-
  .../test/deepseek-harness-adapter.test.ts     |  42 ++++-
- packages/adapters/grok/src/acp-transport.ts   |  16 +-
+ packages/adapters/grok/src/acp-transport.ts   |  19 +-
  packages/adapters/grok/src/command.ts         |   3 +-
- packages/adapters/grok/src/grok-adapter.ts    |  20 +-
- packages/adapters/grok/src/grok-models.ts     |  69 ++++++-
+ packages/adapters/grok/src/grok-adapter.ts    |  33 +++-
+ packages/adapters/grok/src/grok-models.ts     |  70 ++++++-
  packages/adapters/grok/src/index.ts           |   1 +
- .../adapters/grok/test/grok-adapter.test.ts   |  35 ++++
+ .../adapters/grok/test/grok-adapter.test.ts   |  36 ++++
  .../grok/test/grok-environment.test.ts        |  23 +++
  packages/adapters/omp/src/omp-adapter.ts      |  45 ++++-
  packages/adapters/omp/src/omp-rpc-session.ts  |  10 +-
@@ -22,10 +22,10 @@ Subject: [PATCH] feat: isolate Codex Desktop profiles
  .../adapters/omp/test/omp-rpc-session.test.ts |  48 +++++
  packages/adapters/pi/src/pi-rpc-session.ts    |   3 +-
  .../adapters/pi/test/pi-rpc-session.test.ts   |  33 ++++
- .../host-runtime/src/adapter-composition.ts   | 150 ++++++++++++++-
+ .../host-runtime/src/adapter-composition.ts   | 159 +++++++++++++++-
  packages/host-runtime/src/index.ts            |   8 +
- .../test/adapter-composition.test.ts          |  66 +++++++
- 21 files changed, 991 insertions(+), 55 deletions(-)
+ .../test/adapter-composition.test.ts          |  67 +++++++
+ 21 files changed, 1017 insertions(+), 57 deletions(-)
  create mode 100644 packages/adapters/grok/test/grok-environment.test.ts
 
 diff --git a/crates/launcher/src/main.rs b/crates/launcher/src/main.rs
@@ -861,10 +861,18 @@ index 819603c..9c17b9e 100644
      const { adapter, connection } = fixture();
      const model = encodeDeepSeekHarnessModelRef({
 diff --git a/packages/adapters/grok/src/acp-transport.ts b/packages/adapters/grok/src/acp-transport.ts
-index 6c896c6..479e062 100644
+index 6c896c6..7441132 100644
 --- a/packages/adapters/grok/src/acp-transport.ts
 +++ b/packages/adapters/grok/src/acp-transport.ts
-@@ -333,8 +333,15 @@ function transportEvent(
+@@ -131,6 +131,7 @@ export interface GrokAcpTransportOptions {
+   cwd: string;
+   command?: string;
+   environment?: NodeJS.ProcessEnv;
++  modelAliases?: Readonly<Record<string, string>>;
+   commandTimeoutMs?: number;
+   closeTimeoutMs?: number;
+   onFault?: (error: GrokTransportError) => void;
+@@ -333,8 +334,15 @@ function transportEvent(
    }
  }
  
@@ -881,7 +889,7 @@ index 6c896c6..479e062 100644
    const home = environment.HOME ?? environment.USERPROFILE ?? os.homedir();
    return environment.GROK_HOME ?? path.join(home, ".grok");
  }
-@@ -714,14 +721,15 @@ export class GrokAcpTransport {
+@@ -714,14 +722,15 @@ export class GrokAcpTransport {
    async #ensureInitialized(): Promise<InitializeResponse> {
      if (this.#initialize) return this.#initialize;
      if (this.#child || this.#closed) throw new Error("Grok ACP Transport cannot be started twice");
@@ -900,6 +908,15 @@ index 6c896c6..479e062 100644
        detached: process.platform !== "win32",
        stdio: ["pipe", "pipe", "pipe"],
        windowsHide: true,
+@@ -862,7 +871,7 @@ export class GrokAcpTransport {
+       throw new GrokTransportError("protocolError", "Grok rejected Model configuration");
+     }
+     const selected = response._meta.model.Ok;
+-    if (selected !== modelId) {
++    if (selected !== modelId && selected !== this.#options.modelAliases?.[modelId]) {
+       throw new GrokTransportError("protocolError", "Grok activated a different Model");
+     }
+   }
 diff --git a/packages/adapters/grok/src/command.ts b/packages/adapters/grok/src/command.ts
 index 8f573a9..48b2696 100644
 --- a/packages/adapters/grok/src/command.ts
@@ -918,7 +935,7 @@ index 8f573a9..48b2696 100644
 +  return commandInvocation(command, ["agent", "--no-leader", "stdio"], environment, platform);
  }
 diff --git a/packages/adapters/grok/src/grok-adapter.ts b/packages/adapters/grok/src/grok-adapter.ts
-index 6d41bb5..56df42d 100644
+index 6d41bb5..23e92f8 100644
 --- a/packages/adapters/grok/src/grok-adapter.ts
 +++ b/packages/adapters/grok/src/grok-adapter.ts
 @@ -95,9 +95,11 @@ import {
@@ -949,16 +966,33 @@ index 6d41bb5..56df42d 100644
    #closePromise: Promise<void> | null = null;
    #credits: GrokCreditsSnapshot | null = null;
    #creditsRefresh: Promise<GrokCreditsSnapshot | null> | null = null;
-@@ -1220,6 +1224,8 @@ export class GrokAdapter implements HarnessAdapter {
+@@ -1220,11 +1224,24 @@ export class GrokAdapter implements HarnessAdapter {
    constructor(options: GrokAdapterOptions = {}, dependencies?: GrokAdapterDependencies) {
      this.#closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
      this.#environment = options.environment;
 +    this.#configuredModels = options.configuredModels ? [...options.configuredModels] : null;
 +    if (this.#configuredModels) configuredGrokModelState(this.#configuredModels);
      this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_GROK_TOOL_OUTPUT_LIMIT;
++    const modelAliases = this.#configuredModels
++      ? Object.fromEntries(
++          this.#configuredModels.flatMap((model) =>
++            model.upstreamId ? [[model.id, model.upstreamId] as const] : [],
++          ),
++        )
++      : undefined;
      this.#dependencies = dependencies ?? {
        randomUUID,
-@@ -1242,6 +1248,10 @@ export class GrokAdapter implements HarnessAdapter {
+       createTransport: (transportOptions) =>
+-        new GrokAcpTransport({ ...options, ...transportOptions }),
++        new GrokAcpTransport({
++          ...options,
++          ...(modelAliases ? { modelAliases } : {}),
++          ...transportOptions,
++        }),
+     };
+     this.#fetchCredits =
+       this.#dependencies.fetchCredits ??
+@@ -1242,6 +1259,10 @@ export class GrokAdapter implements HarnessAdapter {
      return this.#credits;
    }
  
@@ -969,7 +1003,7 @@ index 6d41bb5..56df42d 100644
    refreshCredits(): Promise<GrokCreditsSnapshot | null> {
      if (this.#closePromise) return Promise.resolve(this.#credits);
      if (this.#creditsRefresh) return this.#creditsRefresh;
-@@ -1283,9 +1293,10 @@ export class GrokAdapter implements HarnessAdapter {
+@@ -1283,9 +1304,10 @@ export class GrokAdapter implements HarnessAdapter {
        stage = "startup";
        const initialize = await transport.inspect();
        stage = "model-catalog";
@@ -982,7 +1016,7 @@ index 6d41bb5..56df42d 100644
        await transport.close();
        const ready: Extract<HarnessInspection, { status: "ready" }> = {
          status: "ready",
-@@ -1452,11 +1463,12 @@ export class GrokAdapter implements HarnessAdapter {
+@@ -1452,11 +1474,12 @@ export class GrokAdapter implements HarnessAdapter {
            },
          };
        }
@@ -998,7 +1032,7 @@ index 6d41bb5..56df42d 100644
        if ((input.kind === "rollbackLastTurn" || input.kind === "fork") && retainedConfiguration) {
          const operation = input.kind === "rollbackLastTurn" ? "Rewind" : "Fork";
 diff --git a/packages/adapters/grok/src/grok-models.ts b/packages/adapters/grok/src/grok-models.ts
-index 3ec7ce2..bf113ba 100644
+index 3ec7ce2..e45918d 100644
 --- a/packages/adapters/grok/src/grok-models.ts
 +++ b/packages/adapters/grok/src/grok-models.ts
 @@ -7,7 +7,11 @@ import type {
@@ -1014,13 +1048,14 @@ index 3ec7ce2..bf113ba 100644
  
  export interface GrokModelState {
    catalog: HarnessModelCatalog;
-@@ -16,6 +20,23 @@ export interface GrokModelState {
+@@ -16,6 +20,24 @@ export interface GrokModelState {
    contextWindowTokensByModel: ReadonlyMap<string, number>;
  }
  
 +export interface GrokConfiguredModel {
 +  id: string;
 +  name: string;
++  upstreamId?: string;
 +  contextWindow?: number;
 +  reasoningLevels?: readonly string[];
 +}
@@ -1038,7 +1073,7 @@ index 3ec7ce2..bf113ba 100644
  function isRecord(value: unknown): value is Record<string, unknown> {
    return typeof value === "object" && value !== null && !Array.isArray(value);
  }
-@@ -102,6 +123,52 @@ export function modelStateFromSessionResponse(response: unknown): GrokModelState
+@@ -102,6 +124,52 @@ export function modelStateFromSessionResponse(response: unknown): GrokModelState
    return parseGrokModelState(isRecord(response) ? response.models : undefined);
  }
  
@@ -1104,10 +1139,10 @@ index 9395f68..655667b 100644
    readGrokNativeHistory,
  } from "./acp-transport.js";
 diff --git a/packages/adapters/grok/test/grok-adapter.test.ts b/packages/adapters/grok/test/grok-adapter.test.ts
-index b7bf34c..ab9e5d3 100644
+index b7bf34c..187fc39 100644
 --- a/packages/adapters/grok/test/grok-adapter.test.ts
 +++ b/packages/adapters/grok/test/grok-adapter.test.ts
-@@ -314,6 +314,41 @@ describe("Grok Adapter ACP projection", () => {
+@@ -314,6 +314,42 @@ describe("Grok Adapter ACP projection", () => {
      await adapter.close();
    });
  
@@ -1119,6 +1154,7 @@ index b7bf34c..ab9e5d3 100644
 +          {
 +            id: "everyone-in-codex~glm-5.3-flash",
 +            name: "GLM-5.3-Flash",
++            upstreamId: "zai-api-cn/glm-5.3-flash",
 +            contextWindow: 1_000_000,
 +            reasoningLevels: ["low", "high", "max"],
 +          },
@@ -1514,10 +1550,10 @@ index 4575cc8..dda1047 100644
      const rpc = session("missing-session-id");
  
 diff --git a/packages/host-runtime/src/adapter-composition.ts b/packages/host-runtime/src/adapter-composition.ts
-index 69558ca..a281169 100644
+index 69558ca..cf58833 100644
 --- a/packages/host-runtime/src/adapter-composition.ts
 +++ b/packages/host-runtime/src/adapter-composition.ts
-@@ -12,9 +12,135 @@ export const DEEPSEEK_HARNESS_ENDPOINT_ENV = "CODEXHOST_DEEPSEEK_HARNESS_ENDPOIN
+@@ -12,9 +12,144 @@ export const DEEPSEEK_HARNESS_ENDPOINT_ENV = "CODEXHOST_DEEPSEEK_HARNESS_ENDPOIN
  export const PI_COMMAND_ENV = "CODEXHOST_PI_COMMAND";
  export const GROK_COMMAND_ENV = "CODEXHOST_GROK_COMMAND";
  export const OMP_COMMAND_ENV = "CODEXHOST_OMP_COMMAND";
@@ -1549,10 +1585,14 @@ index 69558ca..a281169 100644
 +  }
 +}
 +
-+function configuredGrokModels(
-+  value: string | undefined,
-+):
-+  | Array<{ id: string; name: string; contextWindow?: number; reasoningLevels?: string[] }>
++function configuredGrokModels(value: string | undefined):
++  | Array<{
++      id: string;
++      name: string;
++      upstreamId?: string;
++      contextWindow?: number;
++      reasoningLevels?: string[];
++    }>
 +  | undefined {
 +  if (value === undefined) return undefined;
 +  if (value.length === 0 || value.length > 64 * 1024) {
@@ -1575,8 +1615,12 @@ index 69558ca..a281169 100644
 +    const model = entry as Record<string, unknown>;
 +    const id = typeof model.id === "string" ? model.id.trim() : "";
 +    const name = typeof model.displayName === "string" ? model.displayName.trim() : "";
++    const upstreamId = typeof model.upstreamId === "string" ? model.upstreamId.trim() : "";
 +    if (!id || id.length > 256 || !name || name.length > 256 || seen.has(id)) {
 +      throw new Error("CODEXHOST_GROK_MODELS_JSON contains an invalid or duplicate Model");
++    }
++    if (model.upstreamId !== undefined && (!upstreamId || upstreamId.length > 256)) {
++      throw new Error("CODEXHOST_GROK_MODELS_JSON contains an invalid upstream Model id");
 +    }
 +    seen.add(id);
 +    const contextWindow = model.contextWindow;
@@ -1596,6 +1640,7 @@ index 69558ca..a281169 100644
 +    return {
 +      id,
 +      name,
++      ...(upstreamId ? { upstreamId } : {}),
 +      ...(contextWindow === undefined ? {} : { contextWindow: contextWindow as number }),
 +      reasoningLevels: [...new Set(reasoningLevels as string[])],
 +    };
@@ -1653,7 +1698,7 @@ index 69558ca..a281169 100644
  export async function prefetchClaudeCodeModelCatalog(
    adapters: ReadonlyMap<ExternalHarnessId, InspectableHarnessAdapter>,
  ): Promise<void> {
-@@ -28,12 +154,20 @@ export async function prefetchClaudeCodeModelCatalog(
+@@ -28,12 +163,20 @@ export async function prefetchClaudeCodeModelCatalog(
  export function createExternalHarnessAdapters(
    environment: NodeJS.ProcessEnv,
  ): ReadonlyMap<ExternalHarnessId, HarnessAdapter> {
@@ -1675,7 +1720,7 @@ index 69558ca..a281169 100644
        }),
      ],
      [
-@@ -42,7 +176,7 @@ export function createExternalHarnessAdapters(
+@@ -42,7 +185,7 @@ export function createExternalHarnessAdapters(
          ...(environment[CLAUDE_CODE_COMMAND_ENV]
            ? { command: environment[CLAUDE_CODE_COMMAND_ENV] }
            : {}),
@@ -1684,7 +1729,7 @@ index 69558ca..a281169 100644
        }),
      ],
      [
-@@ -54,21 +188,27 @@ export function createExternalHarnessAdapters(
+@@ -54,21 +197,27 @@ export function createExternalHarnessAdapters(
          ...(environment[DEEPSEEK_HARNESS_ENDPOINT_ENV]
            ? { endpoint: environment[DEEPSEEK_HARNESS_ENDPOINT_ENV] }
            : {}),
@@ -1741,7 +1786,7 @@ index da208c8..e48ac0f 100644
  } from "./adapter-composition.js";
  export { AppServerHost, classifyCreateRequestRoute } from "./app-server-host.js";
 diff --git a/packages/host-runtime/test/adapter-composition.test.ts b/packages/host-runtime/test/adapter-composition.test.ts
-index d93032c..cc8a34e 100644
+index d93032c..af903cd 100644
 --- a/packages/host-runtime/test/adapter-composition.test.ts
 +++ b/packages/host-runtime/test/adapter-composition.test.ts
 @@ -3,8 +3,16 @@ import { describe, expect, it, vi } from "vitest";
@@ -1761,7 +1806,7 @@ index d93032c..cc8a34e 100644
    prefetchClaudeCodeModelCatalog,
  } from "../src/index.js";
  
-@@ -46,6 +54,64 @@ describe("Host external Harness composition", () => {
+@@ -46,6 +54,65 @@ describe("Host external Harness composition", () => {
      await Promise.all([...adapters.values()].map((adapter) => adapter.close()));
    });
  
@@ -1777,6 +1822,7 @@ index d93032c..cc8a34e 100644
 +      [CODEXHOST_GROK_MODELS_JSON_ENV]: JSON.stringify([
 +        {
 +          id: "everyone-in-codex~glm-5.3-flash",
++          upstreamId: "zai-api-cn/glm-5.3-flash",
 +          displayName: "GLM-5.3-Flash",
 +          contextWindow: 1_000_000,
 +          reasoningLevels: ["low", "high", "max"],
