@@ -16,6 +16,11 @@ import { promisify } from "node:util";
 
 import { ProfileManager } from "./profile-manager.mjs";
 import { RouterCatalogBridge } from "./router-catalog-bridge.mjs";
+import {
+  publishHarnessConfigs,
+  reserveLoopbackPort,
+  restoreHarnessConfigs,
+} from "./harness-configs.mjs";
 
 const execFileAsync = promisify(execFile);
 const MODULE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -398,13 +403,28 @@ function waitForGatewayReady(child, leaseId, timeoutMs) {
         message?.type !== "ready"
         || message.leaseId !== leaseId
         || message.pid !== child.pid
-        || typeof message.capability !== "string"
-        || message.capability.length < 16
       ) return;
       try {
-        const url = normalizeLoopbackUrl(message.baseUrl, "Gateway baseUrl");
-        if (url.pathname !== "/") throw new Error("gateway_ready_url_has_path");
-        settle(resolve, { ...message, baseUrl: url.origin });
+        const normalizeLease = (lease, target) => {
+          if (
+            typeof lease?.capability !== "string"
+            || lease.capability.length < 16
+            || !Number.isInteger(lease.modelCount)
+            || lease.modelCount < 1
+            || typeof lease.catalogRevision !== "string"
+            || !lease.catalogRevision
+          ) {
+            throw new Error(`gateway_${target}_ready_invalid`);
+          }
+          const url = normalizeLoopbackUrl(lease.baseUrl, `${target} Gateway baseUrl`);
+          if (url.pathname !== "/") throw new Error("gateway_ready_url_has_path");
+          return { ...lease, baseUrl: url.origin };
+        };
+        settle(resolve, {
+          ...message,
+          codex: normalizeLease(message.codex, "codex"),
+          external: normalizeLease(message.external, "external"),
+        });
       } catch (error) {
         settle(reject, error);
       }
@@ -627,6 +647,7 @@ export class LocalFusionRuntime {
     readyTimeoutMs = DEFAULT_READY_TIMEOUT_MS,
     harnesses,
     sourceEnvironment = process.env,
+    loopbackPortAllocator = reserveLoopbackPort,
   } = {}) {
     if (typeof fetchImpl !== "function" || typeof spawnImpl !== "function") {
       throw new Error("LocalFusionRuntime 需要 fetch 与 spawn 边界");
@@ -649,6 +670,10 @@ export class LocalFusionRuntime {
     this.readyTimeoutMs = Math.max(1, Number(readyTimeoutMs) || DEFAULT_READY_TIMEOUT_MS);
     this.harnesses = harnesses;
     this.sourceEnvironment = sourceEnvironment;
+    if (typeof loopbackPortAllocator !== "function") {
+      throw new Error("LocalFusionRuntime 需要回环端口分配器");
+    }
+    this.loopbackPortAllocator = loopbackPortAllocator;
 
     this.validationPolicy = Object.freeze({
       assert: async (profile) => this.#assertConfiguredProfile(profile),
@@ -833,11 +858,14 @@ export class LocalFusionRuntime {
     if ((await this.#activeLeaseFiles()).length > 0) {
       throw new Error("fusion_lease_already_active");
     }
-    const snapshotPath = this.#snapshotPath("codex");
-    const snapshot = parseCatalogSnapshot(
-      await readJsonRegular(snapshotPath, "codex catalog snapshot"),
-      "codex",
-    );
+    const codexSnapshotPath = this.#snapshotPath("codex");
+    const externalSnapshotPath = this.#snapshotPath("external");
+    const [codexSnapshot, externalSnapshot] = await Promise.all([
+      readJsonRegular(codexSnapshotPath, "codex catalog snapshot")
+        .then((value) => parseCatalogSnapshot(value, "codex")),
+      readJsonRegular(externalSnapshotPath, "external catalog snapshot")
+        .then((value) => parseCatalogSnapshot(value, "external")),
+    ]);
     await this.#prepare(profile);
 
     const leaseId = safeLeaseId(this.randomId());
@@ -845,8 +873,10 @@ export class LocalFusionRuntime {
       config.runtime.gatewayDaemonPath,
       "--config",
       this.configPath,
-      "--catalog",
-      snapshotPath,
+      "--codex-catalog",
+      codexSnapshotPath,
+      "--external-catalog",
+      externalSnapshotPath,
       "--lease",
       leaseId,
     ];
@@ -860,6 +890,7 @@ export class LocalFusionRuntime {
     let gatewayIdentity = null;
     let hostIdentity = null;
     let profileManager = null;
+    let harnessConfigOwnership = null;
     try {
       const gatewayReadyPromise = waitForGatewayReady(
         gatewayChild,
@@ -875,20 +906,29 @@ export class LocalFusionRuntime {
       const gatewayReady = await gatewayReadyPromise;
       profileManager = new ProfileManager({ codexHome: profile.codexHome, stateDir: this.stateRoot });
       const profileReceipt = await profileManager.publish({
-        gatewayBaseUrl: gatewayReady.baseUrl,
-        models: snapshot.models,
+        gatewayBaseUrl: gatewayReady.codex.baseUrl,
+        models: codexSnapshot.models,
       });
+      const harnessConfig = await publishHarnessConfigs({
+        root: path.join(this.leaseDirectory, leaseId, "harnesses"),
+        gatewayBaseUrl: gatewayReady.external.baseUrl,
+        models: externalSnapshot.models,
+        loopbackPortAllocator: this.loopbackPortAllocator,
+      });
+      harnessConfigOwnership = harnessConfig.ownership;
 
       const environment = {
         ...safeBaseEnvironment(this.sourceEnvironment),
+        ...harnessConfig.environment,
         CODEX_HOME: profile.codexHome,
         CODEX_SQLITE_HOME: profile.sqliteHome,
         CODEXHOST_DATA_DIR: path.join(this.stateRoot, "codexhost", profile.name),
         CODEXHOST_CODEX_CONFIG_OVERRIDES: encodeCodexConfigOverrides({
-          gatewayBaseUrl: gatewayReady.baseUrl,
+          gatewayBaseUrl: gatewayReady.codex.baseUrl,
           catalogPath: profileReceipt.catalogPath,
         }),
-        EVERYONE_CODEX_LEASE_CAPABILITY: gatewayReady.capability,
+        EVERYONE_CODEX_LEASE_CAPABILITY: gatewayReady.codex.capability,
+        EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY: gatewayReady.external.capability,
       };
       for (const harness of await this.harnesses.list()) {
         if (
@@ -927,18 +967,24 @@ export class LocalFusionRuntime {
         schemaVersion: 1,
         leaseId,
         profile,
-        gatewayBaseUrl: gatewayReady.baseUrl,
-        catalogRevision: snapshot.catalogRevision,
+        gatewayBaseUrl: gatewayReady.codex.baseUrl,
+        externalGatewayBaseUrl: gatewayReady.external.baseUrl,
+        catalogRevision: {
+          codex: codexSnapshot.catalogRevision,
+          external: externalSnapshot.catalogRevision,
+        },
         profileOwnership: profileReceipt,
+        harnessConfigOwnership,
         processes: [gatewayIdentity, hostIdentity],
       };
       await writeTextAtomic(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
       return Object.freeze({
         leaseId,
         receiptPath,
-        gatewayBaseUrl: gatewayReady.baseUrl,
-        catalogRevision: snapshot.catalogRevision,
-        modelCount: snapshot.models.length,
+        gatewayBaseUrl: gatewayReady.codex.baseUrl,
+        catalogRevision: codexSnapshot.catalogRevision,
+        modelCount: codexSnapshot.models.length,
+        externalModelCount: externalSnapshot.models.length,
         processes: Object.freeze({ gateway: gatewayChild.pid, codexHost: hostChild.pid }),
       });
     } catch (error) {
@@ -953,6 +999,15 @@ export class LocalFusionRuntime {
           cleanupErrors.push(cleanupError);
           await childKillBestEffort(child);
         }
+      }
+      try {
+        if (harnessConfigOwnership) {
+          await restoreHarnessConfigs(harnessConfigOwnership, {
+            expectedRoot: path.join(this.leaseDirectory, leaseId, "harnesses"),
+          });
+        }
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
       }
       try {
         await profileManager?.restore();
@@ -1008,6 +1063,11 @@ export class LocalFusionRuntime {
       codexHome: receipt.profile.codexHome,
       stateDir: this.stateRoot,
     });
+    if (receipt.harnessConfigOwnership) {
+      await restoreHarnessConfigs(receipt.harnessConfigOwnership, {
+        expectedRoot: path.join(this.leaseDirectory, leaseId, "harnesses"),
+      });
+    }
     await manager.restore();
     await unlink(receiptPath);
     return { restored: true, leaseId, stoppedPids };

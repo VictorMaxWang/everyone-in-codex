@@ -5,6 +5,7 @@ import {
   mkdtemp,
   readFile,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -13,6 +14,10 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import { startGatewayDaemonService } from "../src/gateway-daemon.mjs";
+import {
+  publishHarnessConfigs,
+  restoreHarnessConfigs,
+} from "../src/harness-configs.mjs";
 import {
   createLocalFusionRuntime,
   inspectProcessIdentity,
@@ -89,7 +94,13 @@ async function fixture() {
   }), "utf8");
 
   const models = [
-    { id: "provider/api-model", context_window: 1_000_000 },
+    {
+      id: "provider/api-model",
+      display_name: "Provider API Model",
+      context_window: 1_000_000,
+      input_modalities: ["text", "image"],
+      supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }],
+    },
     { id: "chatgpt-web/light", context_window: 333_579 },
     { id: "gpt-5.6-sol-1m", context_window: 1_000_000 },
   ];
@@ -180,14 +191,27 @@ test("validation policy 必须显式允许 Codex 2 的四条路径", async () =>
   );
 });
 
-test("Gateway daemon 自己读取 caller-secret 并只通过 IPC 返回 consumer capability", async () => {
+test("Gateway daemon 在单进程中隔离 Codex 15 模型与 external 10 模型 lease", async () => {
   const fx = await fixture();
-  const catalogPath = path.join(fx.stateRoot, "router-catalog-codex.json");
-  await writeFile(catalogPath, JSON.stringify({
+  const codexCatalogPath = path.join(fx.stateRoot, "router-catalog-codex.json");
+  const externalCatalogPath = path.join(fx.stateRoot, "router-catalog-external.json");
+  const externalModels = Array.from({ length: 10 }, (_, index) => ({
+    id: `provider/api-model-${index + 1}`,
+  }));
+  await writeFile(codexCatalogPath, JSON.stringify({
     schemaVersion: 1,
     target: "codex",
-    catalogRevision: "catalog-revision",
-    models: [{ id: "provider/api-model" }],
+    catalogRevision: "catalog-codex-revision",
+    models: [
+      ...externalModels,
+      ...Array.from({ length: 5 }, (_, index) => ({ id: `chatgpt-web/web-${index + 1}` })),
+    ],
+  }), "utf8");
+  await writeFile(externalCatalogPath, JSON.stringify({
+    schemaVersion: 1,
+    target: "external",
+    catalogRevision: "catalog-external-revision",
+    models: externalModels,
   }), "utf8");
 
   const sent = [];
@@ -195,41 +219,138 @@ test("Gateway daemon 自己读取 caller-secret 并只通过 IPC 返回 consumer
   let closed = 0;
   const service = await startGatewayDaemonService({
     configPath: fx.configPath,
-    catalogPath,
+    codexCatalogPath,
+    externalCatalogPath,
     leaseId: "lease-daemon-1",
     pid: 7001,
     send: (value) => sent.push(value),
-    gatewayFactory: (options) => {
-      starts.push(options);
+    gatewayFactory: (options, target) => {
+      starts.push({ options, target });
       return {
         start: async ({ models }) => ({
-          baseUrl: "http://127.0.0.1:45678",
+          baseUrl: target === "codex"
+            ? "http://127.0.0.1:45678"
+            : "http://127.0.0.1:45679",
           models,
-          authorizationHeaders: () => ({ authorization: "Bearer fixture-consumer-capability" }),
+          authorizationHeaders: () => ({
+            authorization: `Bearer fixture-${target}-consumer-capability`,
+          }),
           close: async () => { closed += 1; },
         }),
       };
     },
   });
 
-  assert.equal(starts.length, 1);
+  assert.equal(starts.length, 2);
   assert.equal(
-    starts[0].routerBaseUrl,
+    starts[0].options.routerBaseUrl,
     `http://127.0.0.1:43123/_codex-router/${ROUTER_SECRET}/v1/`,
   );
+  assert.deepEqual(starts.map((entry) => entry.target), ["codex", "external"]);
   assert.deepEqual(sent, [{
     type: "ready",
     leaseId: "lease-daemon-1",
     pid: 7001,
-    baseUrl: "http://127.0.0.1:45678",
-    capability: "fixture-consumer-capability",
-    modelCount: 1,
-    catalogRevision: "catalog-revision",
+    codex: {
+      baseUrl: "http://127.0.0.1:45678",
+      capability: "fixture-codex-consumer-capability",
+      modelCount: 15,
+      catalogRevision: "catalog-codex-revision",
+    },
+    external: {
+      baseUrl: "http://127.0.0.1:45679",
+      capability: "fixture-external-consumer-capability",
+      modelCount: 10,
+      catalogRevision: "catalog-external-revision",
+    },
   }]);
 
   await service.close();
   await service.close();
-  assert.equal(closed, 1);
+  assert.equal(closed, 2);
+});
+
+test("external Gateway lease 拒绝手写 chatgpt-web slug", async () => {
+  const fx = await fixture();
+  const codexCatalogPath = path.join(fx.stateRoot, "router-catalog-codex.json");
+  const externalCatalogPath = path.join(fx.stateRoot, "router-catalog-external.json");
+  await writeFile(codexCatalogPath, JSON.stringify({
+    schemaVersion: 1,
+    target: "codex",
+    catalogRevision: "codex-r1",
+    models: [{ id: "provider/api-model" }, { id: "chatgpt-web/light" }],
+  }), "utf8");
+  await writeFile(externalCatalogPath, JSON.stringify({
+    schemaVersion: 1,
+    target: "external",
+    catalogRevision: "external-r1",
+    models: [{ id: "provider/api-model" }],
+  }), "utf8");
+  const sent = [];
+  const service = await startGatewayDaemonService({
+    configPath: fx.configPath,
+    codexCatalogPath,
+    externalCatalogPath,
+    leaseId: "lease-external-reject",
+    pid: 7002,
+    send: (value) => sent.push(value),
+  });
+  try {
+    const ready = sent[0];
+    const response = await fetch(`${ready.external.baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${ready.external.capability}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "chatgpt-web/light", input: "must-not-forward" }),
+    });
+    assert.equal(response.status, 403);
+  } finally {
+    await service.close();
+  }
+});
+
+test("Harness 清理只删除指纹匹配的受管文件，保留未知与已改写内容", async () => {
+  const fx = await fixture();
+  const harnessRoot = path.join(fx.stateRoot, "leases", "lease-config-cleanup", "harnesses");
+  const published = await publishHarnessConfigs({
+    root: harnessRoot,
+    gatewayBaseUrl: "http://127.0.0.1:45683",
+    models: [{ id: "provider/api-model", context_window: 1_000_000 }],
+    loopbackPortAllocator: async () => 49323,
+  });
+  const managed = published.ownership.files[0].path;
+  const unknown = path.join(path.dirname(managed), "session-owned.jsonl");
+  await writeFile(managed, "harness rewrote this file\n", "utf8");
+  await writeFile(unknown, "unknown runtime state\n", "utf8");
+
+  const result = await restoreHarnessConfigs(published.ownership, {
+    expectedRoot: harnessRoot,
+  });
+  assert.deepEqual(result.removed, published.ownership.files.slice(1).map((entry) => entry.path));
+  assert.deepEqual(result.preserved, [managed]);
+  assert.equal(await readFile(managed, "utf8"), "harness rewrote this file\n");
+  assert.equal(await readFile(unknown, "utf8"), "unknown runtime state\n");
+});
+
+test("Harness 配置发布在 mkdir 前拒绝已有 reparse 祖先", async () => {
+  const fx = await fixture();
+  const target = path.join(fx.root, "junction-target");
+  const link = path.join(fx.stateRoot, "junction-parent");
+  await mkdir(target, { recursive: true });
+  await symlink(target, link, process.platform === "win32" ? "junction" : "dir");
+
+  await assert.rejects(
+    publishHarnessConfigs({
+      root: path.join(link, "must-not-create", "harnesses"),
+      gatewayBaseUrl: "http://127.0.0.1:45684",
+      models: [{ id: "provider/api-model" }],
+      loopbackPortAllocator: async () => 49324,
+    }),
+    /harness_config_path_is_reparse_or_not_directory/,
+  );
+  await assert.rejects(stat(path.join(target, "must-not-create")), /ENOENT/);
 });
 
 test("launch 只把 consumer capability 交给 CodexHost，restore 精确终止 receipt PID", async () => {
@@ -247,10 +368,18 @@ test("launch 只把 consumer capability 交给 CodexHost，restore 精确终止 
         type: "ready",
         leaseId,
         pid: child.pid,
-        baseUrl: "http://127.0.0.1:45679",
-        capability: "consumer-launch-capability",
-        modelCount: 2,
-        catalogRevision: "catalog-launch-revision",
+        codex: {
+          baseUrl: "http://127.0.0.1:45679",
+          capability: "codex-consumer-launch-capability",
+          modelCount: 2,
+          catalogRevision: "catalog-codex-launch-revision",
+        },
+        external: {
+          baseUrl: "http://127.0.0.1:45681",
+          capability: "external-consumer-launch-capability",
+          modelCount: 1,
+          catalogRevision: "catalog-external-launch-revision",
+        },
       }));
     } else {
       queueMicrotask(() => child.stdout.write("ready\n"));
@@ -272,14 +401,20 @@ test("launch 只把 consumer capability 交给 CodexHost，restore 精确终止 
     }],
   ]);
   const terminated = [];
-  const harnesses = {
-    list: async () => [{
-      id: "pi",
-      commandPath: path.join(fx.root, "pi.cmd"),
-      commandEnvironment: "CODEXHOST_PI_COMMAND",
-    }],
-  };
-  await writeFile(path.join(fx.root, "pi.cmd"), "@echo off", "utf8");
+  const harnessRecords = [
+    ["pi", "CODEXHOST_PI_COMMAND"],
+    ["omp", "CODEXHOST_OMP_COMMAND"],
+    ["deepseek-harness", "CODEXHOST_DEEPSEEK_HARNESS_COMMAND"],
+    ["grok", "CODEXHOST_GROK_COMMAND"],
+  ].map(([id, commandEnvironment]) => ({
+    id,
+    commandEnvironment,
+    commandPath: path.join(fx.root, `${id}.cmd`),
+  }));
+  const harnesses = { list: async () => harnessRecords };
+  await Promise.all(harnessRecords.map((record) => (
+    writeFile(record.commandPath, "@echo off", "utf8")
+  )));
 
   const runtime = createLocalFusionRuntime({
     configPath: fx.configPath,
@@ -295,19 +430,34 @@ test("launch 只把 consumer capability 交给 CodexHost，restore 精确终止 
       return { stopped: true };
     },
     randomId: () => "lease-runtime-1",
+    loopbackPortAllocator: async () => 49321,
     harnesses,
   });
-  await runtime.catalogBridge.activate({ target: "codex", profile: fx.profile });
+  await Promise.all([
+    runtime.catalogBridge.activate({ target: "codex", profile: fx.profile }),
+    runtime.catalogBridge.activate({ target: "external", profile: fx.profile }),
+  ]);
 
   const lease = await runtime.launcher.launch({ profile: fx.profile });
   assert.equal(lease.leaseId, "lease-runtime-1");
   assert.deepEqual(lease.processes, { gateway: 7101, codexHost: 7102 });
-  assert.equal(JSON.stringify(lease).includes("consumer-launch-capability"), false);
+  assert.equal(JSON.stringify(lease).includes("codex-consumer-launch-capability"), false);
+  assert.equal(JSON.stringify(lease).includes("external-consumer-launch-capability"), false);
   assert.equal(JSON.stringify(lease).includes(ROUTER_SECRET), false);
 
   const gatewaySpawn = spawnCalls[0];
   assert.equal(JSON.stringify(gatewaySpawn.args).includes(ROUTER_SECRET), false);
   assert.equal(JSON.stringify(gatewaySpawn.options.env).includes(ROUTER_SECRET), false);
+  assert.deepEqual(gatewaySpawn.args.slice(-8), [
+    "--config",
+    fx.configPath,
+    "--codex-catalog",
+    path.join(fx.stateRoot, "router-catalog-codex.json"),
+    "--external-catalog",
+    path.join(fx.stateRoot, "router-catalog-external.json"),
+    "--lease",
+    "lease-runtime-1",
+  ]);
   const hostSpawn = spawnCalls[1];
   assert.deepEqual(hostSpawn.args, [
     "launch",
@@ -333,8 +483,67 @@ test("launch 只把 consumer capability 交给 CodexHost，restore 精确终止 
       'model_providers.everyone-in-codex.env_key="EVERYONE_CODEX_LEASE_CAPABILITY"',
     ],
   );
-  assert.equal(hostSpawn.options.env.EVERYONE_CODEX_LEASE_CAPABILITY, "consumer-launch-capability");
+  assert.equal(
+    hostSpawn.options.env.EVERYONE_CODEX_LEASE_CAPABILITY,
+    "codex-consumer-launch-capability",
+  );
+  assert.equal(
+    hostSpawn.options.env.EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY,
+    "external-consumer-launch-capability",
+  );
   assert.equal(hostSpawn.options.env.CODEXHOST_PI_COMMAND, path.join(fx.root, "pi.cmd"));
+  const harnessRoot = path.join(fx.stateRoot, "leases", "lease-runtime-1", "harnesses");
+  assert.equal(hostSpawn.options.env.CODEXHOST_PI_DATA_DIR, path.join(harnessRoot, "pi"));
+  assert.equal(hostSpawn.options.env.CODEXHOST_OMP_DATA_DIR, path.join(harnessRoot, "omp"));
+  assert.equal(hostSpawn.options.env.CODEXHOST_DSH_HOME, path.join(harnessRoot, "dsh"));
+  assert.equal(hostSpawn.options.env.CODEXHOST_GROK_HOME, path.join(harnessRoot, "grok"));
+  assert.equal(
+    hostSpawn.options.env.CODEXHOST_DEEPSEEK_HARNESS_ENDPOINT,
+    "http://127.0.0.1:49321/",
+  );
+
+  const configFiles = {
+    pi: path.join(harnessRoot, "pi", "models.json"),
+    omp: path.join(harnessRoot, "omp", "models.yml"),
+    dsh: path.join(harnessRoot, "dsh", "settings.yaml"),
+    grok: path.join(harnessRoot, "grok", "config.toml"),
+  };
+  const configTexts = Object.fromEntries(await Promise.all(
+    Object.entries(configFiles).map(async ([id, filePath]) => [id, await readFile(filePath, "utf8")]),
+  ));
+  for (const text of Object.values(configTexts)) {
+    assert.match(text, /provider\/api-model/);
+    assert.doesNotMatch(text, /chatgpt-web/);
+    assert.match(text, /EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY/);
+    assert.doesNotMatch(text, /external-consumer-launch-capability/);
+    assert.match(text, /http:\/\/127\.0\.0\.1:45681\/v1/);
+  }
+  const piConfig = JSON.parse(configTexts.pi);
+  assert.equal(piConfig.providers["everyone-in-codex"].api, "openai-responses");
+  assert.deepEqual(
+    piConfig.providers["everyone-in-codex"].models[0],
+    {
+      id: "provider/api-model",
+      name: "Provider API Model",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 1_000_000,
+    },
+  );
+  assert.match(configTexts.omp, /^providers:/m);
+  assert.equal(
+    configTexts.omp.includes(`apiKey: ${"EVERYONE_CODEX_"}EXTERNAL_LEASE_CAPABILITY`),
+    true,
+  );
+  assert.doesNotMatch(configTexts.omp, /apiKey: \$EVERYONE/);
+  assert.match(configTexts.dsh, /^llm-pi-ai:\n  providers:/m);
+  assert.match(configTexts.dsh, /apiKeyEnv: EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY/);
+  assert.match(configTexts.dsh, /baseURL: "http:\/\/127\.0\.0\.1:45681\/v1"/);
+  assert.match(configTexts.dsh, /reasoningEfforts:\n\s+low: low\n\s+high: high/);
+  assert.doesNotMatch(configTexts.dsh, /^\s+(?:reasoning|input):/m);
+  assert.match(configTexts.grok, /^\[model\."provider\/api-model"\]/m);
+  assert.match(configTexts.grok, /^model = "provider\/api-model"$/m);
+  assert.match(configTexts.grok, /api_backend = "responses"/);
 
   const profile = await readFile(
     path.join(fx.profile.codexHome, "everyone-in-codex.config.toml"),
@@ -343,7 +552,8 @@ test("launch 只把 consumer capability 交给 CodexHost，restore 精确终止 
   assert.match(profile, /base_url = "http:\/\/127\.0\.0\.1:45679\/v1"/);
 
   const receiptText = await readFile(lease.receiptPath, "utf8");
-  assert.equal(receiptText.includes("consumer-launch-capability"), false);
+  assert.equal(receiptText.includes("codex-consumer-launch-capability"), false);
+  assert.equal(receiptText.includes("external-consumer-launch-capability"), false);
   assert.equal(receiptText.includes(ROUTER_SECRET), false);
 
   assert.deepEqual(await runtime.launcher.restore({ leaseId: lease.leaseId }), {
@@ -356,6 +566,9 @@ test("launch 只把 consumer capability 交给 CodexHost，restore 精确终止 
     stat(path.join(fx.profile.codexHome, "everyone-in-codex.config.toml")),
     /ENOENT/,
   );
+  for (const filePath of Object.values(configFiles)) {
+    await assert.rejects(stat(filePath), /ENOENT/);
+  }
   assert.deepEqual(await runtime.launcher.restore({ leaseId: lease.leaseId }), {
     restored: false,
     leaseId: "lease-runtime-1",
@@ -395,8 +608,18 @@ test("launch 就绪失败时按已捕获身份终止进程树并恢复 Profile",
           type: "ready",
           leaseId,
           pid: child.pid,
-          baseUrl: "http://127.0.0.1:45680",
-          capability: "failure-consumer-capability",
+          codex: {
+            baseUrl: "http://127.0.0.1:45680",
+            capability: "failure-codex-consumer-capability",
+            modelCount: 2,
+            catalogRevision: "failure-codex-revision",
+          },
+          external: {
+            baseUrl: "http://127.0.0.1:45682",
+            capability: "failure-external-consumer-capability",
+            modelCount: 1,
+            catalogRevision: "failure-external-revision",
+          },
         }));
       } else {
         queueMicrotask(() => child.emit("exit", 1, null));
@@ -410,9 +633,13 @@ test("launch 就绪失败时按已捕获身份终止进程树并恢复 Profile",
       return { stopped: true };
     },
     randomId: () => "lease-failure",
+    loopbackPortAllocator: async () => 49322,
     harnesses: { list: async () => [] },
   });
-  await runtime.catalogBridge.activate({ target: "codex", profile: fx.profile });
+  await Promise.all([
+    runtime.catalogBridge.activate({ target: "codex", profile: fx.profile }),
+    runtime.catalogBridge.activate({ target: "external", profile: fx.profile }),
+  ]);
 
   await assert.rejects(
     runtime.launcher.launch({ profile: fx.profile }),
@@ -421,6 +648,10 @@ test("launch 就绪失败时按已捕获身份终止进程树并恢复 Profile",
   assert.deepEqual(terminated, [7202, 7201]);
   await assert.rejects(
     stat(path.join(fx.profile.codexHome, "everyone-in-codex.config.toml")),
+    /ENOENT/,
+  );
+  await assert.rejects(
+    stat(path.join(fx.stateRoot, "leases", "lease-failure", "harnesses", "pi", "models.json")),
     /ENOENT/,
   );
 });
