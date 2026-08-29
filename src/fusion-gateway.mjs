@@ -85,22 +85,36 @@ class GatewayLease {
 }
 
 export class FusionGateway {
-  #routerCapability;
+  #routerBaseUrl;
 
   constructor({
     routerBaseUrl,
-    routerCapability,
     fetchImpl = globalThis.fetch,
     leaseTtlMs = DEFAULT_LEASE_TTL_MS,
     maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
   }) {
-    if (!routerBaseUrl || typeof routerCapability !== "string" || !routerCapability) {
-      throw new TypeError("routerBaseUrl and routerCapability are required");
-    }
+    if (!routerBaseUrl) throw new TypeError("routerBaseUrl is required");
     if (typeof fetchImpl !== "function") throw new TypeError("fetchImpl must be a function");
 
-    this.routerBaseUrl = new URL(routerBaseUrl);
-    this.#routerCapability = routerCapability;
+    const parsedRouterBaseUrl = new URL(routerBaseUrl);
+    if (
+      parsedRouterBaseUrl.protocol !== "http:"
+      || parsedRouterBaseUrl.hostname !== "127.0.0.1"
+      || parsedRouterBaseUrl.username
+      || parsedRouterBaseUrl.password
+      || parsedRouterBaseUrl.search
+      || parsedRouterBaseUrl.hash
+    ) {
+      throw new TypeError("routerBaseUrl must be a plain loopback HTTP URL");
+    }
+    if (!parsedRouterBaseUrl.pathname.endsWith("/v1/")) {
+      parsedRouterBaseUrl.pathname = `${parsedRouterBaseUrl.pathname.replace(/\/$/, "")}/`;
+      if (!parsedRouterBaseUrl.pathname.endsWith("/v1/")) {
+        throw new TypeError("routerBaseUrl must end with /v1/");
+      }
+    }
+    // Router caller capability保留在私有URL路径中；绝不能复制到Authorization头。
+    this.#routerBaseUrl = parsedRouterBaseUrl;
     this.fetchImpl = fetchImpl;
     this.leaseTtlMs = Math.max(1, Number(leaseTtlMs) || DEFAULT_LEASE_TTL_MS);
     this.maxBodyBytes = Math.max(1, Number(maxBodyBytes) || DEFAULT_MAX_BODY_BYTES);
@@ -160,11 +174,10 @@ export class FusionGateway {
       request.once("aborted", () => abortController.abort());
 
       try {
-        const upstreamUrl = new URL("/v1/responses", this.routerBaseUrl);
+        const upstreamUrl = new URL("responses", this.#routerBaseUrl);
         const upstream = await this.fetchImpl(upstreamUrl, {
           method: "POST",
           headers: {
-            authorization: `Bearer ${this.#routerCapability}`,
             "content-type": "application/json",
             accept: request.headers.accept ?? "text/event-stream, application/json",
           },

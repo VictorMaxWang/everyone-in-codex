@@ -42,7 +42,7 @@ const SPEC_DATA = [
     defaultCommand: "dsh",
     compatibility: "full-preview",
     routerProtocol: "openai-responses",
-    commandEnvironment: "CODEXHOST_DSH_COMMAND",
+    commandEnvironment: "CODEXHOST_DEEPSEEK_HARNESS_COMMAND",
     login: {
       args: ["--profile", "tui"],
       instruction:

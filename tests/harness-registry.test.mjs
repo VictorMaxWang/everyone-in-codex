@@ -36,7 +36,7 @@ test("内置 Harness 清单公开锁定的兼容等级和启动环境映射", ()
     {
       pi: "CODEXHOST_PI_COMMAND",
       omp: "CODEXHOST_OMP_COMMAND",
-      "deepseek-harness": "CODEXHOST_DSH_COMMAND",
+      "deepseek-harness": "CODEXHOST_DEEPSEEK_HARNESS_COMMAND",
       grok: "CODEXHOST_GROK_COMMAND",
       "claude-code": "CODEXHOST_CLAUDE_COMMAND",
     },

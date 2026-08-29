@@ -30,13 +30,10 @@ test("Gateway 用回环 lease 发布模型并只转发 allowlist 内的请求", 
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ id: "response-ok", output: [] }));
   });
-  const routerBaseUrl = await listen(router);
+  const routerBaseUrl = `${await listen(router)}/_codex-router/upstream-secret-value/v1/`;
   t.after(() => close(router));
 
-  const gateway = new FusionGateway({
-    routerBaseUrl,
-    routerCapability: "upstream-secret-value",
-  });
+  const gateway = new FusionGateway({ routerBaseUrl });
   const lease = await gateway.start({
     models: [{ id: "zai-api-cn/glm-5.3-flash", context_window: 1_000_000 }],
   });
@@ -73,8 +70,8 @@ test("Gateway 用回环 lease 发布模型并只转发 allowlist 内的请求", 
   assert.equal(allowed.status, 200);
   assert.equal((await allowed.json()).id, "response-ok");
   assert.deepEqual(upstreamRequests, [{
-    path: "/v1/responses",
-    authorization: "Bearer upstream-secret-value",
+    path: "/_codex-router/upstream-secret-value/v1/responses",
+    authorization: undefined,
     body: JSON.stringify(allowedBody),
   }]);
 });
@@ -87,13 +84,10 @@ test("Gateway 不向调用方透出 Router 错误正文或 capability", async (t
       debug: "private-router-debug-body",
     }));
   });
-  const routerBaseUrl = await listen(router);
+  const routerBaseUrl = `${await listen(router)}/_codex-router/upstream-secret-value/v1/`;
   t.after(() => close(router));
 
-  const gateway = new FusionGateway({
-    routerBaseUrl,
-    routerCapability: "upstream-secret-value",
-  });
+  const gateway = new FusionGateway({ routerBaseUrl });
   const lease = await gateway.start({ models: [{ id: "provider/allowed" }] });
   t.after(() => lease.close());
 
