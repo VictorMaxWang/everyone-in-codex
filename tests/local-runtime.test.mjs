@@ -497,6 +497,13 @@ test("launch 只把 consumer capability 交给 CodexHost，restore 精确终止 
   assert.equal(hostSpawn.options.env.CODEXHOST_OMP_DATA_DIR, path.join(harnessRoot, "omp"));
   assert.equal(hostSpawn.options.env.CODEXHOST_DSH_HOME, path.join(harnessRoot, "dsh"));
   assert.equal(hostSpawn.options.env.CODEXHOST_GROK_HOME, path.join(harnessRoot, "grok"));
+  const projectedGrokModels = JSON.parse(hostSpawn.options.env.CODEXHOST_GROK_MODELS_JSON);
+  assert.equal(projectedGrokModels.length, lease.externalModelCount);
+  assert.equal(projectedGrokModels.some((model) => model.id.startsWith("chatgpt-web/")), false);
+  assert.equal(
+    projectedGrokModels.every((model) => model.id.startsWith("everyone-in-codex~")),
+    true,
+  );
   assert.equal(
     hostSpawn.options.env.CODEXHOST_DEEPSEEK_HARNESS_ENDPOINT,
     "http://127.0.0.1:49321/",
@@ -541,7 +548,10 @@ test("launch 只把 consumer capability 交给 CodexHost，restore 精确终止 
   assert.match(configTexts.dsh, /baseURL: "http:\/\/127\.0\.0\.1:45681\/v1"/);
   assert.match(configTexts.dsh, /reasoningEfforts:\n\s+low: low\n\s+high: high/);
   assert.doesNotMatch(configTexts.dsh, /^\s+(?:reasoning|input):/m);
-  assert.match(configTexts.grok, /^\[model\."provider\/api-model"\]/m);
+  assert.equal(
+    configTexts.grok.includes(`[model.${JSON.stringify(projectedGrokModels[0].id)}]`),
+    true,
+  );
   assert.match(configTexts.grok, /^model = "provider\/api-model"$/m);
   assert.match(configTexts.grok, /api_backend = "responses"/);
 

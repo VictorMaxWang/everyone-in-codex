@@ -169,12 +169,17 @@ function tomlString(value) {
   return JSON.stringify(String(value));
 }
 
+function grokTransportModelId(upstreamModelId) {
+  return `everyone-in-codex~${Buffer.from(upstreamModelId, "utf8").toString("base64url")}`;
+}
+
 function renderGrok(baseUrl, models) {
   const lines = [];
   for (const model of models) {
+    const transportModelId = grokTransportModelId(model.id);
     lines.push(
       ...(lines.length > 0 ? [""] : []),
-      `[model.${tomlString(model.id)}]`,
+      `[model.${tomlString(transportModelId)}]`,
       `model = ${tomlString(model.id)}`,
       `base_url = ${tomlString(baseUrl)}`,
       `name = ${tomlString(model.displayName)}`,
@@ -319,6 +324,12 @@ export async function publishHarnessConfigs({
       CODEXHOST_OMP_DATA_DIR: directories.omp,
       CODEXHOST_DSH_HOME: directories.dsh,
       CODEXHOST_GROK_HOME: directories.grok,
+      // Grok ACP 1.0.13 的 initialize 元数据会漏掉磁盘自定义模型，Host 用同一份
+      // 无凭据目录补全选择器；真正请求仍由 Grok 按 config.toml 走 Responses。
+      CODEXHOST_GROK_MODELS_JSON: JSON.stringify(normalizedModels.map((model) => ({
+        ...model,
+        id: grokTransportModelId(model.id),
+      }))),
       CODEXHOST_DEEPSEEK_HARNESS_ENDPOINT: `http://127.0.0.1:${dshPort}/`,
     }),
     ownership: Object.freeze({

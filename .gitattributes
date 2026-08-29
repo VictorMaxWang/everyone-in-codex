@@ -1,1 +1,2 @@
 AGENTS.md export-ignore
+*.patch whitespace=-blank-at-eol

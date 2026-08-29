@@ -1,26 +1,31 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Everyone in Codex <noreply@everyone-in-codex.invalid>
-Date: Sun, 30 Aug 2026 03:48:54 +0800
+Date: Sun, 30 Aug 2026 04:43:00 +0800
 Subject: [PATCH] feat: isolate Codex Desktop profiles
 
 ---
  crates/launcher/src/main.rs                   | 124 ++++++++++--
  crates/launcher/src/runtime_instance.rs       |  54 +++++-
  crates/shim/src/lib.rs                        | 177 +++++++++++++++++-
+ .../src/deepseek-harness-adapter.ts           |  69 ++++++-
+ .../test/deepseek-harness-adapter.test.ts     |  42 ++++-
  packages/adapters/grok/src/acp-transport.ts   |  16 +-
  packages/adapters/grok/src/command.ts         |   3 +-
+ packages/adapters/grok/src/grok-adapter.ts    |  20 +-
+ packages/adapters/grok/src/grok-models.ts     |  69 ++++++-
  packages/adapters/grok/src/index.ts           |   1 +
+ .../adapters/grok/test/grok-adapter.test.ts   |  35 ++++
  .../grok/test/grok-environment.test.ts        |  23 +++
- packages/adapters/omp/src/omp-adapter.ts      |   7 +-
+ packages/adapters/omp/src/omp-adapter.ts      |  45 ++++-
  packages/adapters/omp/src/omp-rpc-session.ts  |  10 +-
- .../adapters/omp/test/omp-adapter.test.ts     |  14 ++
+ .../adapters/omp/test/omp-adapter.test.ts     |  50 ++++-
  .../adapters/omp/test/omp-rpc-session.test.ts |  48 +++++
  packages/adapters/pi/src/pi-rpc-session.ts    |   3 +-
  .../adapters/pi/test/pi-rpc-session.test.ts   |  33 ++++
- .../host-runtime/src/adapter-composition.ts   |  87 ++++++++-
- packages/host-runtime/src/index.ts            |   7 +
- .../test/adapter-composition.test.ts          |  56 ++++++
- 16 files changed, 627 insertions(+), 36 deletions(-)
+ .../host-runtime/src/adapter-composition.ts   | 148 ++++++++++++++-
+ packages/host-runtime/src/index.ts            |   8 +
+ .../test/adapter-composition.test.ts          |  66 +++++++
+ 21 files changed, 989 insertions(+), 55 deletions(-)
  create mode 100644 packages/adapters/grok/test/grok-environment.test.ts
 
 diff --git a/crates/launcher/src/main.rs b/crates/launcher/src/main.rs
@@ -661,6 +666,200 @@ index 3c98a1c..b493ac1 100644
      #[test]
      fn starts_host_runtime_for_servers_but_not_app_server_management_commands() {
          assert!(should_start_host_runtime(&arguments(&[
+diff --git a/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts b/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts
+index 1d66da1..d2993ad 100644
+--- a/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts
++++ b/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts
+@@ -95,6 +95,7 @@ import {
+ 
+ export interface DeepSeekHarnessAdapterOptions extends DeepSeekHostConnectionOptions {
+   toolOutputLimit?: number;
++  allowedProviders?: readonly string[];
+ }
+ 
+ export interface DeepSeekHostConnectionLike {
+@@ -1082,6 +1083,7 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+   readonly #connection: DeepSeekHostConnectionLike;
+   readonly #dependencies: DeepSeekHarnessAdapterDependencies;
+   readonly #options: DeepSeekHarnessAdapterOptions;
++  readonly #allowedProviders: ReadonlySet<string> | null;
+   readonly #sessions = new Set<DeepSeekHarnessSession>();
+   readonly #toolOutputLimit: number;
+   #closePromise: Promise<void> | null = null;
+@@ -1091,6 +1093,13 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+     dependencies?: DeepSeekHarnessAdapterDependencies,
+   ) {
+     this.#options = options;
++    const allowedProviders = options.allowedProviders
++      ? new Set(options.allowedProviders.map((provider) => provider.trim()).filter(Boolean))
++      : null;
++    if (options.allowedProviders && allowedProviders?.size === 0) {
++      throw new Error("DeepSeek Harness allowedProviders must not be empty");
++    }
++    this.#allowedProviders = allowedProviders;
+     this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT;
+     this.#dependencies = dependencies ?? {
+       randomUUID,
+@@ -1121,12 +1130,24 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+           "DeepSeek Harness Host has no default Model selection",
+         );
+       }
++      const groups = this.#allowedProviders
++        ? models.groups.filter((group) => this.#allowedProviders?.has(group.id))
++        : models.groups;
++      const firstGroup = groups[0];
++      const firstModel = firstGroup?.models[0];
++      if (!firstGroup || !firstModel) {
++        throw new DeepSeekHarnessTransportError(
++          "protocolError",
++          "DeepSeek Harness has no allowlisted Models",
++        );
++      }
++      const selectedGroup = groups.find((group) => group.id === host.provider);
++      const selection = selectedGroup?.models.some((model) => model.id === host.model)
++        ? { provider: host.provider, model: host.model }
++        : { provider: firstGroup.id, model: firstModel.id };
+       return {
+         status: "ready",
+-        catalog: normalizeDeepSeekModelCatalog(models.groups, {
+-          provider: host.provider,
+-          model: host.model,
+-        }),
++        catalog: normalizeDeepSeekModelCatalog(groups, selection),
+         capabilities: {
+           configuration: {
+             selectModel: true,
+@@ -1175,6 +1196,33 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+         error: unsupported("DeepSeek Harness does not select Thinking or Permission Mode"),
+       };
+     }
++    let requestedCreateModel: ReturnType<typeof decodeDeepSeekHarnessModelRef> | null = null;
++    if (input.kind === "create" && input.model) {
++      try {
++        requestedCreateModel = decodeDeepSeekHarnessModelRef(input.model);
++      } catch (error) {
++        return { ok: false, error: normalizedError(error, "invalidRequest") };
++      }
++      if (this.#allowedProviders && !this.#allowedProviders.has(requestedCreateModel.provider)) {
++        return {
++          ok: false,
++          error: {
++            code: "invalidRequest",
++            message: "DeepSeek Harness Model provider is not allowed by this Fusion lease",
++            retryable: false,
++          },
++        };
++      }
++    } else if (input.kind === "create" && this.#allowedProviders) {
++      return {
++        ok: false,
++        error: {
++          code: "invalidRequest",
++          message: "DeepSeek Harness Fusion Sessions require an explicit Model",
++          retryable: false,
++        },
++      };
++    }
+     try {
+       await this.#connection.connect();
+       const cwd = path.resolve(input.cwd);
+@@ -1217,13 +1265,12 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+               "DeepSeek Harness created an unexpected Session identity",
+             );
+           }
+-          if (input.model) {
+-            const requested = decodeDeepSeekHarnessModelRef(input.model);
++          if (requestedCreateModel) {
+             unwrapRpc(
+               await this.#connection.client.sessions.selectModel({
+                 sessionId: sessionId as SessionId,
+-                provider: requested.provider,
+-                model: requested.model,
++                provider: requestedCreateModel.provider,
++                model: requestedCreateModel.model,
+               }),
+               "session.selectModel",
+             );
+@@ -1234,6 +1281,12 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+           this.#connection.client.sessions.models({ sessionId: sessionId as SessionId }),
+         ]);
+         const models = unwrapRpc(modelState, "session.models");
++        if (this.#allowedProviders && !this.#allowedProviders.has(models.current.provider)) {
++          throw new DeepSeekHarnessTransportError(
++            "protocolError",
++            "DeepSeek Harness Session selected a non-allowlisted Model provider",
++          );
++        }
+         const model = encodeDeepSeekHarnessModelRef(models.current);
+         const projection = projectDeepSeekHistory({
+           harnessId: this.harnessId,
+diff --git a/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts b/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts
+index 819603c..9c17b9e 100644
+--- a/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts
++++ b/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts
+@@ -158,7 +158,7 @@ class FakeConnection implements DeepSeekHostConnectionLike {
+   }
+ }
+ 
+-function fixture(): {
++function fixture(options: ConstructorParameters<typeof DeepSeekHarnessAdapter>[0] = {}): {
+   adapter: DeepSeekHarnessAdapter;
+   connection: FakeConnection;
+ } {
+@@ -167,7 +167,7 @@ function fixture(): {
+     randomUUID: () => "native-1",
+     createConnection: () => connection,
+   };
+-  return { adapter: new DeepSeekHarnessAdapter({}, dependencies), connection };
++  return { adapter: new DeepSeekHarnessAdapter(options, dependencies), connection };
+ }
+ 
+ async function collectUntilTurn(session: Awaited<ReturnType<typeof openCreated>>) {
+@@ -203,6 +203,44 @@ describe("DeepSeekHarnessAdapter local Host", () => {
+     await adapter.close();
+   });
+ 
++  it("publishes and accepts only the Fusion provider allowlist", async () => {
++    const { adapter, connection } = fixture({ allowedProviders: ["everyone-in-codex"] });
++    vi.mocked(connection.client.llm.models).mockResolvedValue(
++      success({
++        groups: [
++          ...MODEL_GROUPS,
++          {
++            id: "everyone-in-codex",
++            name: "Everyone in Codex",
++            models: [
++              { id: "zai-api-cn/glm-5.3-flash", name: "GLM-5.3-Flash" },
++              { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash" },
++            ],
++          },
++        ],
++        failures: [],
++      }),
++    );
++
++    await expect(adapter.inspect()).resolves.toMatchObject({
++      status: "ready",
++      catalog: {
++        models: [
++          expect.objectContaining({ label: "Everyone in Codex / GLM-5.3-Flash" }),
++          expect.objectContaining({ label: "Everyone in Codex / DeepSeek V4 Flash" }),
++        ],
++      },
++    });
++    await expect(
++      adapter.open({
++        kind: "create",
++        cwd: "/workspace",
++        model: encodeDeepSeekHarnessModelRef(CURRENT_MODEL),
++      }),
++    ).resolves.toMatchObject({ ok: false, error: { code: "invalidRequest" } });
++    await adapter.close();
++  });
++
+   it("creates an official Session, selects the requested Model, and projects a live Tool Turn", async () => {
+     const { adapter, connection } = fixture();
+     const model = encodeDeepSeekHarnessModelRef({
 diff --git a/packages/adapters/grok/src/acp-transport.ts b/packages/adapters/grok/src/acp-transport.ts
 index 6c896c6..479e062 100644
 --- a/packages/adapters/grok/src/acp-transport.ts
@@ -718,6 +917,180 @@ index 8f573a9..48b2696 100644
 -  return commandInvocation(command, ["agent", "--no-leader", "stdio"], process.env, platform);
 +  return commandInvocation(command, ["agent", "--no-leader", "stdio"], environment, platform);
  }
+diff --git a/packages/adapters/grok/src/grok-adapter.ts b/packages/adapters/grok/src/grok-adapter.ts
+index 6d41bb5..56df42d 100644
+--- a/packages/adapters/grok/src/grok-adapter.ts
++++ b/packages/adapters/grok/src/grok-adapter.ts
+@@ -95,9 +95,11 @@ import {
+   type GrokProjectedToolItem,
+ } from "./grok-tool-output.js";
+ import {
++  configuredGrokModelState,
+   modelStateFromInitialize,
+   modelStateFromSessionResponse,
+   stateForGrokModel,
++  type GrokConfiguredModel,
+   type GrokModelState,
+ } from "./grok-models.js";
+ import { fetchGrokCredits, type GrokCreditsSnapshot } from "./grok-credits.js";
+@@ -113,6 +115,7 @@ import {
+ export interface GrokAdapterOptions {
+   command?: string;
+   environment?: NodeJS.ProcessEnv;
++  configuredModels?: readonly GrokConfiguredModel[];
+   commandTimeoutMs?: number;
+   closeTimeoutMs?: number;
+   toolOutputLimit?: number;
+@@ -1213,6 +1216,7 @@ export class GrokAdapter implements HarnessAdapter {
+   readonly #inspectionCache = new Map<string, Extract<HarnessInspection, { status: "ready" }>>();
+   readonly #sessions = new Set<GrokHarnessSession>();
+   readonly #toolOutputLimit: number;
++  readonly #configuredModels: readonly GrokConfiguredModel[] | null;
+   #closePromise: Promise<void> | null = null;
+   #credits: GrokCreditsSnapshot | null = null;
+   #creditsRefresh: Promise<GrokCreditsSnapshot | null> | null = null;
+@@ -1220,6 +1224,8 @@ export class GrokAdapter implements HarnessAdapter {
+   constructor(options: GrokAdapterOptions = {}, dependencies?: GrokAdapterDependencies) {
+     this.#closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
+     this.#environment = options.environment;
++    this.#configuredModels = options.configuredModels ? [...options.configuredModels] : null;
++    if (this.#configuredModels) configuredGrokModelState(this.#configuredModels);
+     this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_GROK_TOOL_OUTPUT_LIMIT;
+     this.#dependencies = dependencies ?? {
+       randomUUID,
+@@ -1242,6 +1248,10 @@ export class GrokAdapter implements HarnessAdapter {
+     return this.#credits;
+   }
+ 
++  #projectModelState(native: GrokModelState): GrokModelState {
++    return this.#configuredModels ? configuredGrokModelState(this.#configuredModels) : native;
++  }
++
+   refreshCredits(): Promise<GrokCreditsSnapshot | null> {
+     if (this.#closePromise) return Promise.resolve(this.#credits);
+     if (this.#creditsRefresh) return this.#creditsRefresh;
+@@ -1283,9 +1293,10 @@ export class GrokAdapter implements HarnessAdapter {
+       stage = "startup";
+       const initialize = await transport.inspect();
+       stage = "model-catalog";
+-      const modelState = modelStateFromInitialize(initialize);
+-      if (!modelState)
++      const nativeModelState = modelStateFromInitialize(initialize);
++      if (!nativeModelState)
+         throw new GrokTransportError("protocolError", "Grok returned an invalid Model catalog");
++      const modelState = this.#projectModelState(nativeModelState);
+       await transport.close();
+       const ready: Extract<HarnessInspection, { status: "ready" }> = {
+         status: "ready",
+@@ -1452,11 +1463,12 @@ export class GrokAdapter implements HarnessAdapter {
+           },
+         };
+       }
+-      const modelState =
++      const nativeModelState =
+         modelStateFromSessionResponse(opened.session) ??
+         modelStateFromInitialize(opened.initialize);
+-      if (!modelState)
++      if (!nativeModelState)
+         throw new GrokTransportError("protocolError", "Grok returned an invalid Model catalog");
++      const modelState = this.#projectModelState(nativeModelState);
+       const retainedConfiguration = sourceConfiguration;
+       if ((input.kind === "rollbackLastTurn" || input.kind === "fork") && retainedConfiguration) {
+         const operation = input.kind === "rollbackLastTurn" ? "Rewind" : "Fork";
+diff --git a/packages/adapters/grok/src/grok-models.ts b/packages/adapters/grok/src/grok-models.ts
+index 3ec7ce2..bf113ba 100644
+--- a/packages/adapters/grok/src/grok-models.ts
++++ b/packages/adapters/grok/src/grok-models.ts
+@@ -7,7 +7,11 @@ import type {
+   HarnessThinkingOption,
+   HarnessThinkingOptionId,
+ } from "@codexhost/harness-adapter";
+-import { harnessModelRefSchema, harnessThinkingOptionIdSchema } from "@codexhost/shared-contracts";
++import {
++  harnessModelCatalogSchema,
++  harnessModelRefSchema,
++  harnessThinkingOptionIdSchema,
++} from "@codexhost/shared-contracts";
+ 
+ export interface GrokModelState {
+   catalog: HarnessModelCatalog;
+@@ -16,6 +20,23 @@ export interface GrokModelState {
+   contextWindowTokensByModel: ReadonlyMap<string, number>;
+ }
+ 
++export interface GrokConfiguredModel {
++  id: string;
++  name: string;
++  contextWindow?: number;
++  reasoningLevels?: readonly string[];
++}
++
++const configuredThinkingLabels: Readonly<Record<string, string>> = {
++  off: "Off",
++  minimal: "Minimal",
++  low: "Low",
++  medium: "Medium",
++  high: "High",
++  xhigh: "Extra High",
++  max: "Max",
++};
++
+ function isRecord(value: unknown): value is Record<string, unknown> {
+   return typeof value === "object" && value !== null && !Array.isArray(value);
+ }
+@@ -102,6 +123,52 @@ export function modelStateFromSessionResponse(response: unknown): GrokModelState
+   return parseGrokModelState(isRecord(response) ? response.models : undefined);
+ }
+ 
++/**
++ * Grok 1.0.13 能请求 config.toml 中的自定义 Responses 模型，但 ACP initialize
++ * 仍只上报原生 Grok 条目。Fusion 用无凭据目录替换这份选择器元数据；请求本身
++ * 继续交给 Grok 的 set_model 与 Responses transport。
++ */
++export function configuredGrokModelState(models: readonly GrokConfiguredModel[]): GrokModelState {
++  if (models.length === 0) throw new Error("Configured Grok Model catalog must not be empty");
++  const seen = new Set<string>();
++  const thinkingById = new Map<string, HarnessThinkingOption>();
++  const contextWindowTokensByModel = new Map<string, number>();
++  const catalogModels: HarnessModelCatalog["models"] = models.map((model) => {
++    const ref = harnessModelRefSchema.parse({ id: model.id });
++    if (seen.has(ref.id) || !model.name.trim()) {
++      throw new Error("Configured Grok Model catalog contains an invalid or duplicate Model");
++    }
++    seen.add(ref.id);
++    if (model.contextWindow !== undefined) {
++      if (!Number.isSafeInteger(model.contextWindow) || model.contextWindow < 1) {
++        throw new Error("Configured Grok Model context window is invalid");
++      }
++      contextWindowTokensByModel.set(ref.id, model.contextWindow);
++    }
++    const supportedThinkingOptionIds = (model.reasoningLevels ?? []).map((level) => {
++      const id = harnessThinkingOptionIdSchema.parse(level);
++      thinkingById.set(id, { id, label: configuredThinkingLabels[id] ?? id });
++      return id;
++    });
++    return {
++      ref,
++      label: model.name,
++      ...(supportedThinkingOptionIds.length > 0 ? { supportedThinkingOptionIds } : {}),
++    };
++  });
++  const defaultModel = catalogModels[0]?.ref;
++  if (!defaultModel) throw new Error("Configured Grok Model catalog has no default Model");
++  return {
++    currentModel: defaultModel,
++    contextWindowTokensByModel,
++    catalog: harnessModelCatalogSchema.parse({
++      models: catalogModels,
++      defaultModel,
++      thinkingOptions: [...thinkingById.values()],
++    }),
++  };
++}
++
+ export function stateForGrokModel(
+   modelState: GrokModelState,
+   nativeState: Pick<HarnessSessionState, "nativeRef">,
 diff --git a/packages/adapters/grok/src/index.ts b/packages/adapters/grok/src/index.ts
 index 9395f68..655667b 100644
 --- a/packages/adapters/grok/src/index.ts
@@ -730,6 +1103,52 @@ index 9395f68..655667b 100644
    locateGrokNativeSession,
    readGrokNativeHistory,
  } from "./acp-transport.js";
+diff --git a/packages/adapters/grok/test/grok-adapter.test.ts b/packages/adapters/grok/test/grok-adapter.test.ts
+index b7bf34c..ab9e5d3 100644
+--- a/packages/adapters/grok/test/grok-adapter.test.ts
++++ b/packages/adapters/grok/test/grok-adapter.test.ts
+@@ -314,6 +314,41 @@ describe("Grok Adapter ACP projection", () => {
+     await adapter.close();
+   });
+ 
++  it("replaces incomplete ACP metadata with the Fusion configured Model catalog", async () => {
++    const transport = new FakeGrokTransport();
++    const adapter = new GrokAdapter(
++      {
++        configuredModels: [
++          {
++            id: "everyone-in-codex~glm-5.3-flash",
++            name: "GLM-5.3-Flash",
++            contextWindow: 1_000_000,
++            reasoningLevels: ["low", "high", "max"],
++          },
++        ],
++      },
++      {
++        randomUUID: () => "grok-id",
++        createTransport: () => transport,
++        fetchCredits: async () => null,
++      },
++    );
++
++    await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
++      status: "ready",
++      catalog: {
++        models: [
++          {
++            ref: { id: "everyone-in-codex~glm-5.3-flash" },
++            supportedThinkingOptionIds: ["low", "high", "max"],
++          },
++        ],
++        defaultModel: { id: "everyone-in-codex~glm-5.3-flash" },
++      },
++    });
++    await adapter.close();
++  });
++
+   it("seeds and changes the native Grok Permission Mode", async () => {
+     const transport = new FakeGrokTransport();
+     const adapter = new GrokAdapter(
 diff --git a/packages/adapters/grok/test/grok-environment.test.ts b/packages/adapters/grok/test/grok-environment.test.ts
 new file mode 100644
 index 0000000..b5e3a93
@@ -760,18 +1179,27 @@ index 0000000..b5e3a93
 +  });
 +});
 diff --git a/packages/adapters/omp/src/omp-adapter.ts b/packages/adapters/omp/src/omp-adapter.ts
-index 2a30e97..20e806d 100644
+index 2a30e97..5221117 100644
 --- a/packages/adapters/omp/src/omp-adapter.ts
 +++ b/packages/adapters/omp/src/omp-adapter.ts
-@@ -93,6 +93,7 @@ import { OmpSubagentLifecycle } from "./omp-subagent-lifecycle.js";
+@@ -93,6 +93,8 @@ import { OmpSubagentLifecycle } from "./omp-subagent-lifecycle.js";
  export interface OmpAdapterOptions {
    command?: string;
    environment?: NodeJS.ProcessEnv;
 +  readOnly?: boolean;
++  allowedProviders?: readonly string[];
    commandTimeoutMs?: number;
    compactionTimeoutMs?: number;
    cancelTimeoutMs?: number;
-@@ -1677,7 +1678,11 @@ export class OmpAdapter implements HarnessAdapter {
+@@ -1668,6 +1670,7 @@ export class OmpAdapter implements HarnessAdapter {
+   readonly #inspections = new Set<OmpTurnTransport>();
+   readonly #sessions = new Set<OmpHarnessSession>();
+   readonly #toolOutputLimit: number;
++  readonly #allowedProviders: ReadonlySet<string> | null;
+   #closePromise: Promise<void> | null = null;
+   #thinkingSelectionSupported: boolean | null = null;
+ 
+@@ -1677,7 +1680,18 @@ export class OmpAdapter implements HarnessAdapter {
        createTransport: (sessionOptions) => new OmpRpcSession({ ...options, ...sessionOptions }),
      },
    ) {
@@ -781,9 +1209,66 @@ index 2a30e97..20e806d 100644
 +        ...sessionOptions,
 +        ...(options.readOnly !== undefined ? { readOnly: options.readOnly } : {}),
 +      });
++    const allowedProviders = options.allowedProviders
++      ? new Set(options.allowedProviders.map((provider) => provider.trim()).filter(Boolean))
++      : null;
++    if (options.allowedProviders && allowedProviders?.size === 0) {
++      throw new Error("Omp allowedProviders must not be empty");
++    }
++    this.#allowedProviders = allowedProviders;
      this.#closeTimeoutMs = options.closeTimeoutMs ?? 2_000;
      this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT;
    }
+@@ -1723,12 +1737,23 @@ export class OmpAdapter implements HarnessAdapter {
+       await transport.start();
+       stage = "model-catalog";
+       const models = await transport.getAvailableModels();
++      const allowedModels = this.#allowedProviders
++        ? models.filter((model) => this.#allowedProviders?.has(model.provider))
++        : models;
++      const firstAllowedModel = allowedModels[0];
++      if (!firstAllowedModel) throw new Error("Omp has no allowlisted Models");
+       stage = "capabilities";
+       const thinkingLevels = await transport.getAvailableThinkingLevels();
+       this.#thinkingSelectionSupported = thinkingLevels !== null;
++      const reportedModel = nativeModelFromState(transport.state);
++      const effectiveModel =
++        reportedModel &&
++        (!this.#allowedProviders || this.#allowedProviders.has(reportedModel.provider))
++          ? reportedModel
++          : { provider: firstAllowedModel.provider, id: firstAllowedModel.id };
+       const catalog = normalizeOmpModelCatalog(
+-        models,
+-        nativeModelFromState(transport.state),
++        allowedModels,
++        effectiveModel,
+         thinkingLevels,
+         transport.state.thinkingLevel,
+       );
+@@ -1792,10 +1817,22 @@ export class OmpAdapter implements HarnessAdapter {
+       }
+       if (input.model) {
+         try {
+-          decodeOmpModelRef(input.model);
++          const decoded = decodeOmpModelRef(input.model);
++          if (this.#allowedProviders && !this.#allowedProviders.has(decoded.provider)) {
++            throw new Error("Omp Model provider is not allowed by this Fusion lease");
++          }
+         } catch (error) {
+           return { ok: false, error: normalizedError(error, "invalidRequest") };
+         }
++      } else if (this.#allowedProviders) {
++        return {
++          ok: false,
++          error: {
++            code: "invalidRequest",
++            message: "Omp Fusion Sessions require an explicit Model",
++            retryable: false,
++          },
++        };
+       }
+       const thinkingOptionId = input.thinkingOptionId
+         ? harnessThinkingOptionIdSchema.safeParse(input.thinkingOptionId)
 diff --git a/packages/adapters/omp/src/omp-rpc-session.ts b/packages/adapters/omp/src/omp-rpc-session.ts
 index ddcba8f..45ca612 100644
 --- a/packages/adapters/omp/src/omp-rpc-session.ts
@@ -830,10 +1315,60 @@ index ddcba8f..45ca612 100644
        ...(this.#options.forkSessionFile ? { forkSessionFile: this.#options.forkSessionFile } : {}),
        ...(this.#options.model ? { model: this.#options.model } : {}),
 diff --git a/packages/adapters/omp/test/omp-adapter.test.ts b/packages/adapters/omp/test/omp-adapter.test.ts
-index f75baac..a0b315f 100644
+index f75baac..ea77d69 100644
 --- a/packages/adapters/omp/test/omp-adapter.test.ts
 +++ b/packages/adapters/omp/test/omp-adapter.test.ts
-@@ -291,6 +291,20 @@ function outputs(session: { outputs: AsyncIterable<HarnessOutput> }): HarnessOut
+@@ -23,7 +23,7 @@ import type {
+   OmpTurnEvent,
+   OmpTurnResult,
+ } from "../src/omp-rpc-session.js";
+-import type { OmpNativeModel } from "../src/omp-model-catalog.js";
++import { encodeOmpModelRef, type OmpNativeModel } from "../src/omp-model-catalog.js";
+ 
+ class FakeOmpTransport implements OmpTurnTransport {
+   state: OmpSessionState = {
+@@ -170,6 +170,40 @@ class FakeOmpTransport implements OmpTurnTransport {
+   async close(): Promise<void> {}
+ }
+ 
++describe("OMP Fusion provider allowlist", () => {
++  it("publishes only allowlisted Models and rejects a hidden provider", async () => {
++    const transport = new FakeOmpTransport();
++    transport.state = { ...transport.state, provider: "ollama", modelId: "local-model" };
++    transport.getAvailableModels = async () => [
++      { provider: "ollama", id: "local-model", reasoning: false },
++      { provider: "everyone-in-codex", id: "zai-api-cn/glm-5.3-flash", reasoning: true },
++      { provider: "everyone-in-codex", id: "deepseek/deepseek-v4-flash", reasoning: true },
++    ];
++    const adapter = new OmpAdapter(
++      { allowedProviders: ["everyone-in-codex"] },
++      { createTransport: () => transport },
++    );
++
++    await expect(adapter.inspect({ cwd: "/synthetic", refresh: true })).resolves.toMatchObject({
++      status: "ready",
++      catalog: {
++        models: [
++          expect.objectContaining({ label: "everyone-in-codex / deepseek/deepseek-v4-flash" }),
++          expect.objectContaining({ label: "everyone-in-codex / zai-api-cn/glm-5.3-flash" }),
++        ],
++      },
++    });
++    await expect(
++      adapter.open({
++        kind: "create",
++        cwd: "/synthetic",
++        model: encodeOmpModelRef({ provider: "ollama", id: "local-model" }),
++      }),
++    ).resolves.toMatchObject({ ok: false, error: { code: "invalidRequest" } });
++    await adapter.close();
++  });
++});
++
+ function historyTurn(input: {
+   assistantId: string;
+   parentId: string | null;
+@@ -291,6 +325,20 @@ function outputs(session: { outputs: AsyncIterable<HarnessOutput> }): HarnessOut
  }
  
  describe("OMP Adapter Subagents", () => {
@@ -979,10 +1514,10 @@ index 4575cc8..dda1047 100644
      const rpc = session("missing-session-id");
  
 diff --git a/packages/host-runtime/src/adapter-composition.ts b/packages/host-runtime/src/adapter-composition.ts
-index 69558ca..8a291bb 100644
+index 69558ca..186bbf5 100644
 --- a/packages/host-runtime/src/adapter-composition.ts
 +++ b/packages/host-runtime/src/adapter-composition.ts
-@@ -12,9 +12,80 @@ export const DEEPSEEK_HARNESS_ENDPOINT_ENV = "CODEXHOST_DEEPSEEK_HARNESS_ENDPOIN
+@@ -12,9 +12,135 @@ export const DEEPSEEK_HARNESS_ENDPOINT_ENV = "CODEXHOST_DEEPSEEK_HARNESS_ENDPOIN
  export const PI_COMMAND_ENV = "CODEXHOST_PI_COMMAND";
  export const GROK_COMMAND_ENV = "CODEXHOST_GROK_COMMAND";
  export const OMP_COMMAND_ENV = "CODEXHOST_OMP_COMMAND";
@@ -990,6 +1525,7 @@ index 69558ca..8a291bb 100644
 +export const CODEXHOST_OMP_DATA_DIR_ENV = "CODEXHOST_OMP_DATA_DIR";
 +export const CODEXHOST_DSH_HOME_ENV = "CODEXHOST_DSH_HOME";
 +export const CODEXHOST_GROK_HOME_ENV = "CODEXHOST_GROK_HOME";
++export const CODEXHOST_GROK_MODELS_JSON_ENV = "CODEXHOST_GROK_MODELS_JSON";
 +export const EVERYONE_CODEX_LEASE_CAPABILITY_ENV = "EVERYONE_CODEX_LEASE_CAPABILITY";
 +export const EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV =
 +  "EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY";
@@ -1013,6 +1549,59 @@ index 69558ca..8a291bb 100644
 +  }
 +}
 +
++function configuredGrokModels(
++  value: string | undefined,
++):
++  | Array<{ id: string; name: string; contextWindow?: number; reasoningLevels?: string[] }>
++  | undefined {
++  if (value === undefined) return undefined;
++  if (value.length === 0 || value.length > 64 * 1024) {
++    throw new Error("CODEXHOST_GROK_MODELS_JSON has an invalid size");
++  }
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(value);
++  } catch {
++    throw new Error("CODEXHOST_GROK_MODELS_JSON is invalid JSON");
++  }
++  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 50) {
++    throw new Error("CODEXHOST_GROK_MODELS_JSON must contain a bounded Model array");
++  }
++  const seen = new Set<string>();
++  return parsed.map((entry) => {
++    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
++      throw new Error("CODEXHOST_GROK_MODELS_JSON contains an invalid Model");
++    }
++    const model = entry as Record<string, unknown>;
++    const id = typeof model.id === "string" ? model.id.trim() : "";
++    const name = typeof model.displayName === "string" ? model.displayName.trim() : "";
++    if (!id || id.length > 256 || !name || name.length > 256 || seen.has(id)) {
++      throw new Error("CODEXHOST_GROK_MODELS_JSON contains an invalid or duplicate Model");
++    }
++    seen.add(id);
++    const contextWindow = model.contextWindow;
++    if (
++      contextWindow !== undefined &&
++      (!Number.isSafeInteger(contextWindow) || (contextWindow as number) < 1)
++    ) {
++      throw new Error("CODEXHOST_GROK_MODELS_JSON contains an invalid context window");
++    }
++    const reasoningLevels = model.reasoningLevels;
++    if (
++      !Array.isArray(reasoningLevels) ||
++      reasoningLevels.some((level) => typeof level !== "string" || !level)
++    ) {
++      throw new Error("CODEXHOST_GROK_MODELS_JSON contains invalid reasoning levels");
++    }
++    return {
++      id,
++      name,
++      ...(contextWindow === undefined ? {} : { contextWindow: contextWindow as number }),
++      reasoningLevels: [...new Set(reasoningLevels as string[])],
++    };
++  });
++}
++
 +/**
 + * 为单个 Harness 创建独立环境。Codex 专用 lease 永不下沉；外部 lease 也不会进入
 + * Claude Code，避免其原生 OAuth 会话意外获得 Fusion Gateway 权限。
@@ -1028,6 +1617,7 @@ index 69558ca..8a291bb 100644
 +
 +  deleteEnvironmentValue(environment, EVERYONE_CODEX_LEASE_CAPABILITY_ENV);
 +  for (const name of harnessDataDirectoryEnvironment) deleteEnvironmentValue(environment, name);
++  deleteEnvironmentValue(environment, CODEXHOST_GROK_MODELS_JSON_ENV);
 +
 +  if (harnessId === "claude-code") {
 +    deleteEnvironmentValue(environment, EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV);
@@ -1063,7 +1653,7 @@ index 69558ca..8a291bb 100644
  export async function prefetchClaudeCodeModelCatalog(
    adapters: ReadonlyMap<ExternalHarnessId, InspectableHarnessAdapter>,
  ): Promise<void> {
-@@ -28,12 +99,17 @@ export async function prefetchClaudeCodeModelCatalog(
+@@ -28,12 +154,20 @@ export async function prefetchClaudeCodeModelCatalog(
  export function createExternalHarnessAdapters(
    environment: NodeJS.ProcessEnv,
  ): ReadonlyMap<ExternalHarnessId, HarnessAdapter> {
@@ -1072,6 +1662,9 @@ index 69558ca..8a291bb 100644
 +  const deepSeekEnvironment = externalHarnessEnvironment(environment, "deepseek-harness");
 +  const grokEnvironment = externalHarnessEnvironment(environment, "grok");
 +  const ompEnvironment = externalHarnessEnvironment(environment, "omp");
++  const grokModels = configuredGrokModels(
++    environmentValue(environment, CODEXHOST_GROK_MODELS_JSON_ENV),
++  );
    return new Map<ExternalHarnessId, HarnessAdapter>([
      [
        "pi",
@@ -1082,7 +1675,7 @@ index 69558ca..8a291bb 100644
        }),
      ],
      [
-@@ -42,7 +118,7 @@ export function createExternalHarnessAdapters(
+@@ -42,7 +176,7 @@ export function createExternalHarnessAdapters(
          ...(environment[CLAUDE_CODE_COMMAND_ENV]
            ? { command: environment[CLAUDE_CODE_COMMAND_ENV] }
            : {}),
@@ -1091,11 +1684,12 @@ index 69558ca..8a291bb 100644
        }),
      ],
      [
-@@ -54,21 +130,22 @@ export function createExternalHarnessAdapters(
+@@ -54,21 +188,25 @@ export function createExternalHarnessAdapters(
          ...(environment[DEEPSEEK_HARNESS_ENDPOINT_ENV]
            ? { endpoint: environment[DEEPSEEK_HARNESS_ENDPOINT_ENV] }
            : {}),
 -        environment,
++        allowedProviders: ["everyone-in-codex"],
 +        environment: deepSeekEnvironment,
        }),
      ],
@@ -1104,6 +1698,7 @@ index 69558ca..8a291bb 100644
        new GrokAdapter({
          ...(environment[GROK_COMMAND_ENV] ? { command: environment[GROK_COMMAND_ENV] } : {}),
 -        environment,
++        ...(grokModels ? { configuredModels: grokModels } : {}),
 +        environment: grokEnvironment,
        }),
      ],
@@ -1114,19 +1709,21 @@ index 69558ca..8a291bb 100644
 -        environment,
 +        environment: ompEnvironment,
 +        readOnly: true,
++        allowedProviders: ["everyone-in-codex"],
        }),
      ],
    ]);
 diff --git a/packages/host-runtime/src/index.ts b/packages/host-runtime/src/index.ts
-index da208c8..1a12add 100644
+index da208c8..e48ac0f 100644
 --- a/packages/host-runtime/src/index.ts
 +++ b/packages/host-runtime/src/index.ts
-@@ -12,12 +12,19 @@ import { packageMetadata as updateManager } from "@codexhost/update-manager";
+@@ -12,12 +12,20 @@ import { packageMetadata as updateManager } from "@codexhost/update-manager";
  
  export {
    CLAUDE_CODE_COMMAND_ENV,
 +  CODEXHOST_DSH_HOME_ENV,
 +  CODEXHOST_GROK_HOME_ENV,
++  CODEXHOST_GROK_MODELS_JSON_ENV,
 +  CODEXHOST_OMP_DATA_DIR_ENV,
 +  CODEXHOST_PI_DATA_DIR_ENV,
    DEEPSEEK_HARNESS_COMMAND_ENV,
@@ -1142,15 +1739,16 @@ index da208c8..1a12add 100644
  } from "./adapter-composition.js";
  export { AppServerHost, classifyCreateRequestRoute } from "./app-server-host.js";
 diff --git a/packages/host-runtime/test/adapter-composition.test.ts b/packages/host-runtime/test/adapter-composition.test.ts
-index d93032c..25ca10f 100644
+index d93032c..cc8a34e 100644
 --- a/packages/host-runtime/test/adapter-composition.test.ts
 +++ b/packages/host-runtime/test/adapter-composition.test.ts
-@@ -3,8 +3,15 @@ import { describe, expect, it, vi } from "vitest";
+@@ -3,8 +3,16 @@ import { describe, expect, it, vi } from "vitest";
  import type { HarnessInspection } from "@codexhost/harness-adapter";
  import {
    CLAUDE_CODE_COMMAND_ENV,
 +  CODEXHOST_DSH_HOME_ENV,
 +  CODEXHOST_GROK_HOME_ENV,
++  CODEXHOST_GROK_MODELS_JSON_ENV,
 +  CODEXHOST_OMP_DATA_DIR_ENV,
 +  CODEXHOST_PI_DATA_DIR_ENV,
 +  EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV,
@@ -1161,7 +1759,7 @@ index d93032c..25ca10f 100644
    prefetchClaudeCodeModelCatalog,
  } from "../src/index.js";
  
-@@ -46,6 +53,55 @@ describe("Host external Harness composition", () => {
+@@ -46,6 +54,64 @@ describe("Host external Harness composition", () => {
      await Promise.all([...adapters.values()].map((adapter) => adapter.close()));
    });
  
@@ -1174,6 +1772,14 @@ index d93032c..25ca10f 100644
 +      [CODEXHOST_OMP_DATA_DIR_ENV]: "/fusion/omp",
 +      [CODEXHOST_DSH_HOME_ENV]: "/fusion/dsh",
 +      [CODEXHOST_GROK_HOME_ENV]: "/fusion/grok",
++      [CODEXHOST_GROK_MODELS_JSON_ENV]: JSON.stringify([
++        {
++          id: "everyone-in-codex~glm-5.3-flash",
++          displayName: "GLM-5.3-Flash",
++          contextWindow: 1_000_000,
++          reasoningLevels: ["low", "high", "max"],
++        },
++      ]),
 +    };
 +
 +    const pi = externalHarnessEnvironment(source, "pi");
@@ -1211,6 +1817,7 @@ index d93032c..25ca10f 100644
 +      expect(environment).not.toHaveProperty(CODEXHOST_OMP_DATA_DIR_ENV);
 +      expect(environment).not.toHaveProperty(CODEXHOST_DSH_HOME_ENV);
 +      expect(environment).not.toHaveProperty(CODEXHOST_GROK_HOME_ENV);
++      expect(environment).not.toHaveProperty(CODEXHOST_GROK_MODELS_JSON_ENV);
 +    }
 +  });
 +
