@@ -2,14 +2,14 @@
   "schemaVersion": 1,
   "profile": {
     "name": "secondary",
-    "codexHome": "C:\\path\\to\\isolated-codex-home",
-    "sqliteHome": "C:\\path\\to\\isolated-codex-home",
-    "desktopRoot": "C:\\path\\to\\managed-codex-desktop-version",
-    "desktopUserData": "C:\\path\\to\\isolated-electron-user-data"
+    "codexHome": "<absolute-path-to-isolated-codex-home>",
+    "sqliteHome": "<absolute-path-to-isolated-codex-home>",
+    "desktopRoot": "<absolute-path-to-managed-codex-desktop-version>",
+    "desktopUserData": "<absolute-path-to-isolated-electron-user-data>"
   },
   "router": {
-    "sourceRoot": "C:\\path\\to\\codex-router",
-    "stateDir": "C:\\path\\to\\codex-router-state",
+    "sourceRoot": "<absolute-path-to-codex-router>",
+    "stateDir": "<absolute-path-to-codex-router-state>",
     "healthUrl": "http://127.0.0.1:4202/health"
   },
   "webgpt": {
