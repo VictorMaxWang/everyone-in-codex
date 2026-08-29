@@ -1,0 +1,1680 @@
+From 326f36abc5bebd8014601411a5d4b26cf18d96c6 Mon Sep 17 00:00:00 2001
+From: wangwang <1280424159@qq.com>
+Date: Sat, 29 Aug 2026 18:40:24 +0800
+Subject: [PATCH 02/11] feat: preserve external Router ownership
+
+
+diff --git a/launcher/electron/main.cjs b/launcher/electron/main.cjs
+index 4927a4c..9905cef 100644
+--- a/launcher/electron/main.cjs
++++ b/launcher/electron/main.cjs
+@@ -45,6 +45,8 @@ const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
+ const SOURCE_ROOT = path.resolve(__dirname, "../..");
+ const LAUNCHER_PROFILE = resolveLauncherProfile({ appData: app.getPath("appData") });
+ const IS_DEV_PROFILE = LAUNCHER_PROFILE.kind === DEVELOPMENT_PROFILE;
++// 该生产发行物固定作为 Codex Router 的本机上游，不能被托管 route 或自动更新覆盖。
++const EXTERNAL_ROUTER_BUILD = true;
+ const CORE_HOME = LAUNCHER_PROFILE.coreHome;
+ const BROWSER_DESCRIPTOR_PATH = path.join(CORE_HOME, "runtime", "launcher-browser.json");
+ const BROWSER_HELPER_PATH = app.isPackaged
+@@ -524,11 +526,11 @@ function registerIpc({ logger, stateStore }) {
+       cancelId: 0,
+       title: chinese ? "移除 Codex Web GPT" : "Remove Codex Web GPT",
+       message: chinese
+-        ? "从 Codex 中移除 ChatGPT Web 模型并恢复此前的模型路由？"
+-        : "Remove the ChatGPT Web models from Codex and restore the previous model route?",
++        ? "移除本机 ChatGPT Web Full harness？"
++        : "Remove the local ChatGPT Web Full harness?",
+       detail: chinese
+-        ? "启动器中的 ChatGPT 登录 profile 会保留。Codex 需要重启一次。"
+-        : "The launcher's ChatGPT login profile will be preserved. Codex must be restarted once.",
++        ? "启动器中的 ChatGPT 登录 profile 会保留，Codex Router 的路由配置不会改变。"
++        : "The launcher ChatGPT profile is preserved and Codex Router routing is not changed.",
+       noLink: true,
+     });
+     if (confirmation.response !== 1) return { cancelled: true };
+@@ -543,7 +545,7 @@ function registerIpc({ logger, stateStore }) {
+       mcpSetupComplete: false,
+       mcpRuntimeInstalled: false,
+       mcpGuideStep: 0,
+-      codexRestartRequired: true,
++      codexRestartRequired: false,
+     });
+     send("launcher:state-changed", state);
+     stopCatalogVerificationMonitor();
+@@ -587,7 +589,8 @@ function registerIpc({ logger, stateStore }) {
+         message: error instanceof Error ? error.message : String(error),
+       });
+     });
+-    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
++    // external setup 仅提示刷新 Router catalog 与完整重启 Codex，不探测托管 route。
++    if (!IS_DEV_PROFILE && !EXTERNAL_ROUTER_BUILD) startCatalogVerificationMonitor({ logger, stateStore });
+     return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
+   });
+   handle("launcher:setup-mcp", async (_event, input) => {
+@@ -630,7 +633,7 @@ function registerIpc({ logger, stateStore }) {
+       codexRestartRequired: IS_DEV_PROFILE ? false : true,
+     });
+     send("launcher:state-changed", state);
+-    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
++    if (!IS_DEV_PROFILE && !EXTERNAL_ROUTER_BUILD) startCatalogVerificationMonitor({ logger, stateStore });
+     return state;
+   });
+   handle("launcher:set-preference", (_event, key, value) => {
+@@ -825,7 +828,7 @@ async function start() {
+     currentVersion: app.getVersion(),
+     platform: process.platform,
+     arch: process.arch,
+-    packaged: app.isPackaged && !IS_DEV_PROFILE,
++    packaged: app.isPackaged && !IS_DEV_PROFILE && !EXTERNAL_ROUTER_BUILD,
+     executablePath: process.execPath,
+     runtimeExecutable: updaterRuntimeRoot
+       ? runtimeBundlePaths(updaterRuntimeRoot, process.platform).executable
+@@ -847,7 +850,7 @@ async function start() {
+     });
+   }
+   await loadRenderer(mainWindow);
+-  if (!launcherSmokeTest) void updateController.checkOnce();
++  if (!launcherSmokeTest && !EXTERNAL_ROUTER_BUILD) void updateController.checkOnce();
+   if (launcherSmokeTest) {
+     const smokeRuntimeRoot = runtimeRootProvider();
+     if (app.isPackaged && !smokeRuntimeRoot) {
+@@ -955,9 +958,7 @@ async function start() {
+       }
+     }
+     const runtime = await runtimeSupervisor.startIfConfigured();
+-    if (runtime.status !== "ready") return runtime;
+-    const route = await runtimeHost.connectBridgeRoute();
+-    return { ...runtime, bridgeRouteChanged: route.changed === true };
++    return runtime;
+   })().then(async (runtime) => {
+     if (runtime.status === "ready") {
+       const config = runtimeSupervisor.readConfig();
+@@ -979,7 +980,7 @@ async function start() {
+         const state = stateStore.update(patch);
+         send("launcher:state-changed", state);
+       }
+-      startCatalogVerificationMonitor({ logger, stateStore });
++      if (!EXTERNAL_ROUTER_BUILD) startCatalogVerificationMonitor({ logger, stateStore });
+       return;
+     }
+     if (runtime.status === "not-configured") {
+diff --git a/launcher/electron/runtime-supervisor.cjs b/launcher/electron/runtime-supervisor.cjs
+index d268ae0..d2cdc4b 100644
+--- a/launcher/electron/runtime-supervisor.cjs
++++ b/launcher/electron/runtime-supervisor.cjs
+@@ -195,6 +195,17 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
+     && config.subagentProtocol !== "native") {
+     throw new Error("Runtime configuration has an invalid subagent protocol");
+   }
++  // 定制生产启动器只接受 full/external/native/launcher，避免 repair 或启动重获 Codex route 所有权。
++  if (launcherProfile !== "development" && (
++    config.mode !== "full"
++    || config.codexIntegration !== "external"
++    || config.subagentProtocol !== "native"
++    || config.browserHost !== "launcher"
++  )) {
++    throw new Error(
++      "Runtime configuration is not an externally routed Full launcher with the native subagent protocol",
++    );
++  }
+   if (typeof config.releaseVersion !== "string" || !config.releaseVersion.trim()) {
+     throw new Error("Runtime configuration has no release version");
+   }
+diff --git a/launcher/electron/runtime.cjs b/launcher/electron/runtime.cjs
+index 68b1723..5ab69b2 100644
+--- a/launcher/electron/runtime.cjs
++++ b/launcher/electron/runtime.cjs
+@@ -101,28 +101,6 @@ function regularFileChanged(snapshot, platform = process.platform) {
+   return !fs.readFileSync(snapshot.path).equals(snapshot.data);
+ }
+ 
+-function parseBridgeRouteResult(stdout, { expectedActive, requireInstalled = false } = {}) {
+-  let result;
+-  try {
+-    result = JSON.parse(stdout);
+-  } catch {
+-    throw new Error("Codex bridge route command returned invalid JSON");
+-  }
+-  if (typeof result?.active !== "boolean") {
+-    throw new Error("Codex bridge route command did not report its active state");
+-  }
+-  if (requireInstalled && typeof result.installed !== "boolean") {
+-    throw new Error("Codex bridge route status did not report whether the integration is installed");
+-  }
+-  if (Array.isArray(result.errors) && result.errors.length > 0) {
+-    throw new Error(`Codex bridge route is inconsistent: ${result.errors.join("; ")}`);
+-  }
+-  if (typeof expectedActive === "boolean" && result.active !== expectedActive) {
+-    throw new Error(`Codex bridge route remained ${result.active ? "connected" : "disconnected"}`);
+-  }
+-  return result;
+-}
+-
+ class RuntimeHost {
+   constructor({
+     app,
+@@ -273,7 +251,7 @@ class RuntimeHost {
+     );
+   }
+ 
+-  captureSetupCheckpoint(snapshot) {
++  captureSetupCheckpoint(snapshot, { includeCodex = true } = {}) {
+     if (typeof this.supervisor.configPath !== "string" || !path.isAbsolute(this.supervisor.configPath)) {
+       throw new Error("Launcher runtime supervisor has no absolute configuration path for setup rollback");
+     }
+@@ -283,11 +261,14 @@ class RuntimeHost {
+       this.supervisor.configPath,
+       path.join(coreHome, "codex", "integration-journal.json"),
+       path.join(coreHome, "codex", "integration-journal.recovery.json"),
+-      path.join(this.codexHome, "config.toml"),
+-      path.join(this.codexHome, "models_cache.json"),
+       path.join(coreHome, "secrets", "tunnel-runtime.key"),
+       path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web.yaml"),
+     ]);
++    // external Router 拥有 Codex 配置；外部路径连回滚快照也不读取这些文件。
++    if (includeCodex) {
++      paths.add(path.join(this.codexHome, "config.toml"));
++      paths.add(path.join(this.codexHome, "models_cache.json"));
++    }
+     if (snapshot.owner === "external" && this.platform === "darwin") {
+       paths.add(path.join(this.launchAgentsDir, "io.github.codex-chatgpt-web.daemon.plist"));
+       paths.add(path.join(this.launchAgentsDir, "io.github.codex-chatgpt-web.tunnel.plist"));
+@@ -625,33 +606,14 @@ class RuntimeHost {
+ 
+   async bridgeStatus(operationName = "bridge-status") {
+     this.assertProductionProfile("Codex bridge status");
+-    const result = await this.run(operationName, ["route", "status"], {
+-      embedded: true,
+-      message: "Checking Codex bridge route",
+-      successMessage: "Codex bridge route checked",
+-      timeoutMs: 15_000,
+-    });
+-    return parseBridgeRouteResult(result.stdout, { requireInstalled: true });
++    // 定制生产包固定由 Router 接管，启动和修复都不能探测残留 managed route。
++    void operationName;
++    return { installed: false, active: false, external: true, errors: [] };
+   }
+ 
+   async restoreBridgeRouteWithinOperation(operationName) {
+-    const current = await this.bridgeStatus(operationName);
+-    if (!current.installed || !current.active) return current;
+-    const disconnected = await this.run(operationName, ["route", "disconnect"], {
+-      embedded: true,
+-      message: "Restoring the previous Codex route",
+-      successMessage: "Previous Codex route restored",
+-      timeoutMs: 15_000,
+-    });
+-    const result = parseBridgeRouteResult(disconnected.stdout, { expectedActive: false });
+-    const verified = await this.bridgeStatus(operationName);
+-    if (!verified.installed || verified.active) {
+-      throw new Error("Codex bridge route restore did not persist in the active config");
+-    }
+-    return {
+-      ...result,
+-      installed: true,
+-    };
++    // 失败补偿只返回只读 external 状态，绝不越过 Router 所有权边界。
++    return this.bridgeStatus(operationName);
+   }
+ 
+   async restoreBridgeRoute(operationName = "bridge-route-restore") {
+@@ -664,40 +626,10 @@ class RuntimeHost {
+     }
+   }
+ 
+-  async connectBridgeRoute() {
++  async setBridgeEnabled(enabled) {
+     this.assertProductionProfile("Codex bridge routing");
+-    const name = "bridge-connect";
+-    if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
+-    this.lifecycleOperation = name;
+-    try {
+-      const current = await this.bridgeStatus(name);
+-      if (!current.installed) throw new Error("Install the Codex integration before connecting the bridge route");
+-      if (current.active) return current;
+-      try {
+-        const connected = await this.run(name, ["route", "connect"], {
+-          embedded: true,
+-          message: "Connecting Codex to the launcher",
+-          successMessage: "Codex bridge connected",
+-          timeoutMs: 15_000,
+-        });
+-        const result = parseBridgeRouteResult(connected.stdout, { expectedActive: true });
+-        const verified = await this.bridgeStatus(name);
+-        if (!verified.installed || !verified.active) {
+-          throw new Error("Codex bridge route connection did not persist in the active config");
+-        }
+-        return result;
+-      } catch (error) {
+-        let cleanupError;
+-        try { await this.supervisor.stopForSetup(); } catch (caught) { cleanupError = caught; }
+-        if (!cleanupError) throw error;
+-        throw new Error(
+-          `${error instanceof Error ? error.message : String(error)}; stopping the unrouted runtime also failed:`
+-          + ` ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+-        );
+-      }
+-    } finally {
+-      this.lifecycleOperation = null;
+-    }
++    void enabled;
++    throw new Error("Codex routing is externally managed by Codex Router");
+   }
+ 
+   mcpConnectorName() {
+@@ -733,6 +665,12 @@ class RuntimeHost {
+     const name = "uninstall-integration";
+     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
+     const previousRuntime = this.runtimeConfigSnapshot();
++    if (previousRuntime.config?.codexIntegration !== "external") {
++      throw new Error(
++        "This custom launcher refuses to remove a legacy managed Codex route;"
++        + " restore or remove that integration with the matching stock release first",
++      );
++    }
+     this.lifecycleOperation = name;
+     try {
+       try {
+@@ -748,22 +686,18 @@ class RuntimeHost {
+           );
+         }
+         throw new Error(
+-          `${error instanceof Error ? error.message : String(error)}; the previous Codex route was restored,`
++          `${error instanceof Error ? error.message : String(error)}; the external Codex route remained untouched,`
+           + " but launcher runtime cleanup did not complete",
+         );
+       }
+       try {
+-        const result = await this.run(name, ["uninstall", "--yes", "--launcher-control"], {
++        const result = await this.run(name, ["uninstall", "--yes", "--launcher-control", "--no-codex-route"], {
+           embedded: true,
+           env: this.launcherControlEnvironment(),
+-          message: "Restoring the previous Codex route",
++          message: "Removing the local external Router harness",
+           successMessage: "Codex Web GPT integration removed",
+           timeoutMs: UNINSTALL_TIMEOUT_MS,
+         });
+-        const verified = await this.bridgeStatus(name);
+-        if (verified.installed || verified.active) {
+-          throw new Error("Codex integration removal did not persist in the active config");
+-        }
+         return result;
+       } catch (error) {
+         try {
+@@ -785,6 +719,12 @@ class RuntimeHost {
+     this.assertProductionProfile("Codex integration setup");
+     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
+     const existing = this.runtimeConfigSnapshot();
++    if (existing.configured && existing.config?.codexIntegration !== "external") {
++      throw new Error(
++        "This custom launcher cannot convert a legacy managed Codex route in place;"
++        + " remove it with the matching stock release first",
++      );
++    }
+     const mode = existing.mode;
+     const args = [
+       "setup",
+@@ -792,7 +732,9 @@ class RuntimeHost {
+       "--browser-host-descriptor",
+       this.browserDescriptorPath,
+       "--refresh-account-capabilities",
+-      "--replace-codex-route",
++      "--no-codex-route",
++      "--subagent-protocol",
++      "native",
+       "--acknowledge-unofficial",
+       "--restart-service",
+     ];
+@@ -861,7 +803,9 @@ class RuntimeHost {
+       mode === "full" ? "--full" : "--browser-only",
+       "--browser-host-descriptor",
+       this.browserDescriptorPath,
+-      "--replace-codex-route",
++      "--no-codex-route",
++      "--subagent-protocol",
++      "native",
+       "--acknowledge-unofficial",
+       "--restart-service",
+       contextFlag,
+@@ -880,6 +824,12 @@ class RuntimeHost {
+     this.assertProductionProfile("Managed Codex runtime upgrade");
+     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
+     const existing = this.runtimeConfigSnapshot();
++    if (existing.owner === "launcher" && existing.config?.codexIntegration !== "external") {
++      throw new Error(
++        "This custom launcher refuses to upgrade a legacy managed Codex route in place;"
++        + " remove it with the matching stock release first",
++      );
++    }
+     const currentVersion = this.app.getVersion();
+     const connectorMigrationRequired = existing.mode === "full"
+       && isLegacyConnectorName(validateConnectorName(existing.config?.appName));
+@@ -892,6 +842,9 @@ class RuntimeHost {
+       existing.mode === "full" ? "--full" : "--browser-only",
+       "--browser-host-descriptor",
+       this.browserDescriptorPath,
++      "--no-codex-route",
++      "--subagent-protocol",
++      "native",
+       "--acknowledge-unofficial",
+       "--restart-service",
+     ];
+@@ -906,6 +859,7 @@ class RuntimeHost {
+     return {
+       updated: true,
+       mode: existing.mode,
++      bridgeEnabled: false,
+       fromVersion: existing.config.releaseVersion,
+       toVersion: currentVersion,
+       connectorMigrated: connectorMigrationRequired,
+@@ -930,7 +884,9 @@ class RuntimeHost {
+       this.browserDescriptorPath,
+       "--app-name",
+       this.browserConnectorName(),
+-      "--replace-codex-route",
++      "--no-codex-route",
++      "--subagent-protocol",
++      "native",
+     ];
+     if (reuseSavedCredentials) {
+       args.push("--acknowledge-unofficial", "--restart-service");
+@@ -1016,7 +972,9 @@ class RuntimeHost {
+   async runSetup(name, args, options) {
+     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
+     const previousRuntime = this.runtimeConfigSnapshot();
+-    const checkpoint = this.captureSetupCheckpoint(previousRuntime);
++    const checkpoint = this.captureSetupCheckpoint(previousRuntime, {
++      includeCodex: !args.includes("--no-codex-route"),
++    });
+     this.lifecycleOperation = name;
+     let setupCommandStarted = false;
+     try {
+@@ -1024,6 +982,13 @@ class RuntimeHost {
+       else await this.supervisor.stopForSetup();
+       setupCommandStarted = true;
+       const result = await this.run(name, args, options);
++      const stagedRuntime = this.runtimeConfigSnapshot();
++      // 首次 UI setup 会先保存 browser-only 外部配置；它只是等待 Full tunnel 的中间态，不能启动生产 daemon。
++      if (this.launcherProfile === "production"
++        && stagedRuntime.config?.codexIntegration === "external"
++        && stagedRuntime.mode === "browser-only") {
++        return result;
++      }
+       const runtime = await this.supervisor.startIfConfigured();
+       if (runtime.status !== "ready") {
+         throw new Error(`Setup completed, but the launcher-owned runtime is ${runtime.status}: ${runtime.detail || "not ready"}`);
+diff --git a/launcher/tests/renderer-wiring.test.cjs b/launcher/tests/renderer-wiring.test.cjs
+index 08440db..9054933 100644
+--- a/launcher/tests/renderer-wiring.test.cjs
++++ b/launcher/tests/renderer-wiring.test.cjs
+@@ -93,11 +93,14 @@ test("MCP surfaces use the official local protocol mark", () => {
+   assert.match(stylesSource, /mask:\s*url\("\.\.\/assets\/mcp-mark\.svg"\)/);
+ });
+ 
+-test("the configured launcher exposes no persistent bridge opt-out", () => {
++test("the external Router launcher exposes no managed bridge or automatic updater path", () => {
+   assert.doesNotMatch(appSource, /setBridgeEnabled|bridgeRouteBody/);
+   assert.doesNotMatch(preloadSource, /launcher:bridge-enabled|setBridgeEnabled/);
+   assert.doesNotMatch(electronMain, /launcher:bridge-enabled|bridge-disabled|bridgeEnabled/);
+-  assert.match(electronMain, /runtimeSupervisor\.startIfConfigured\(\)[\s\S]*?runtimeHost\.connectBridgeRoute\(\)/);
++  assert.doesNotMatch(electronMain, /runtimeHost\.connectBridgeRoute\(\)/);
++  assert.match(electronMain, /const EXTERNAL_ROUTER_BUILD = true/);
++  assert.match(electronMain, /packaged: app\.isPackaged && !IS_DEV_PROFILE && !EXTERNAL_ROUTER_BUILD/);
++  assert.match(electronMain, /if \(!launcherSmokeTest && !EXTERNAL_ROUTER_BUILD\) void updateController\.checkOnce\(\)/);
+ });
+ 
+ test("MCP connection remains unavailable until the model catalog is verified", () => {
+@@ -162,11 +165,10 @@ test("saved ChatGPT authentication is refreshed before setup is presented", () =
+   const refreshBarrier = electronMain.indexOf("await startupAuthenticationRefresh", productionStartup);
+   const upgrade = electronMain.indexOf("runtimeHost.upgradeManagedRuntime()", productionStartup);
+   const runtimeStart = electronMain.indexOf("runtimeSupervisor.startIfConfigured()", upgrade);
+-  const routeConnect = electronMain.indexOf("runtimeHost.connectBridgeRoute()", runtimeStart);
+   assert.ok(refreshBarrier > productionStartup, "production startup must wait for saved-session refresh");
+   assert.ok(upgrade > refreshBarrier, "runtime upgrade must not inspect the browser before refresh settles");
+   assert.ok(runtimeStart > upgrade, "configured runtime must start after any upgrade");
+-  assert.ok(routeConnect > runtimeStart, "Codex route must connect only after the runtime is healthy");
++  assert.equal(electronMain.includes("runtimeHost.connectBridgeRoute()"), false, "external startup must never connect a Codex route");
+   assert.match(appSource, /browser\?\.status === "loading" \? copy\.checkingSignIn/);
+ });
+ 
+diff --git a/launcher/tests/runtime-host.test.cjs b/launcher/tests/runtime-host.test.cjs
+index ab8ad55..5b2dade 100644
+--- a/launcher/tests/runtime-host.test.cjs
++++ b/launcher/tests/runtime-host.test.cjs
+@@ -56,8 +56,8 @@ function devHostFor(existingConfig) {
+   return { host, invocation: () => invocation };
+ }
+ 
+-test("core setup preserves an existing full-harness installation", async () => {
+-  const fixture = hostFor({ mode: "full", appName: "Codex Native2" });
++test("core setup preserves an existing external full-harness installation", async () => {
++  const fixture = hostFor({ mode: "full", appName: "Codex Native2", codexIntegration: "external" });
+   const result = await fixture.host.setupCore();
+   assert.equal(result.mode, "full");
+   assert.deepEqual(fixture.invocation().args, [
+@@ -66,7 +66,9 @@ test("core setup preserves an existing full-harness installation", async () => {
+     "--browser-host-descriptor",
+     "/runtime/launcher-browser.json",
+     "--refresh-account-capabilities",
+-    "--replace-codex-route",
++    "--no-codex-route",
++    "--subagent-protocol",
++    "native",
+     "--acknowledge-unofficial",
+     "--restart-service",
+     "--app-name",
+@@ -75,7 +77,7 @@ test("core setup preserves an existing full-harness installation", async () => {
+ });
+ 
+ test("core setup replaces the known legacy connector identity with the direct-turn identity", async () => {
+-  const fixture = hostFor({ mode: "full", appName: "Codex Native" });
++  const fixture = hostFor({ mode: "full", appName: "Codex Native", codexIntegration: "external" });
+   await fixture.host.setupCore();
+   assert.deepEqual(fixture.invocation().args.slice(-2), ["--app-name", "Codex Native2"]);
+ });
+@@ -86,7 +88,9 @@ test("core setup starts in browser-only mode when no installation exists", async
+   assert.equal(result.mode, "browser-only");
+   assert.deepEqual(fixture.invocation().args.slice(0, 2), ["setup", "--browser-only"]);
+   assert.equal(fixture.invocation().args.includes("--refresh-account-capabilities"), true);
+-  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), true);
++  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
++  assert.equal(fixture.invocation().args.includes("--no-codex-route"), true);
++  assert.equal(fixture.invocation().args.includes("native"), true);
+   assert.equal(fixture.invocation().args.includes("--chrome"), false);
+ });
+ 
+@@ -110,8 +114,8 @@ test("DEV core setup configures only the isolated harness contract", async () =>
+   assert.equal(fixture.invocation().args.includes("--restart-service"), false);
+ });
+ 
+-test("Bigger Context uses the setup transaction and refreshes the production Codex catalog", async () => {
+-  const fixture = hostFor({ mode: "full", appName: "Codex Native2" });
++test("Bigger Context uses the external setup transaction and requests a catalog refresh", async () => {
++  const fixture = hostFor({ mode: "full", appName: "Codex Native2", codexIntegration: "external" });
+   const result = await fixture.host.setBiggerContext(true);
+   assert.equal(result.enabled, true);
+   assert.deepEqual(fixture.invocation(), {
+@@ -121,7 +125,9 @@ test("Bigger Context uses the setup transaction and refreshes the production Cod
+       "--full",
+       "--browser-host-descriptor",
+       "/runtime/launcher-browser.json",
+-      "--replace-codex-route",
++      "--no-codex-route",
++      "--subagent-protocol",
++      "native",
+       "--acknowledge-unofficial",
+       "--restart-service",
+       "--bigger-context",
+@@ -271,9 +277,9 @@ test("launcher update transaction upgrades its owned full runtime with saved con
+     mode: "full",
+     browserHost: "launcher",
+     appName: "Codex Native2",
++    codexIntegration: "external",
+     releaseVersion: "1.1.1",
+   });
+-  fixture.host.bridgeStatus = async () => ({ installed: true, active: true, errors: [] });
+ 
+   const result = await fixture.host.upgradeManagedRuntime();
+ 
+@@ -282,6 +288,9 @@ test("launcher update transaction upgrades its owned full runtime with saved con
+     "--full",
+     "--browser-host-descriptor",
+     "/runtime/launcher-browser.json",
++    "--no-codex-route",
++    "--subagent-protocol",
++    "native",
+     "--acknowledge-unofficial",
+     "--restart-service",
+     "--app-name",
+@@ -290,6 +299,7 @@ test("launcher update transaction upgrades its owned full runtime with saved con
+   assert.deepEqual(result, {
+     updated: true,
+     mode: "full",
++    bridgeEnabled: false,
+     fromVersion: "1.1.1",
+     toVersion: "1.1.3",
+     connectorMigrated: false,
+@@ -302,9 +312,9 @@ test("launcher migrates the legacy connector identity even when the release vers
+     mode: "full",
+     browserHost: "launcher",
+     appName: "Codex Native",
++    codexIntegration: "external",
+     releaseVersion: "1.1.3",
+   });
+-  fixture.host.bridgeStatus = async () => ({ installed: true, active: true, errors: [] });
+ 
+   const result = await fixture.host.upgradeManagedRuntime();
+ 
+@@ -313,6 +323,9 @@ test("launcher migrates the legacy connector identity even when the release vers
+     "--full",
+     "--browser-host-descriptor",
+     "/runtime/launcher-browser.json",
++    "--no-codex-route",
++    "--subagent-protocol",
++    "native",
+     "--acknowledge-unofficial",
+     "--restart-service",
+     "--app-name",
+@@ -323,29 +336,44 @@ test("launcher migrates the legacy connector identity even when the release vers
+   assert.equal(result.fromVersion, result.toVersion);
+ });
+ 
+-test("launcher update transaction does not preserve a stale disconnected route preference", async () => {
++test("external launcher update never invokes managed Codex route state", async () => {
+   const fixture = hostFor({
+     mode: "browser-only",
+     browserHost: "launcher",
++    codexIntegration: "external",
+     releaseVersion: "1.1.1",
+   });
++  let bridgeCalls = 0;
++  fixture.host.bridgeStatus = async () => { bridgeCalls += 1; };
+ 
+   const result = await fixture.host.upgradeManagedRuntime();
+ 
+   assert.equal(result.updated, true);
+-  assert.equal("bridgeEnabled" in result, false);
+-  assert.equal(fixture.invocation().args.includes("disconnect"), false);
++  assert.equal(result.bridgeEnabled, false);
++  assert.equal(bridgeCalls, 0);
++  assert.equal(fixture.invocation().args.includes("--no-codex-route"), true);
+ });
+ 
+ test("launcher update transaction leaves current and externally owned runtimes unchanged", async () => {
+-  const current = hostFor({ mode: "browser-only", browserHost: "launcher", releaseVersion: "1.1.3" });
++  const current = hostFor({
++    mode: "browser-only",
++    browserHost: "launcher",
++    codexIntegration: "external",
++    releaseVersion: "1.1.3",
++  });
+   const currentFull = hostFor({
+     mode: "full",
+     browserHost: "launcher",
+     appName: "Codex Native2",
++    codexIntegration: "external",
+     releaseVersion: "1.1.3",
+   });
+-  const external = hostFor({ mode: "browser-only", browserHost: "managed-chrome", releaseVersion: "1.1.1" });
++  const external = hostFor({
++    mode: "browser-only",
++    browserHost: "managed-chrome",
++    codexIntegration: "external",
++    releaseVersion: "1.1.1",
++  });
+ 
+   assert.deepEqual(await current.host.upgradeManagedRuntime(), { updated: false });
+   assert.deepEqual(await currentFull.host.upgradeManagedRuntime(), { updated: false });
+@@ -362,6 +390,7 @@ test("MCP setup reuses valid private credentials without exposing or rewriting t
+   const fixture = hostFor({
+     mode: "full",
+     appName: "Codex Native2",
++    codexIntegration: "external",
+     tunnel: {
+       tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+       runtimeKeyFile: keyPath,
+@@ -377,12 +406,14 @@ test("MCP setup reuses valid private credentials without exposing or rewriting t
+       "/runtime/launcher-browser.json",
+       "--app-name",
+       "Codex Native2",
+-      "--replace-codex-route",
++      "--no-codex-route",
++      "--subagent-protocol",
++      "native",
+       "--acknowledge-unofficial",
+       "--restart-service",
+     ]);
+     assert.equal(fixture.invocation().args.includes("--refresh-account-capabilities"), false);
+-    assert.equal(fixture.invocation().args.includes("--replace-codex-route"), true);
++    assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
+   } finally {
+     fs.rmSync(root, { recursive: true, force: true });
+   }
+@@ -428,7 +459,7 @@ test("mutating launcher operations are serialized before lifecycle changes begin
+   assert.equal(fixture.invocation(), undefined);
+ });
+ 
+-function bridgeFixture({ active }) {
++function bridgeFixture({ active = false } = {}) {
+   const calls = [];
+   let routeActive = active;
+   const supervisor = {
+@@ -469,44 +500,59 @@ function bridgeFixture({ active }) {
+   return { calls, host, supervisor };
+ }
+ 
+-test("launcher connects an inactive installed route", async () => {
+-  const fixture = bridgeFixture({ active: false });
+-  const result = await fixture.host.connectBridgeRoute();
+-  assert.equal(result.active, true);
+-  assert.deepEqual(fixture.calls, ["route status", "route connect", "route status"]);
+-});
+-
+-test("launcher leaves an already connected route unchanged", async () => {
+-  const fixture = bridgeFixture({ active: true });
+-  const result = await fixture.host.connectBridgeRoute();
+-  assert.equal(result.active, true);
+-  assert.deepEqual(fixture.calls, ["route status"]);
++test("external launcher rejects bridge toggles without running route or runtime commands", async () => {
++  const fixture = bridgeFixture();
++  await assert.rejects(fixture.host.setBridgeEnabled(true), /externally managed by Codex Router/);
++  await assert.rejects(fixture.host.setBridgeEnabled(false), /externally managed by Codex Router/);
++  assert.deepEqual(fixture.calls, []);
+ });
+ 
+-test("bridge connection rejects a route command that did not reach the requested state", async () => {
+-  const fixture = bridgeFixture({ active: false });
+-  fixture.host.run = async (_name, args) => {
+-    const action = args.join(" ");
+-    fixture.calls.push(action);
+-    if (action === "route status") {
+-      return { stdout: JSON.stringify({ installed: true, active: false, errors: [] }) };
+-    }
+-    return { stdout: JSON.stringify({ changed: false, active: false }) };
++test("external launcher startup never inspects or restores a managed Codex route", async () => {
++  const calls = [];
++  const config = {
++    mode: "full",
++    browserHost: "launcher",
++    codexIntegration: "external",
++    subagentProtocol: "native",
++  };
++  const host = new RuntimeHost({
++    app: { getPath: () => path.join(os.tmpdir(), "codex-web-gpt-external-startup") },
++    logger: { info() {}, warn() {}, error() {} },
++    sourceRoot: "/source",
++    browserDescriptorPath: "/runtime/launcher-browser.json",
++    supervisor: {
++      readConfig: () => config,
++      readSetupConfig: () => config,
++    },
++  });
++  host.run = async (_name, args) => {
++    calls.push(args.join(" "));
++    throw new Error("external startup must not execute a Codex route command");
+   };
+-  await assert.rejects(fixture.host.connectBridgeRoute(), /remained disconnected/);
+-  assert.deepEqual(fixture.calls, ["route status", "route connect", "runtime:stop"]);
+-});
+ 
+-test("startup recovery can restore the Codex route without requiring a healthy local runtime", async () => {
+-  const fixture = bridgeFixture({ active: true });
+-  const result = await fixture.host.restoreBridgeRoute("runtime-start-fail-safe");
+-  assert.equal(result.active, false);
+-  assert.deepEqual(fixture.calls, ["route status", "route disconnect", "route status"]);
++  assert.deepEqual(await host.bridgeStatus(), {
++    installed: false,
++    active: false,
++    external: true,
++    errors: [],
++  });
++  assert.deepEqual(await host.restoreBridgeRoute("runtime-start-fail-safe"), {
++    installed: false,
++    active: false,
++    external: true,
++    errors: [],
++  });
++  assert.deepEqual(calls, []);
+ });
+ 
+-test("failed runtime cleanup during removal still restores the previous Codex route", async () => {
++test("failed runtime cleanup during external removal never touches the Codex route", async () => {
+   const calls = [];
+-  const config = { mode: "full", browserHost: "launcher", releaseVersion: "1.1.2" };
++  const config = {
++    mode: "full",
++    browserHost: "launcher",
++    codexIntegration: "external",
++    releaseVersion: "1.1.2",
++  };
+   const host = new RuntimeHost({
+     app: { getPath: () => path.join(os.tmpdir(), "codex-web-gpt-uninstall-fail-safe") },
+     logger: { info() {}, warn() {}, error() {} },
+@@ -521,30 +567,27 @@ test("failed runtime cleanup during removal still restores the previous Codex ro
+       },
+     },
+   });
+-  let routeActive = true;
+   host.run = async (_name, args) => {
+     const action = args.join(" ");
+     calls.push(action);
+-    if (action === "route status") {
+-      return { stdout: JSON.stringify({ installed: true, active: routeActive, errors: [] }) };
+-    }
+-    if (action === "route disconnect") {
+-      routeActive = false;
+-      return { stdout: JSON.stringify({ changed: true, active: false }) };
+-    }
+     throw new Error(`Unexpected command: ${action}`);
+   };
+ 
+   await assert.rejects(
+     host.uninstallIntegration(),
+-    /previous Codex route was restored, but launcher runtime cleanup did not complete/,
++    /external Codex route remained untouched, but launcher runtime cleanup did not complete/,
+   );
+-  assert.deepEqual(calls, ["runtime:stop", "route status", "route disconnect", "route status"]);
++  assert.deepEqual(calls, ["runtime:stop"]);
+ });
+ 
+-test("integration removal is accepted only after a new status process observes it absent", async () => {
++test("external integration removal never inspects or mutates a managed Codex route", async () => {
+   const calls = [];
+-  const config = { mode: "browser-only", browserHost: "launcher", releaseVersion: "2.1.8" };
++  const config = {
++    mode: "browser-only",
++    browserHost: "launcher",
++    codexIntegration: "external",
++    releaseVersion: "2.1.8",
++  };
+   const host = new RuntimeHost({
+     app: { getPath: () => path.join(os.tmpdir(), "codex-web-gpt-uninstall-success") },
+     logger: { info() {}, warn() {}, error() {} },
+@@ -560,60 +603,32 @@ test("integration removal is accepted only after a new status process observes i
+   host.run = async (_name, args) => {
+     const action = args.join(" ");
+     calls.push(action);
+-    if (action === "uninstall --yes --launcher-control") {
++    if (action === "uninstall --yes --launcher-control --no-codex-route") {
+       return { stdout: "uninstalled\n" };
+     }
+-    if (action === "route status") {
+-      return { stdout: JSON.stringify({ installed: false, active: false, errors: [] }) };
+-    }
+     throw new Error(`Unexpected command: ${action}`);
+   };
+ 
+   await host.uninstallIntegration();
+   assert.deepEqual(calls, [
+     "runtime:stop",
+-    "uninstall --yes --launcher-control",
+-    "route status",
++    "uninstall --yes --launcher-control --no-codex-route",
+   ]);
+ });
+ 
+-test("integration removal rejects a command that leaves an inactive journal behind", async () => {
+-  const calls = [];
+-  const config = { mode: "browser-only", browserHost: "launcher", releaseVersion: "2.1.8" };
+-  const host = new RuntimeHost({
+-    app: { getPath: () => path.join(os.tmpdir(), "codex-web-gpt-uninstall-stale") },
+-    logger: { info() {}, warn() {}, error() {} },
+-    sourceRoot: "/source",
+-    browserDescriptorPath: "/runtime/launcher-browser.json",
+-    supervisor: {
+-      readConfig: () => config,
+-      readSetupConfig: () => config,
+-      stopForSetup: async () => { calls.push("runtime:stop"); },
+-    },
++test("external launcher refuses legacy managed setup, repair, and removal paths", async () => {
++  const fixture = hostFor({
++    mode: "full",
++    browserHost: "launcher",
++    codexIntegration: "managed",
++    subagentProtocol: "compatibility-v1",
++    appName: "Codex Native2",
++    releaseVersion: "4.0.5",
+   });
+-  host.launcherControlEnvironment = () => ({ CODEX_WEB_GPT_LAUNCHER_CONTROL_TOKEN: "test-token" });
+-  host.run = async (_name, args) => {
+-    const action = args.join(" ");
+-    calls.push(action);
+-    if (action === "uninstall --yes --launcher-control") {
+-      return { stdout: "uninstalled\n" };
+-    }
+-    if (action === "route status") {
+-      return { stdout: JSON.stringify({ installed: true, active: false, errors: [] }) };
+-    }
+-    throw new Error(`Unexpected command: ${action}`);
+-  };
+-
+-  await assert.rejects(
+-    host.uninstallIntegration(),
+-    /integration removal did not persist in the active config/,
+-  );
+-  assert.deepEqual(calls, [
+-    "runtime:stop",
+-    "uninstall --yes --launcher-control",
+-    "route status",
+-    "route status",
+-  ]);
++  await assert.rejects(fixture.host.setupCore(), /cannot convert a legacy managed Codex route/);
++  await assert.rejects(fixture.host.upgradeManagedRuntime(), /refuses to upgrade a legacy managed Codex route/);
++  await assert.rejects(fixture.host.uninstallIntegration(), /refuses to remove a legacy managed Codex route/);
++  assert.equal(fixture.invocation(), undefined);
+ });
+ 
+ test("connector verification uses the current identity and rejects a legacy local runtime", () => {
+@@ -725,6 +740,54 @@ test("failed first-time setup removes its route before restoring the unconfigure
+   }
+ });
+ 
++test("external browser-only setup is staged without starting a non-production runtime tuple", async () => {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-external-staging-"));
++  const coreHome = path.join(root, "core");
++  const configPath = path.join(coreHome, "config.json");
++  let config = null;
++  let starts = 0;
++  const supervisor = {
++    coreHome,
++    configPath,
++    readConfig: () => config,
++    readSetupConfig: () => config,
++    stopForSetup: async () => ({ status: "stopped" }),
++    startIfConfigured: async () => {
++      starts += 1;
++      return { status: "needs-setup", detail: "browser-only is not a production tuple" };
++    },
++  };
++  const host = new RuntimeHost({
++    app: { getPath: () => root },
++    logger: { info() {}, warn() {}, error() {} },
++    sourceRoot: "/source",
++    browserDescriptorPath: path.join(root, "launcher-browser.json"),
++    coreHome,
++    codexHome: path.join(root, "codex"),
++    supervisor,
++  });
++  host.run = async () => {
++    config = {
++      mode: "browser-only",
++      browserHost: "launcher",
++      codexIntegration: "external",
++      subagentProtocol: "native",
++    };
++    fs.mkdirSync(coreHome, { recursive: true });
++    fs.writeFileSync(configPath, `${JSON.stringify(config)}\n`);
++    return { stdout: "staged\n" };
++  };
++
++  try {
++    const result = await host.runSetup("core-setup", ["setup", "--browser-only", "--no-codex-route"], {});
++    assert.equal(result.stdout, "staged\n");
++    assert.equal(starts, 0);
++    assert.equal(fs.existsSync(configPath), true);
++  } finally {
++    fs.rmSync(root, { recursive: true, force: true });
++  }
++});
++
+ test("launcher delegates an existing terminal-managed installation to the migration-aware CLI", async () => {
+   let config = { mode: "full", browserHost: "managed-chrome", releaseVersion: "0.1.16" };
+   let prepared = 0;
+diff --git a/launcher/tests/runtime-supervisor.test.cjs b/launcher/tests/runtime-supervisor.test.cjs
+index 48c4084..84f439a 100644
+--- a/launcher/tests/runtime-supervisor.test.cjs
++++ b/launcher/tests/runtime-supervisor.test.cjs
+@@ -48,6 +48,8 @@ function launcherConfig(descriptorPath, overrides = {}) {
+     version: 3,
+     releaseVersion: "0.2.0",
+     mode: "browser-only",
++    codexIntegration: "external",
++    subagentProtocol: "native",
+     host: "127.0.0.1",
+     port: 17841,
+     contextWindow: 256_000,
+@@ -68,6 +70,68 @@ function launcherConfig(descriptorPath, overrides = {}) {
+   };
+ }
+ 
++function fullLauncherConfig(descriptorPath, overrides = {}) {
++  const root = path.dirname(descriptorPath);
++  return launcherConfig(descriptorPath, {
++    mode: "full",
++    codexIntegration: "external",
++    subagentProtocol: "native",
++    solAvailable: true,
++    tunnel: {
++      binaryPath: path.join(root, process.platform === "win32" ? "tunnel-client.exe" : "tunnel-client"),
++      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
++      runtimeKeyFile: path.join(root, "runtime.key"),
++      profileDir: path.join(root, "profiles"),
++      profileName: "codex-chatgpt-web",
++      alias: "codex-chatgpt-web",
++    },
++    ...overrides,
++  });
++}
++
++test("production runtime validation refuses legacy or managed Codex routing", () => {
++  const descriptorPath = path.join(os.tmpdir(), "codex-web-gpt-production-descriptor.json");
++  const legacy = fullLauncherConfig(descriptorPath);
++  delete legacy.codexIntegration;
++  assert.throws(
++    () => validateConfig(legacy, descriptorPath, process.platform, "production"),
++    /externally routed Full launcher/,
++  );
++  assert.throws(
++    () => validateConfig(
++      fullLauncherConfig(descriptorPath, { codexIntegration: "managed" }),
++      descriptorPath,
++      process.platform,
++      "production",
++    ),
++    /externally routed Full launcher/,
++  );
++});
++
++test("production runtime validation requires the full external native launcher tuple", () => {
++  const descriptorPath = path.join(os.tmpdir(), "codex-web-gpt-production-invariant.json");
++  const valid = fullLauncherConfig(descriptorPath);
++  assert.equal(validateConfig(valid, descriptorPath, process.platform, "production"), valid);
++  for (const invalid of [
++    { ...valid, mode: "browser-only", tunnel: undefined },
++    { ...valid, subagentProtocol: undefined },
++    { ...valid, subagentProtocol: "compatibility-v1" },
++    { ...valid, browserHost: "managed-chrome" },
++  ]) {
++    assert.throws(
++      () => validateConfig(invalid, descriptorPath, process.platform, "production"),
++      /externally routed Full launcher.*native subagent protocol/,
++    );
++  }
++
++  const development = launcherConfig(descriptorPath, {
++    purpose: "dev-harness",
++    subagentProtocol: "compatibility-v1",
++    solAvailable: true,
++  });
++  assert.equal(validateConfig(development, descriptorPath, process.platform, "development"), development);
++});
++
+ test("packaged runtime paths are native on Windows and Unix", () => {
+   const windows = packagedRuntimePaths("C:\\Program Files\\Codex\\resources", "win32");
+   assert.equal(path.basename(windows.executable), "bun.exe");
+@@ -125,14 +189,14 @@ test("launcher autostart fails explicitly when the operating system rejects the
+ 
+ test("launcher runtime ownership rejects a different browser descriptor", () => {
+   assert.throws(
+-    () => validateConfig(launcherConfig("/one/launcher.json"), "/two/launcher.json"),
++    () => validateConfig(fullLauncherConfig("/one/launcher.json"), "/two/launcher.json"),
+     /different launcher browser host/,
+   );
+ });
+ 
+ test("launcher runtime ownership cannot cross production and DEV profiles", () => {
+   const descriptorPath = path.join(os.tmpdir(), "launcher.json");
+-  const production = { ...launcherConfig(descriptorPath), solAvailable: true };
++  const production = fullLauncherConfig(descriptorPath);
+   const development = { ...production, purpose: "dev-harness" };
+   assert.equal(validateConfig(production, descriptorPath, process.platform, "production"), production);
+   assert.equal(validateConfig(development, descriptorPath, process.platform, "development"), development);
+@@ -212,8 +276,7 @@ test("DEV runtime supervision ignores launcher version mismatch and starts only
+ 
+ test("launcher runtime validation rejects a relative full-mode executable before spawn", () => {
+   const descriptorPath = path.join(os.tmpdir(), "launcher.json");
+-  assert.throws(() => validateConfig(launcherConfig(descriptorPath, {
+-    mode: "full",
++  assert.throws(() => validateConfig(fullLauncherConfig(descriptorPath, {
+     tunnel: {
+       binaryPath: "tunnel-client",
+       tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+@@ -230,7 +293,9 @@ test("launcher runtime validation accepts native Windows paths and a named pipe"
+   const config = {
+     version: 3,
+     releaseVersion: "0.2.0",
+-    mode: "browser-only",
++    mode: "full",
++    codexIntegration: "external",
++    subagentProtocol: "native",
+     host: "127.0.0.1",
+     port: 17841,
+     contextWindow: 256_000,
+@@ -246,6 +311,14 @@ test("launcher runtime validation accepts native Windows paths and a named pipe"
+     autoApproveToolCalls: false,
+     controlToken: "runtime-supervisor-control-token-0123456789abcdef",
+     runtimeCommand: ["C:\\Users\\Example\\.codex-chatgpt-web\\runtime\\bun.exe"],
++    tunnel: {
++      binaryPath: "C:\\Users\\Example\\.codex-chatgpt-web\\bin\\tunnel-client.exe",
++      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
++      runtimeKeyFile: "C:\\Users\\Example\\.codex-chatgpt-web\\secrets\\runtime.key",
++      profileDir: "C:\\Users\\Example\\.codex-chatgpt-web\\tunnel\\profiles",
++      profileName: "codex-chatgpt-web",
++      alias: "codex-chatgpt-web",
++    },
+   };
+   assert.equal(validateConfig(config, descriptorPath, "win32"), config);
+ });
+@@ -1337,7 +1410,7 @@ test("launcher preserves stale ownership evidence when an old active runtime can
+   const statePath = path.join(root, "runtime", "launcher-supervisor.json");
+   fs.mkdirSync(path.dirname(descriptorPath), { recursive: true });
+   fs.writeFileSync(descriptorPath, "{}\n");
+-  fs.writeFileSync(path.join(root, "config.json"), `${JSON.stringify(launcherConfig(descriptorPath, {
++  fs.writeFileSync(path.join(root, "config.json"), `${JSON.stringify(fullLauncherConfig(descriptorPath, {
+     releaseVersion: "0.1.16",
+     controlToken: "active-stale-control-token-0123456789abcdef",
+   }))}\n`);
+@@ -1377,8 +1450,7 @@ test("launcher recovers a stale tunnel even when no stale Responses proxy is rea
+   const descriptorPath = path.join(root, "runtime", "launcher-browser.json");
+   fs.mkdirSync(path.dirname(descriptorPath), { recursive: true });
+   fs.writeFileSync(descriptorPath, "{}\n");
+-  fs.writeFileSync(path.join(root, "config.json"), `${JSON.stringify(launcherConfig(descriptorPath, {
+-    mode: "full",
++  fs.writeFileSync(path.join(root, "config.json"), `${JSON.stringify(fullLauncherConfig(descriptorPath, {
+     controlToken: "stale-tunnel-control-token-0123456789abcdef",
+     tunnel: {
+       binaryPath: path.join(root, "tunnel-client"),
+@@ -1535,8 +1607,7 @@ test("a failed full-runtime marker with no child evidence cannot block removal o
+   const statePath = path.join(root, "runtime", "launcher-supervisor.json");
+   fs.mkdirSync(path.dirname(descriptorPath), { recursive: true });
+   fs.writeFileSync(descriptorPath, "{}\n");
+-  fs.writeFileSync(configPath, `${JSON.stringify(launcherConfig(descriptorPath, {
+-    mode: "full",
++  fs.writeFileSync(configPath, `${JSON.stringify(fullLauncherConfig(descriptorPath, {
+     tunnel: {
+       binaryPath: path.join(root, "tunnel-client"),
+       tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+@@ -1616,7 +1687,7 @@ test("launcher supervisor starts, health-checks, drains, and stops its daemon",
+   const port = await freePort();
+   fs.mkdirSync(path.dirname(descriptorPath), { recursive: true });
+   fs.writeFileSync(descriptorPath, "{}\n");
+-  fs.writeFileSync(configPath, `${JSON.stringify(launcherConfig(descriptorPath, {
++  fs.writeFileSync(configPath, `${JSON.stringify(fullLauncherConfig(descriptorPath, {
+     port,
+     controlToken: "runtime-supervisor-control-token-0123456789abcdef",
+   }))}\n`);
+@@ -1674,6 +1745,9 @@ process.once("SIGTERM", () => server.close(() => process.exit(0)));
+       cwd: root,
+     }),
+   });
++  // 本用例只验证 Responses daemon；生产 tuple 所需 tunnel 由专门测试覆盖。
++  supervisor.startTunnel = async () => {};
++  supervisor.adoptConfiguredTunnelForStop = async () => {};
+ 
+   try {
+     const started = await supervisor.startIfConfigured();
+@@ -1702,7 +1776,7 @@ test("launcher supervisor safely replaces an idle daemon left by a crashed launc
+   const port = await freePort();
+   fs.mkdirSync(path.dirname(descriptorPath), { recursive: true });
+   fs.writeFileSync(descriptorPath, "{}\n");
+-  fs.writeFileSync(configPath, `${JSON.stringify(launcherConfig(descriptorPath, {
++  fs.writeFileSync(configPath, `${JSON.stringify(fullLauncherConfig(descriptorPath, {
+     port,
+     controlToken: "stale-owner-test-control-token-0123456789",
+   }))}\n`);
+@@ -1762,6 +1836,10 @@ server.listen(config.port, config.host);
+       cwd: root,
+     }),
+   });
++  // 旧 owner 恢复断言聚焦 daemon，隔离 tunnel 控制面与本地二进制依赖。
++  supervisor.waitForKnownTunnelStatus = async () => ({ state: "stopped", processRunning: false, pid: null });
++  supervisor.startTunnel = async () => {};
++  supervisor.adoptConfiguredTunnelForStop = async () => {};
+ 
+   try {
+     const deadline = Date.now() + 5_000;
+diff --git a/src/cli.ts b/src/cli.ts
+index 356be32..572e24a 100644
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -5,7 +5,7 @@ import { timingSafeEqual } from "node:crypto";
+ import { existsSync, rmSync } from "node:fs";
+ import { stdin, stdout } from "node:process";
+ import { checkBrowserEngine, loginToChatGpt } from "./browser-login";
+-import { CHATGPT_CONNECTOR_NAME, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
++import { CHATGPT_CONNECTOR_NAME, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup, saveConfig } from "./config";
+ import { inspectLauncherBrowserHost, readLauncherBrowserHostDescriptor } from "./launcher-browser-host";
+ import {
+   activateCodexIntegration,
+@@ -63,6 +63,7 @@ Setup options:
+   --tunnel-id ID               Existing OpenAI tunnel id (full mode)
+   --runtime-key-file PATH      File containing a Tunnels Read+Use runtime key
+   --replace-codex-route        Reversibly replace an existing openai_base_url
++  --no-codex-route             Keep Codex routing externally managed (upstream-only mode)
+   --subagent-protocol MODE     compatibility-v1 (default) or native (advanced)
+   --restart-service            Explicitly restart this project's daemon after an update
+   --login                      Refresh the stored ChatGPT login even if one exists
+@@ -189,6 +190,16 @@ async function setupCommand(args: string[]): Promise<void> {
+   }
+   if (biggerContext || standardContext) options.experimentalBiggerContext = biggerContext;
+   options.replaceCodexRoute = takeFlag(args, "--replace-codex-route");
++  const noCodexRoute = takeFlag(args, "--no-codex-route");
++  if (noCodexRoute && options.replaceCodexRoute) {
++    throw new Error("Choose either --no-codex-route or --replace-codex-route, not both");
++  }
++  if (noCodexRoute) {
++    options.codexIntegration = "external";
++    if (options.subagentProtocol !== undefined && options.subagentProtocol !== "native") {
++      throw new Error("external Router mode requires --subagent-protocol native");
++    }
++  }
+   options.restartService = takeFlag(args, "--restart-service");
+   assertNoArgs(args);
+ 
+@@ -226,7 +237,15 @@ async function setupCommand(args: string[]): Promise<void> {
+     stdout.write("One account-level step remains: attach the tunnel to the ChatGPT connector named in config.\n");
+     stdout.write("Open: https://chatgpt.com/#settings/Plugins\n");
+   }
+-  stdout.write("Restart the Codex app once so its native model catalog refreshes through the installed route.\n");
++  const externalIntegration = options.codexIntegration === "external"
++    || existing?.codexIntegration === "external";
++  if (result.codexRestartRequired && externalIntegration) {
++    stdout.write("Bigger Context metadata changed; refresh the external Router model catalog and restart Codex once.\n");
++  } else if (result.codexRestartRequired) {
++    stdout.write("Restart the Codex app once so its native model catalog refreshes through the installed route.\n");
++  } else {
++    stdout.write("Codex routing remains externally managed; no Codex route or feature was changed.\n");
++  }
+ }
+ 
+ async function doctorCommand(args: string[]): Promise<void> {
+@@ -240,6 +259,14 @@ async function doctorCommand(args: string[]): Promise<void> {
+ async function routeCommand(args: string[]): Promise<void> {
+   const action = args.shift() ?? "status";
+   assertNoArgs(args);
++  const config = existsSync(getConfigPath()) ? loadConfig() : undefined;
++  if (config?.codexIntegration === "external") {
++    if (action !== "status") {
++      throw new Error("Codex routing is externally managed; connect and disconnect are disabled");
++    }
++    stdout.write(`${JSON.stringify({ installed: false, active: false, external: true, errors: [] }, null, 2)}\n`);
++    return;
++  }
+   const result = action === "status"
+     ? (() => {
+         const status = inspectCodexIntegration();
+@@ -267,6 +294,15 @@ async function subagentsCommand(args: string[]): Promise<void> {
+     throw new Error("The isolated DEV harness has no Codex subagent protocol to configure");
+   }
+   if (action === "status") {
++    if (config.codexIntegration === "external") {
++      stdout.write(`${JSON.stringify({
++        protocol: config.subagentProtocol,
++        installed: false,
++        active: false,
++        external: true,
++      }, null, 2)}\n`);
++      return;
++    }
+     const integration = inspectCodexIntegration();
+     stdout.write(`${JSON.stringify({
+       protocol: readCodexSubagentProtocol(config.subagentProtocol),
+@@ -278,6 +314,17 @@ async function subagentsCommand(args: string[]): Promise<void> {
+   if (action !== "compatibility-v1" && action !== "native") {
+     throw new Error("Subagent protocol must be one of: status, compatibility-v1, native");
+   }
++  if (config.codexIntegration === "external") {
++    if (action !== "native") throw new Error("external Router mode requires native subagents");
++    // external 只保存 WebGPT 对 native helper wire 的选择，绝不改写 Codex/Router features。
++    saveConfig({ ...config, subagentProtocol: "native" });
++    stdout.write(`${JSON.stringify({
++      protocol: "native",
++      codexRestartRequired: false,
++      launcherRestartRequired: true,
++    }, null, 2)}\n`);
++    return;
++  }
+   const journal = setCodexSubagentProtocol(config, action);
+   stdout.write(`${JSON.stringify({
+     protocol: journal.installed.subagent_protocol,
+@@ -356,12 +403,16 @@ async function uninstallCommand(args: string[]): Promise<void> {
+   const yes = takeFlag(args, "--yes");
+   const keepData = takeFlag(args, "--keep-data");
+   const launcherControl = takeFlag(args, "--launcher-control");
++  const noCodexRoute = takeFlag(args, "--no-codex-route");
+   assertNoArgs(args);
+   if (launcherControl) authorizeLauncherControl("uninstall");
+   if (!yes && !await confirm("Restore Codex config, stop services, and remove this installation?")) {
+     throw new Error("Uninstall cancelled");
+   }
+   const config = existsSync(getConfigPath()) ? loadConfig() : undefined;
++  if (noCodexRoute && config?.codexIntegration !== "external") {
++    throw new Error("--no-codex-route uninstall requires a verified external integration configuration");
++  }
+   if (config?.browserHost === "launcher" && !launcherControl) {
+     throw new Error(
+       "Launcher-owned integration must be removed from Codex Web GPT Settings so the active runtime can be drained safely.",
+@@ -377,7 +428,8 @@ async function uninstallCommand(args: string[]): Promise<void> {
+     stopTunnel(config);
+   }
+   if (config && process.platform === "darwin" && !launcherRuntimeStopped) await uninstallService(config);
+-  uninstallCodexIntegration();
++  // external 配置只归 WebGPT 所有；卸载不得读取、恢复或删除 Router/Codex route journal。
++  if (!noCodexRoute && config?.codexIntegration !== "external") uninstallCodexIntegration();
+   if (!keepData) rmSync(getConfigDir(), { recursive: true, force: true });
+   stdout.write(keepData ? "Uninstalled; private application data was preserved.\n" : "Uninstalled and removed private application data.\n");
+ }
+diff --git a/src/config.ts b/src/config.ts
+index b9485e0..fd786c2 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -9,6 +9,7 @@ import { VERSION } from "./version";
+ export type RuntimeMode = "browser-only" | "full";
+ export type BrowserHostMode = "managed-chrome" | "launcher";
+ export type SubagentProtocol = "compatibility-v1" | "native";
++export type CodexIntegrationMode = "managed" | "external";
+ 
+ /**
+  * ChatGPT caches a connector's public MCP contract by connector identity. The direct turn-token
+@@ -66,6 +67,7 @@ export interface AppConfig {
+   purpose?: "dev-harness";
+   releaseVersion: string;
+   mode: RuntimeMode;
++  codexIntegration: CodexIntegrationMode;
+   subagentProtocol: SubagentProtocol;
+   host: "127.0.0.1";
+   port: number;
+@@ -168,6 +170,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
+     version: 3,
+     releaseVersion: VERSION,
+     mode,
++    codexIntegration: "managed",
+     subagentProtocol: "compatibility-v1",
+     host: "127.0.0.1",
+     port: 17841,
+@@ -333,6 +336,11 @@ function parseConfig(value: unknown, path: string): AppConfig {
+   }
+   if (typeof parsed.releaseVersion !== "string" || !parsed.releaseVersion.trim()) throw new Error(`Missing releaseVersion in ${path}`);
+   if (parsed.mode !== "browser-only" && parsed.mode !== "full") throw new Error(`Invalid runtime mode in ${path}`);
++  // 旧配置继续按 managed 解释；只有显式 external 才能把 Codex 路由所有权交给 Router。
++  const codexIntegration = parsed.codexIntegration ?? "managed";
++  if (codexIntegration !== "managed" && codexIntegration !== "external") {
++    throw new Error(`Invalid codexIntegration in ${path}`);
++  }
+   const subagentProtocol = parsed.subagentProtocol ?? "compatibility-v1";
+   if (subagentProtocol !== "compatibility-v1" && subagentProtocol !== "native") {
+     throw new Error(`Invalid subagentProtocol in ${path}`);
+@@ -417,6 +425,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
+   }
+   return {
+     ...parsed,
++    codexIntegration,
+     subagentProtocol,
+     solAvailable,
+     proAvailable,
+diff --git a/src/dev-chat/profile.ts b/src/dev-chat/profile.ts
+index b0b4408..ecf8a05 100644
+--- a/src/dev-chat/profile.ts
++++ b/src/dev-chat/profile.ts
+@@ -133,7 +133,10 @@ export function installedLauncherCandidates({
+     );
+   } else if (platform === "win32") {
+     const registeredLocation = windowsInstallLocation?.trim()
+-      || (process.platform === "win32" ? registeredWindowsLauncherInstallLocation() : undefined);
++      // 注入 environment 时该对象就是完整发现边界，不能再混入真实宿主机的注册表位置。
++      || (process.platform === "win32" && environment === process.env
++        ? registeredWindowsLauncherInstallLocation()
++        : undefined);
+     if (registeredLocation && win32.isAbsolute(registeredLocation)) {
+       candidates.push(win32.join(registeredLocation, "Codex Web GPT.exe"));
+     } else {
+diff --git a/src/setup.ts b/src/setup.ts
+index 2a0e49c..8a5e69b 100644
+--- a/src/setup.ts
++++ b/src/setup.ts
+@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
+ import { randomBytes } from "node:crypto";
+ import { createServer } from "node:net";
+ import { join } from "node:path";
+-import type { AppConfig, RuntimeMode, SubagentProtocol } from "./config";
++import type { AppConfig, CodexIntegrationMode, RuntimeMode, SubagentProtocol } from "./config";
+ import {
+   currentRuntimeCommand,
+   defaultBrokerEndpoint,
+@@ -44,6 +44,7 @@ import { VERSION } from "./version";
+ 
+ export interface SetupOptions {
+   mode: RuntimeMode;
++  codexIntegration?: CodexIntegrationMode;
+   subagentProtocol?: SubagentProtocol;
+   port?: number;
+   chromeExecutablePath?: string;
+@@ -67,7 +68,7 @@ export interface SetupResult {
+   loginCreated: boolean;
+   serviceLoaded: boolean;
+   tunnelReady: boolean | null;
+-  codexRestartRequired: true;
++  codexRestartRequired: boolean;
+   connectorSetupRequired: boolean;
+ }
+ 
+@@ -109,6 +110,7 @@ function loadExistingConfig(): AppConfig | undefined {
+ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
+   return JSON.stringify({
+     mode: before.mode,
++    codexIntegration: before.codexIntegration,
+     subagentProtocol: before.subagentProtocol,
+     releaseVersion: before.releaseVersion,
+     host: before.host,
+@@ -130,6 +132,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
+     tunnel: before.tunnel,
+   }) !== JSON.stringify({
+     mode: after.mode,
++    codexIntegration: after.codexIntegration,
+     subagentProtocol: after.subagentProtocol,
+     releaseVersion: after.releaseVersion,
+     host: after.host,
+@@ -209,6 +212,7 @@ async function waitForProxy(config: AppConfig, timeoutMs = 10_000): Promise<void
+ function baseConfig(existing: AppConfig | undefined, options: SetupOptions): AppConfig {
+   const config = existing ? structuredClone(existing) : defaultConfig(options.mode);
+   config.mode = options.mode;
++  if (options.codexIntegration) config.codexIntegration = options.codexIntegration;
+   if (options.subagentProtocol) config.subagentProtocol = options.subagentProtocol;
+   config.releaseVersion = VERSION;
+   config.runtimeCommand = currentRuntimeCommand();
+@@ -311,12 +315,31 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
+   if (existing?.purpose === DEV_CONFIG_PURPOSE) {
+     throw new Error("A DEV harness configuration cannot be installed into Codex");
+   }
++  if (existing
++    && options.codexIntegration === "external"
++    && existing.codexIntegration !== "external") {
++    throw new Error(
++      "Refusing to convert a managed Codex route in place. Remove the previous managed integration"
++      + " before installing external Router mode.",
++    );
++  }
++  const codexIntegration = options.codexIntegration ?? existing?.codexIntegration ?? "managed";
++  if (codexIntegration === "external" && options.replaceCodexRoute) {
++    throw new Error("external Router mode cannot replace the Codex route");
++  }
+   const config = baseConfig(existing, {
+     ...options,
++    codexIntegration,
+     subagentProtocol: options.subagentProtocol
+-      ?? readCodexSubagentProtocol(existing?.subagentProtocol ?? "compatibility-v1"),
++      ?? (codexIntegration === "external"
++        ? existing?.subagentProtocol ?? "native"
++        : readCodexSubagentProtocol(existing?.subagentProtocol ?? "compatibility-v1")),
+   });
+   delete config.purpose;
++  // Router 生产链路只发布 native helper wire；失败关闭可避免兼容层反向改写 Codex features。
++  if (config.codexIntegration === "external" && config.subagentProtocol !== "native") {
++    throw new Error("external Router mode requires --subagent-protocol native");
++  }
+   const launcherOwned = config.browserHost === "launcher";
+   if (!launcherOwned && process.platform !== "darwin") {
+     throw new Error(
+@@ -324,9 +347,11 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
+       + "Use the Codex Web GPT launcher on Windows or Linux.",
+     );
+   }
+-  preflightCodexIntegration(config, {
+-    replaceExistingRoute: options.replaceCodexRoute,
+-  });
++  if (config.codexIntegration === "managed") {
++    preflightCodexIntegration(config, {
++      replaceExistingRoute: options.replaceCodexRoute,
++    });
++  }
+   const refreshTunnelWorker = tunnelWorkerRuntimeChanged(existing, config);
+   if (existing && options.restartService) config.controlToken = randomBytes(32).toString("base64url");
+   const beforeService = getServiceStatus();
+@@ -456,9 +481,15 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
+     launcherOwned && existing && existing.browserHost !== "launcher",
+   );
+   if (!migratingTerminalRuntime) removeLegacyRuntimeArtifacts(config);
+-  installCodexIntegration(config, {
+-    replaceExistingRoute: options.replaceCodexRoute,
+-  });
++  if (config.codexIntegration === "managed") {
++    installCodexIntegration(config, {
++      replaceExistingRoute: options.replaceCodexRoute,
++    });
++  }
++
++  const externalCatalogRefreshRequired = config.codexIntegration === "external"
++    && options.experimentalBiggerContext !== undefined
++    && config.experimentalBiggerContext !== (existing?.experimentalBiggerContext === true);
+ 
+   return {
+     mode: config.mode,
+@@ -466,7 +497,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
+     loginCreated,
+     serviceLoaded: launcherOwned ? false : getServiceStatus().loaded,
+     tunnelReady,
+-    codexRestartRequired: true,
++    codexRestartRequired: config.codexIntegration === "managed" || externalCatalogRefreshRequired,
+     connectorSetupRequired: config.mode === "full",
+   };
+ }
+diff --git a/tests/external-integration.test.ts b/tests/external-integration.test.ts
+new file mode 100644
+index 0000000..116bad7
+--- /dev/null
++++ b/tests/external-integration.test.ts
+@@ -0,0 +1,240 @@
++import { expect, test } from "bun:test";
++import { createServer } from "node:http";
++import {
++  existsSync,
++  mkdirSync,
++  mkdtempSync,
++  readFileSync,
++  rmSync,
++  statSync,
++  writeFileSync,
++} from "node:fs";
++import { tmpdir } from "node:os";
++import { join, resolve } from "node:path";
++
++async function runCli(args: string[], env: Record<string, string | undefined>) {
++  const child = Bun.spawn([process.execPath, resolve(import.meta.dir, "../src/cli.ts"), ...args], {
++    env,
++    stdout: "pipe",
++    stderr: "pipe",
++  });
++  const [exitCode, stdout, stderr] = await Promise.all([
++    child.exited,
++    new Response(child.stdout).text(),
++    new Response(child.stderr).text(),
++  ]);
++  return { exitCode, stdout, stderr };
++}
++
++async function availableLoopbackPort(): Promise<number> {
++  const probe = createServer();
++  await new Promise<void>((resolveListen, rejectListen) => {
++    probe.once("error", rejectListen);
++    probe.listen(0, "127.0.0.1", resolveListen);
++  });
++  const address = probe.address();
++  if (!address || typeof address === "string") throw new Error("port probe has no port");
++  await new Promise<void>((resolveClose, rejectClose) => {
++    probe.close(error => error ? rejectClose(error) : resolveClose());
++  });
++  return address.port;
++}
++
++test("external setup, catalog refresh, Bigger Context, and uninstall preserve Codex Router ownership", async () => {
++  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-external-"));
++  const appHome = join(root, "app");
++  const codexHome = join(root, "codex");
++  const routerHome = join(root, "router");
++  const descriptorPath = join(appHome, "runtime", "launcher-browser.json");
++  const helperScript = join(root, "helper.cjs");
++  const controlToken = "external-launcher-control-token-0123456789abcdefghijkl";
++  const codexConfig = "model = \"preserve-me\"\nopenai_base_url = \"http://127.0.0.1:4202/router\"\n";
++  const routerFiles = new Map([
++    [join(routerHome, "model-picker.json"), "{\"models\":[\"preserve-me\"]}\n"],
++    [join(routerHome, "enabled-providers.json"), "{\"providers\":[\"existing\"]}\n"],
++    [join(routerHome, "user-models.json"), "{\"favorites\":[\"preserve-me\"]}\n"],
++  ]);
++  let inspections = 0;
++  const control = createServer(async (request, response) => {
++    const chunks: Buffer[] = [];
++    for await (const chunk of request) chunks.push(Buffer.from(chunk));
++    expect(request.url).toBe("/v1/session/inspect");
++    expect(request.headers.authorization).toBe(`Bearer ${controlToken}`);
++    inspections += 1;
++    expect(JSON.parse(Buffer.concat(chunks).toString("utf8"))).toEqual({
++      detectCapabilities: inspections !== 2,
++    });
++    response.writeHead(200, { "content-type": "application/json" });
++    response.end(JSON.stringify({
++      authenticated: true,
++      temporary: true,
++      solAvailable: true,
++      proAvailable: true,
++      url: "https://chatgpt.com/?temporary-chat=true",
++    }));
++  });
++  await new Promise<void>((resolveListen, rejectListen) => {
++    control.once("error", rejectListen);
++    control.listen(0, "127.0.0.1", resolveListen);
++  });
++
++  try {
++    // 使用独立端口和文件树验证字节级所有权边界，避免接触当前运行中的 Router/Codex。
++    const responsesPort = await availableLoopbackPort();
++    const address = control.address();
++    if (!address || typeof address === "string") throw new Error("control server has no port");
++    mkdirSync(join(appHome, "runtime"), { recursive: true });
++    mkdirSync(codexHome, { recursive: true });
++    mkdirSync(routerHome, { recursive: true });
++    writeFileSync(helperScript, "module.exports = {};\n", { mode: 0o700 });
++    writeFileSync(join(codexHome, "config.toml"), codexConfig);
++    for (const [filePath, contents] of routerFiles) writeFileSync(filePath, contents);
++    const protectedFiles = new Map([
++      [join(codexHome, "config.toml"), codexConfig],
++      ...routerFiles,
++    ]);
++    const protectedMtimes = new Map(
++      [...protectedFiles.keys()].map(filePath => [filePath, statSync(filePath).mtimeMs]),
++    );
++    writeFileSync(descriptorPath, `${JSON.stringify({
++      version: 2,
++      kind: "codex-web-gpt-launcher",
++      profile: "production",
++      pid: process.pid,
++      endpoint: "http://127.0.0.1:48121",
++      control: { endpoint: `http://127.0.0.1:${address.port}`, token: controlToken },
++      helper: { executable: process.execPath, script: helperScript },
++      partition: "persist:codex-web-gpt-chatgpt",
++      idleUrl: "about:blank#codex-web-gpt-browser-host",
++      surfaceId: "e".repeat(32),
++      createdAt: new Date().toISOString(),
++    })}\n`, { mode: 0o600 });
++
++    const environment = {
++      ...process.env,
++      CODEX_HOME: codexHome,
++      CODEX_CHATGPT_WEB_HOME: appHome,
++      CODEX_ROUTER_HOME: routerHome,
++    };
++    const setup = await runCli([
++      "setup",
++      "--browser-only",
++      "--browser-host-descriptor",
++      descriptorPath,
++      "--port",
++      String(responsesPort),
++      "--no-codex-route",
++      "--subagent-protocol",
++      "native",
++      "--acknowledge-unofficial",
++    ], environment);
++    expect({ exitCode: setup.exitCode, stderr: setup.stderr }).toEqual({ exitCode: 0, stderr: "" });
++    expect(setup.stdout).toContain("Codex routing remains externally managed");
++    expect(setup.stdout).not.toContain("installed route");
++    expect(JSON.parse(readFileSync(join(appHome, "config.json"), "utf8"))).toMatchObject({
++      codexIntegration: "external",
++      subagentProtocol: "native",
++      browserHost: "launcher",
++    });
++    expect(existsSync(join(appHome, "codex", "integration-journal.json"))).toBe(false);
++
++    const biggerContext = await runCli([
++      "setup",
++      "--browser-only",
++      "--browser-host-descriptor",
++      descriptorPath,
++      "--port",
++      String(responsesPort),
++      "--no-codex-route",
++      "--subagent-protocol",
++      "native",
++      "--bigger-context",
++      "--acknowledge-unofficial",
++    ], environment);
++    expect({ exitCode: biggerContext.exitCode, stderr: biggerContext.stderr }).toEqual({ exitCode: 0, stderr: "" });
++    expect(biggerContext.stdout).toContain("refresh the external Router model catalog and restart Codex once");
++    expect(biggerContext.stdout).not.toContain("installed route");
++
++    const refresh = await runCli([
++      "setup",
++      "--browser-only",
++      "--browser-host-descriptor",
++      descriptorPath,
++      "--port",
++      String(responsesPort),
++      "--no-codex-route",
++      "--subagent-protocol",
++      "native",
++      "--refresh-account-capabilities",
++      "--acknowledge-unofficial",
++    ], environment);
++    expect({ exitCode: refresh.exitCode, stderr: refresh.stderr }).toEqual({ exitCode: 0, stderr: "" });
++    expect(refresh.stdout).toContain("Codex routing remains externally managed");
++    expect(refresh.stdout).not.toContain("installed route");
++
++    const route = await runCli(["route", "status"], environment);
++    expect(JSON.parse(route.stdout)).toEqual({ installed: false, active: false, external: true, errors: [] });
++    for (const action of ["connect", "disconnect"]) {
++      const blocked = await runCli(["route", action], environment);
++      expect(blocked.exitCode).toBe(1);
++      expect(blocked.stderr).toContain("Codex routing is externally managed");
++    }
++
++    const replace = await runCli([
++      "setup",
++      "--browser-only",
++      "--browser-host-descriptor",
++      descriptorPath,
++      "--replace-codex-route",
++      "--acknowledge-unofficial",
++    ], environment);
++    expect(replace.exitCode).toBe(1);
++    expect(replace.stderr).toContain("external Router mode cannot replace the Codex route");
++
++    const uninstall = await runCli([
++      "uninstall",
++      "--yes",
++      "--launcher-control",
++      "--no-codex-route",
++    ], {
++      ...environment,
++      CODEX_CHATGPT_WEB_BROWSER_HOST_DESCRIPTOR: descriptorPath,
++      CODEX_WEB_GPT_LAUNCHER_CONTROL_TOKEN: controlToken,
++    });
++    expect({ exitCode: uninstall.exitCode, stderr: uninstall.stderr }).toEqual({ exitCode: 0, stderr: "" });
++    expect(existsSync(appHome)).toBe(false);
++    expect(inspections).toBe(3);
++    for (const [filePath, contents] of protectedFiles) {
++      expect(readFileSync(filePath, "utf8")).toBe(contents);
++      expect(statSync(filePath).mtimeMs).toBe(protectedMtimes.get(filePath)!);
++    }
++  } finally {
++    await new Promise<void>(resolveClose => control.close(() => resolveClose()));
++    rmSync(root, { recursive: true, force: true });
++  }
++}, 20_000);
++
++test("external setup fails before writing state when native subagents are not selected", async () => {
++  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-external-protocol-"));
++  try {
++    const result = await runCli([
++      "setup",
++      "--browser-only",
++      "--browser-host-descriptor",
++      join(root, "missing-launcher.json"),
++      "--no-codex-route",
++      "--subagent-protocol",
++      "compatibility-v1",
++      "--acknowledge-unofficial",
++    ], {
++      ...process.env,
++      CODEX_HOME: join(root, "codex"),
++      CODEX_CHATGPT_WEB_HOME: join(root, "app"),
++    });
++    expect(result.exitCode).toBe(1);
++    expect(result.stderr).toContain("external Router mode requires --subagent-protocol native");
++    expect(existsSync(join(root, "app", "config.json"))).toBe(false);
++  } finally {
++    rmSync(root, { recursive: true, force: true });
++  }
++});
+-- 
+2.55.0.windows.2
+

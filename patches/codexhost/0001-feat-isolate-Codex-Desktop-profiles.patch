@@ -1,0 +1,547 @@
+From 7ebf4bf890bee97ca7f8f307a72cec92fbde7bb8 Mon Sep 17 00:00:00 2001
+From: wangwang <1280424159@qq.com>
+Date: Sun, 30 Aug 2026 01:21:57 +0800
+Subject: [PATCH] feat: isolate Codex Desktop profiles
+
+
+diff --git a/crates/launcher/src/main.rs b/crates/launcher/src/main.rs
+index 9fc2c11..d1bbca1 100644
+--- a/crates/launcher/src/main.rs
++++ b/crates/launcher/src/main.rs
+@@ -60,6 +60,7 @@ use system_proxy_environment::launcher_proxy_environment;
+ const HOST_NODE_PATH_ENV: &str = "CODEXHOST_HOST_NODE_PATH";
+ const HOST_RUNTIME_PATH_ENV: &str = "CODEXHOST_HOST_RUNTIME_PATH";
+ const DATA_DIRECTORY_ENV: &str = "CODEXHOST_DATA_DIR";
++const CODEX_PROFILE_ENV: &str = "CODEXHOST_CODEX_PROFILE";
+ const REMOTE_SSH_MANAGED_ENV: &str = "CODEXHOST_REMOTE_SSH_MANAGED";
+ const PI_COMMAND_ENV: &str = "CODEXHOST_PI_COMMAND";
+ const DEFAULT_AGENT_ENV: &str = "CODEXHOST_DEFAULT_AGENT";
+@@ -112,7 +113,7 @@ impl Error for UnmanagedDesktopConflict {}
+ 
+ fn usage() {
+     eprintln!(
+-        "usage:\n  codexhost\n  codexhost inspect [--custom-install <absolute-directory>]\n  codexhost launch [--shim <absolute-file>] [--node <absolute-file>] [--host-runtime <absolute-file>] [--desktop-controller <absolute-file>] [--renderer <absolute-file>] [--pi <absolute-file>] [--custom-install <absolute-directory>]"
++        "usage:\n  codexhost\n  codexhost inspect [--custom-install <absolute-directory>]\n  codexhost launch [--shim <absolute-file>] [--node <absolute-file>] [--host-runtime <absolute-file>] [--desktop-controller <absolute-file>] [--renderer <absolute-file>] [--pi <absolute-file>] [--custom-install <absolute-directory>] [--desktop-user-data-dir <absolute-existing-directory>]"
+     );
+ }
+ 
+@@ -231,6 +232,7 @@ struct LaunchOptions {
+     renderer_extension: Option<PathBuf>,
+     pi: Option<PathBuf>,
+     custom_install_root: Option<PathBuf>,
++    desktop_user_data_dir: Option<PathBuf>,
+ }
+ 
+ #[derive(Debug)]
+@@ -242,6 +244,7 @@ struct ResolvedLaunchOptions {
+     renderer_extension: PathBuf,
+     pi: Option<PathBuf>,
+     custom_install_root: Option<PathBuf>,
++    desktop_user_data_dir: Option<PathBuf>,
+ }
+ 
+ fn required_path(arguments: &[String], index: &mut usize, option: &str) -> Result<PathBuf, String> {
+@@ -260,6 +263,7 @@ fn parse_launch_options(arguments: &[String]) -> Result<LaunchOptions, String> {
+     let mut renderer_extension = None;
+     let mut pi = None;
+     let mut custom_install_root = None;
++    let mut desktop_user_data_dir = None;
+     let mut index = 0;
+     while index < arguments.len() {
+         match arguments[index].as_str() {
+@@ -283,6 +287,13 @@ fn parse_launch_options(arguments: &[String]) -> Result<LaunchOptions, String> {
+                 custom_install_root =
+                     Some(required_path(arguments, &mut index, "--custom-install")?)
+             }
++            "--desktop-user-data-dir" => {
++                desktop_user_data_dir = Some(required_path(
++                    arguments,
++                    &mut index,
++                    "--desktop-user-data-dir",
++                )?)
++            }
+             unknown => return Err(format!("unknown launch option: {unknown}")),
+         }
+         index += 1;
+@@ -295,6 +306,7 @@ fn parse_launch_options(arguments: &[String]) -> Result<LaunchOptions, String> {
+         renderer_extension,
+         pi,
+         custom_install_root,
++        desktop_user_data_dir,
+     })
+ }
+ 
+@@ -382,10 +394,30 @@ impl LaunchOptions {
+                 .custom_install_root
+                 .map(|path| absolute_directory(&path, "--custom-install"))
+                 .transpose()?,
++            desktop_user_data_dir: self
++                .desktop_user_data_dir
++                .map(|path| absolute_directory(&path, "--desktop-user-data-dir"))
++                .transpose()?,
+         })
+     }
+ }
+ 
++/// Build the ephemeral Electron arguments owned by this Launcher invocation.
++fn desktop_arguments(options: &ResolvedLaunchOptions, control: &RuntimeControl) -> Vec<OsString> {
++    let mut arguments = vec![control.inspector_argument.clone()];
++    if let Some(directory) = &options.desktop_user_data_dir {
++        // 使用单个 `--user-data-dir=` 参数，避免 Windows 路径中的空格被二次拆分。
++        let mut argument = OsString::from("--user-data-dir=");
++        argument.push(directory.as_os_str());
++        arguments.push(argument);
++    }
++    arguments
++}
++
++fn external_desktop_restart_allowed(custom_install_root: Option<&Path>) -> bool {
++    custom_install_root.is_none()
++}
++
+ fn desktop_controller_command(
+     options: &ResolvedLaunchOptions,
+     control: &RuntimeControl,
+@@ -775,6 +807,7 @@ fn desktop_environment(
+     launcher_executable: &Path,
+     descriptor_path: &Path,
+     data_directory: Option<OsString>,
++    codex_profile: Option<OsString>,
+ ) -> Vec<(OsString, OsString)> {
+     let mut environment = vec![
+         (
+@@ -816,6 +849,9 @@ fn desktop_environment(
+     if let Some(data_directory) = data_directory {
+         environment.push((OsString::from(DATA_DIRECTORY_ENV), data_directory));
+     }
++    if let Some(profile) = codex_profile {
++        environment.push((OsString::from(CODEX_PROFILE_ENV), profile));
++    }
+     if env::var_os(STARTUP_TRACE_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+         environment.push((OsString::from(STARTUP_TRACE_ENV), OsString::from("1")));
+     }
+@@ -941,6 +977,11 @@ fn launch(
+                 }
+                 #[cfg(target_os = "windows")]
+                 {
++                    // 自定义安装可能属于另一套 Codex Profile；没有本 Launcher 的 live
++                    // descriptor 时绝不终止它，避免误伤并行运行的 Desktop。
++                    if !external_desktop_restart_allowed(options.custom_install_root.as_deref()) {
++                        return Err(Box::new(UnmanagedDesktopConflict));
++                    }
+                     if _interactive_running_desktop {
+                         match prompt_running_desktop() {
+                             RunningDesktopChoice::Restart => {
+@@ -954,7 +995,7 @@ fn launch(
+                             RunningDesktopChoice::Cancel => return Ok(()),
+                         }
+                     }
+-                    // A Desktop is running without a live codexhost owner (an official
++                    // A stock Desktop is running without a live codexhost owner (an official
+                     // instance or a controlled instance whose Launcher exited). Drop the
+                     // stale runtime descriptor, force-stop the Desktop, and relaunch.
+                     if let Some(descriptor) = &descriptor {
+@@ -985,6 +1026,7 @@ fn launch(
+                 env::var_os(DATA_DIRECTORY_ENV),
+                 env::var_os(REMOTE_SSH_MANAGED_ENV),
+             ),
++            env::var_os(CODEX_PROFILE_ENV),
+         );
+         #[cfg(target_os = "macos")]
+         let environment = {
+@@ -992,10 +1034,11 @@ fn launch(
+             environment.extend(launcher_proxy_environment());
+             environment
+         };
++        let desktop_arguments = desktop_arguments(&options, &control);
+         let result = supervise_desktop(
+             &installation,
+             &options,
+-            std::slice::from_ref(&control.inspector_argument),
++            &desktop_arguments,
+             &environment,
+             &control,
+             &descriptor_path,
+@@ -1082,11 +1125,13 @@ fn launch(
+             env::var_os(DATA_DIRECTORY_ENV),
+             env::var_os(REMOTE_SSH_MANAGED_ENV),
+         ),
++        env::var_os(CODEX_PROFILE_ENV),
+     );
++    let desktop_arguments = desktop_arguments(&options, &control);
+     supervise_desktop(
+         &installation,
+         &options,
+-        std::slice::from_ref(&control.inspector_argument),
++        &desktop_arguments,
+         &environment,
+         &control,
+         &descriptor_path,
+@@ -1102,6 +1147,7 @@ fn default_launch_options() -> LaunchOptions {
+         renderer_extension: None,
+         pi: None,
+         custom_install_root: None,
++        desktop_user_data_dir: None,
+     }
+ }
+ 
+@@ -1316,6 +1362,30 @@ mod tests {
+         assert_eq!(parse_inspect_options(&[]).expect("bare inspect"), None);
+     }
+ 
++    #[test]
++    fn desktop_user_data_directory_is_forwarded_as_one_electron_argument() {
++        let directory = std::env::temp_dir();
++        let parsed = parse_launch_options(&[
++            "--desktop-user-data-dir".into(),
++            directory.to_string_lossy().into_owned(),
++        ])
++        .expect("launch accepts a Desktop user-data directory");
++
++        assert_eq!(
++            parsed.desktop_user_data_dir.as_deref(),
++            Some(directory.as_path())
++        );
++        let options = ResolvedLaunchOptions {
++            desktop_user_data_dir: Some(directory.clone()),
++            ..resolved_options()
++        };
++        let arguments = desktop_arguments(&options, &runtime_control());
++        assert_eq!(arguments[0], "--inspect=127.0.0.1:43123");
++        let mut expected = OsString::from("--user-data-dir=");
++        expected.push(directory.as_os_str());
++        assert_eq!(arguments[1], expected);
++    }
++
+     #[test]
+     fn removed_agent_option_is_rejected() {
+         assert!(parse_launch_options(&["--agent".into(), "pi".into()]).is_err());
+@@ -1324,6 +1394,7 @@ mod tests {
+     #[test]
+     fn custom_install_root_rejects_missing_values_and_unknown_options() {
+         assert!(parse_launch_options(&["--custom-install".into()]).is_err());
++        assert!(parse_launch_options(&["--desktop-user-data-dir".into()]).is_err());
+         assert!(parse_inspect_options(&["--custom-install".into()]).is_err());
+         assert!(parse_inspect_options(&["--unknown".into()]).is_err());
+     }
+@@ -1341,6 +1412,14 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn unmanaged_custom_install_is_never_eligible_for_forced_restart() {
++        assert!(!external_desktop_restart_allowed(Some(Path::new(
++            "/opt/CodexPortable"
++        ))));
++        assert!(external_desktop_restart_allowed(None));
++    }
++
+     fn resolved_options() -> ResolvedLaunchOptions {
+         ResolvedLaunchOptions {
+             shim: PathBuf::from("/opt/codexhost-shim"),
+@@ -1350,6 +1429,7 @@ mod tests {
+             renderer_extension: PathBuf::from("/opt/renderer-extension.js"),
+             pi: None,
+             custom_install_root: None,
++            desktop_user_data_dir: None,
+         }
+     }
+ 
+@@ -1412,6 +1492,7 @@ mod tests {
+             Path::new("/opt/codexhost"),
+             Path::new("/run/user/1000/codexhost/desktop-runtime-v1.json"),
+             None,
++            None,
+         );
+         let value = |name: &str| {
+             environment
+@@ -1499,6 +1580,7 @@ mod tests {
+             Path::new("/opt/codexhost"),
+             Path::new("/run/user/1000/codexhost/desktop-runtime-v1.json"),
+             Some(OsString::from("/home/codex/.codexhost")),
++            None,
+         );
+ 
+         assert!(environment.contains(&(
+@@ -1507,6 +1589,23 @@ mod tests {
+         )));
+     }
+ 
++    #[test]
++    fn desktop_environment_propagates_the_codex_profile_to_the_shim() {
++        let environment = desktop_environment(
++            &resolved_options(),
++            &runtime_control(),
++            Path::new("/opt/codexhost"),
++            Path::new("/run/user/1000/codexhost/desktop-runtime-v1.json"),
++            None,
++            Some(OsString::from("everyone-in-codex")),
++        );
++
++        assert!(environment.contains(&(
++            OsString::from("CODEXHOST_CODEX_PROFILE"),
++            OsString::from("everyone-in-codex"),
++        )));
++    }
++
+     #[test]
+     fn managed_desktop_data_directory_rejects_a_remote_profile_value() {
+         let remote_data = Some(OsString::from("/home/codex/.codexhost/remote/data"));
+@@ -1646,6 +1745,7 @@ mod tests {
+                 Path::new(r"C:\codexhost.exe"),
+                 Path::new(r"C:\Users\Codex\AppData\Local\codexhost\desktop-runtime-v1.json"),
+                 None,
++                None,
+             )
+             .into_iter()
+             .find(|(name, _)| name == PI_COMMAND_ENV)
+diff --git a/crates/launcher/src/runtime_instance.rs b/crates/launcher/src/runtime_instance.rs
+index cdfa045..f885576 100644
+--- a/crates/launcher/src/runtime_instance.rs
++++ b/crates/launcher/src/runtime_instance.rs
+@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
+ const RUNTIME_DESCRIPTOR_VERSION: u8 = 1;
+ const RUNTIME_DESCRIPTOR_FILE: &str = "desktop-runtime-v1.json";
+ const LAUNCHER_GUARD_FILE: &str = "launcher-v1.lock";
++#[cfg(target_os = "windows")]
++const DATA_DIRECTORY_ENV: &str = "CODEXHOST_DATA_DIR";
+ #[cfg(target_os = "linux")]
+ const MAX_RUNTIME_DESCRIPTOR_BYTES: usize = 4 * 1024;
+ 
+@@ -116,11 +118,35 @@ pub fn default_descriptor_path() -> io::Result<PathBuf> {
+ }
+ 
+ #[cfg(target_os = "windows")]
+-pub fn default_descriptor_path() -> io::Result<PathBuf> {
+-    let root = env::var_os("LOCALAPPDATA")
++fn windows_state_directory(
++    data_directory: Option<std::ffi::OsString>,
++    local_app_data: Option<std::ffi::OsString>,
++) -> io::Result<PathBuf> {
++    if let Some(data_directory) = data_directory {
++        let path = PathBuf::from(data_directory);
++        if !path.is_absolute() {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "CODEXHOST_DATA_DIR must be an absolute path",
++            ));
++        }
++        return Ok(path);
++    }
++
++    local_app_data
+         .map(PathBuf::from)
+-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable"))?;
+-    Ok(root.join("codexhost").join(RUNTIME_DESCRIPTOR_FILE))
++        .map(|root| root.join("codexhost"))
++        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is unavailable"))
++}
++
++#[cfg(target_os = "windows")]
++pub fn default_descriptor_path() -> io::Result<PathBuf> {
++    // descriptor、Launcher guard 和 update state 都从此入口派生；优先采用
++    // Profile 专属目录可避免两套 Codex Desktop 竞争同一份运行状态。
++    Ok(
++        windows_state_directory(env::var_os(DATA_DIRECTORY_ENV), env::var_os("LOCALAPPDATA"))?
++            .join(RUNTIME_DESCRIPTOR_FILE),
++    )
+ }
+ 
+ #[cfg(target_os = "macos")]
+@@ -416,6 +442,26 @@ mod tests {
+         fs::remove_dir_all(path.parent().expect("fixture parent")).expect("remove fixture");
+     }
+ 
++    #[cfg(target_os = "windows")]
++    #[test]
++    fn windows_runtime_state_prefers_an_absolute_profile_data_directory() {
++        assert_eq!(
++            windows_state_directory(
++                Some(std::ffi::OsString::from(r"D:\EveryoneCodex\codexhost")),
++                Some(std::ffi::OsString::from(r"C:\Users\Codex\AppData\Local")),
++            )
++            .expect("absolute profile state"),
++            PathBuf::from(r"D:\EveryoneCodex\codexhost")
++        );
++        assert!(
++            windows_state_directory(
++                Some(std::ffi::OsString::from("relative-state")),
++                Some(std::ffi::OsString::from(r"C:\Users\Codex\AppData\Local")),
++            )
++            .is_err()
++        );
++    }
++
+     #[test]
+     fn descriptor_guard_removes_only_its_published_value() {
+         let path = fixture_path("runtime-guard");
+diff --git a/crates/shim/src/lib.rs b/crates/shim/src/lib.rs
+index 3c98a1c..75d12bc 100644
+--- a/crates/shim/src/lib.rs
++++ b/crates/shim/src/lib.rs
+@@ -27,6 +27,7 @@ pub const HOST_NODE_PATH_ENV: &str = "CODEXHOST_HOST_NODE_PATH";
+ pub const HOST_RUNTIME_PATH_ENV: &str = "CODEXHOST_HOST_RUNTIME_PATH";
+ pub const REMOTE_SSH_MANAGED_ENV: &str = "CODEXHOST_REMOTE_SSH_MANAGED";
+ const DATA_DIRECTORY_ENV: &str = "CODEXHOST_DATA_DIR";
++const CODEX_PROFILE_ENV: &str = "CODEXHOST_CODEX_PROFILE";
+ const LAUNCHER_PID_ENV: &str = "CODEXHOST_LAUNCHER_PID";
+ const NPM_NODE_PATH_ENV: &str = "CODEXHOST_NPM_NODE_PATH";
+ const NPM_PACKAGE_ROOT_ENV: &str = "CODEXHOST_NPM_PACKAGE_ROOT";
+@@ -290,6 +291,46 @@ pub fn app_server_subcommand_index(arguments: &[OsString]) -> Option<usize> {
+     None
+ }
+ 
++fn codex_profile_arguments(
++    arguments: &[OsString],
++    profile: Option<OsString>,
++) -> ShimResult<Vec<OsString>> {
++    let Some(profile) = profile else {
++        return Ok(arguments.to_vec());
++    };
++    let profile_text = profile
++        .to_str()
++        .ok_or("CODEXHOST_CODEX_PROFILE must be UTF-8")?;
++    if profile_text.is_empty()
++        || !profile_text
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
++    {
++        return Err("CODEXHOST_CODEX_PROFILE contains unsupported characters".into());
++    }
++    let Some(app_server_index) = app_server_subcommand_index(arguments) else {
++        return Ok(arguments.to_vec());
++    };
++    if arguments[..app_server_index].iter().any(|argument| {
++        argument.to_str().is_some_and(|value| {
++            value == "-p"
++                || value == "--profile"
++                || value.starts_with("--profile=")
++                || value.starts_with("-p=")
++        })
++    }) {
++        return Err("Codex app-server arguments already contain an explicit profile".into());
++    }
++
++    // Profile 必须位于 `app-server` 子命令前，Codex CLI 才会把它识别为全局选项。
++    let mut profiled = arguments.to_vec();
++    profiled.splice(
++        app_server_index..app_server_index,
++        [OsString::from("-p"), profile],
++    );
++    Ok(profiled)
++}
++
+ /// Returns whether this invocation starts an app-server instance owned by the Host Runtime.
+ ///
+ /// App-server management commands such as `proxy` and `daemon` must stay on the stock Codex CLI.
+@@ -564,6 +605,7 @@ fn child_command(
+     current_executable: &Path,
+     stock_codex_path: &Path,
+ ) -> ShimResult<Command> {
++    let arguments = codex_profile_arguments(arguments, env::var_os(CODEX_PROFILE_ENV))?;
+     let launcher_managed = env::var_os(LAUNCHER_PID_ENV).is_some();
+     let inherited_remote_profile = launcher_managed
+         && env::var_os(REMOTE_SSH_MANAGED_ENV).as_deref() == Some(std::ffi::OsStr::new("1"));
+@@ -580,7 +622,7 @@ fn child_command(
+         } else {
+             Vec::new()
+         };
+-    if should_start_host_runtime(arguments) {
++    if should_start_host_runtime(&arguments) {
+         match host_paths {
+             (Some(node_path), Some(runtime_path)) => {
+                 let node_path =
+@@ -589,11 +631,12 @@ fn child_command(
+                 let mut command = Command::new(&node_path);
+                 command
+                     .arg(node_entrypoint_path(&runtime_path))
+-                    .args(arguments)
++                    .args(&arguments)
+                     .env(STOCK_CODEX_PATH_ENV, stock_codex_path)
+                     .env(HOST_NODE_PATH_ENV, &node_path)
+                     .env(HOST_RUNTIME_PATH_ENV, &runtime_path)
+                     .env_remove(CODEX_CLI_PATH_ENV)
++                    .env_remove(CODEX_PROFILE_ENV)
+                     .env_remove(REMOTE_SSH_MANAGED_ENV)
+                     .env_remove(REMOTE_LISTENER_CHILD_ENV);
+                 if inherited_remote_profile {
+@@ -615,10 +658,11 @@ fn child_command(
+ 
+     let mut command = Command::new(stock_codex_path);
+     command
+-        .args(arguments)
++        .args(&arguments)
+         .env_remove(CODEX_CLI_PATH_ENV)
+         .env_remove(HOST_NODE_PATH_ENV)
+         .env_remove(HOST_RUNTIME_PATH_ENV)
++        .env_remove(CODEX_PROFILE_ENV)
+         .env_remove(REMOTE_SSH_MANAGED_ENV)
+         .env_remove(REMOTE_LISTENER_CHILD_ENV);
+     command.envs(remote_proxy_environment);
+@@ -754,8 +798,8 @@ mod tests {
+     #[cfg(any(target_os = "macos", target_os = "linux"))]
+     use super::ShutdownSignals;
+     use super::{
+-        app_server_subcommand_index, is_default_remote_unix_listener, select_host_paths,
+-        should_start_host_runtime,
++        app_server_subcommand_index, codex_profile_arguments, is_default_remote_unix_listener,
++        select_host_paths, should_start_host_runtime,
+     };
+ 
+     fn arguments(values: &[&str]) -> Vec<OsString> {
+@@ -788,6 +832,52 @@ mod tests {
+         assert_eq!(app_server_subcommand_index(&arguments(&["-c"])), None);
+     }
+ 
++    #[test]
++    fn injects_the_requested_codex_profile_before_app_server_only() {
++        assert_eq!(
++            codex_profile_arguments(
++                &arguments(&[
++                    "-c",
++                    "features.code_mode_host=true",
++                    "app-server",
++                    "--stdio"
++                ]),
++                Some(OsString::from("everyone-in-codex")),
++            )
++            .expect("inject app-server profile"),
++            arguments(&[
++                "-c",
++                "features.code_mode_host=true",
++                "-p",
++                "everyone-in-codex",
++                "app-server",
++                "--stdio",
++            ])
++        );
++        assert_eq!(
++            codex_profile_arguments(
++                &arguments(&["exec", "echo app-server"]),
++                Some(OsString::from("everyone-in-codex")),
++            )
++            .expect("non app-server remains transparent"),
++            arguments(&["exec", "echo app-server"])
++        );
++        assert!(
++            codex_profile_arguments(
++                &arguments(&["--profile", "other", "app-server"]),
++                Some(OsString::from("everyone-in-codex")),
++            )
++            .is_err()
++        );
++        assert!(
++            codex_profile_arguments(
++                &arguments(&["app-server"]),
++                Some(OsString::from("../unsafe")),
++            )
++            .is_err()
++        );
++    }
++
+     #[test]
+     fn starts_host_runtime_for_servers_but_not_app_server_management_commands() {
+         assert!(should_start_host_runtime(&arguments(&[
+-- 
+2.55.0.windows.2
+

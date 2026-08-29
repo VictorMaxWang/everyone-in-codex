@@ -1,0 +1,2519 @@
+From 51ab320878d311b9961e94a89d8b9c3d8dbf36b1 Mon Sep 17 00:00:00 2001
+From: wangwang <1280424159@qq.com>
+Date: Sat, 29 Aug 2026 20:14:55 +0800
+Subject: [PATCH 05/11] fix: harden Bigger Context submission protocol
+
+
+diff --git a/.superpowers/sdd/2026-08-29-webgpt-v405-pro-repair/task-2-report.md b/.superpowers/sdd/2026-08-29-webgpt-v405-pro-repair/task-2-report.md
+new file mode 100644
+index 0000000..6bf771b
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-29-webgpt-v405-pro-repair/task-2-report.md
+@@ -0,0 +1,135 @@
++# Task 2 报告：Bigger Context 与不可逆提交协议
++
++## 状态
++
++完成。实现基于 v4.0.5 的 retained conversation、native compaction、fresh/resume prompt 选择、effort slider、隐藏 viewport、重连与 DOM virtualization；仅将 v3 `a01780d`、`3536f30`、`63fd33a` 的逐阶段授权与 cooldown 行为迁入现有 v4 接缝，没有复制覆盖整个重叠文件，也没有触碰生产服务、Router、live config、凭据或模型选择。
++
++## 实现
++
++### 1. helper / 父进程逐阶段授权
++
++- 新增严格四字段 `submission_attempt` / `submission_authorized` 帧：`type`、`id`、`transport`、`submission`。任何额外、缺失、错误 turn、错误 transport 或错误 stage/final 都失败关闭。
++- helper 在实际 `Enter` 前登记 waiter 并发出 attempt；只有父进程对当前 turn + transport + stage/final 的一次精确授权才能继续。timeout、abort、shutdown 都清理 waiter。
++- 父进程以 `prepared_selected(_ack)` 选中的真实 `inline` / `multipart-2` / `multipart-3` 为权威，先推进不可重试屏障，再写 authorization；pipe 写入是否到达不明时不会安全重放。
++- 保留并串联 v4 `prepared_selected(_ack)`、`send_activated(_ack)`、`submitted`。父/helper 两侧状态机拒绝重复、乱序、transport 变化、stage 越界、ACK 提前、final 提前和未知字段。
++- helper 的 stage accepted / ACK 证据写失败会抛错；重复 prompt 选择会中止 turn，而不是静默覆盖。
++
++### 2. 浏览器本地不可逆状态机
++
++- `ChatGptMultipartSubmissionState` 固定 `attempt -> accepted -> exact ACK -> next` 单向跃迁；两段 staging 与 final 各最多一次。
++- stage ACK 缺失、错误或超时会阻断所有后续 stage 与 final。
++- `sendAttachedPrompt` 在按钮可见、可用且 cooldown 健康之后请求授权，授权后才进入既有 Send activation，再按 `Enter`。
++- final 之前仍按 v4 顺序完成 staging、恢复目标 effort、compaction composer retry、connector 与附件；图片/附件/connector 没有进入 staging。
++- 任何 attempt 之后的普通或 retryable 失败均规范化为 `multipart_submission_ambiguous`、`retryable:false`；已明确非重试的结构化终态按原错误保留。
++
++### 3. turn 级 cooldown controller
++
++- 已知英、简中、繁中、日文弹窗采用严格正文组合和严格按钮 `Got it` / `知道了` / `明白了` / `了解`。
++- 点击后必须证明 dialog hidden 才递增 generation；按钮缺失、正文未知或弹窗不消失返回结构化可重试 429，并让 controller 失败关闭。
++- controller 在 turn 生命周期内持续监听，次数不限，直到 abort、页面关闭或 turn 完成。
++- effort/menu、stage send、stage ACK、final send/response、compaction 后继续阶段均原地恢复；generation 不清除 submission 状态，也不重新提交已接受 stage/final。
++- launcher 同页 rebind 时停止旧 controller、在新 Page 上重建，保留 v4 DOM virtualization / reconnect 逻辑。
++
++### 4. v4 权威行为保持
++
++- `conversationKey`、`connectorIdentity`、`requireRetainedConversation`、`retain`、`connectorBound` 的 launcher 交互未被替换。
++- fresh/resume 仍由 launcher lease 的 `reused` 决定，并由父进程选择 `prepare` 或 `prepareResume`。
++- retained compaction 测试继续证明同一 Pro/max retained chat；仅 source unavailable / disappeared 时 canonical fallback。
++- effort slider、hidden viewport、五 tab 限制、DOM rebind、stream replay、附件终态和 native tool broker 的既有测试保持通过。
++
++## TDD 证据
++
++所有功能切片先加入行为测试并观察预期 RED，再写最小实现：
++
++1. 授权 gate
++   - RED：`npx --yes bun@1.4.0 test tests/helper-submission-authorization.test.ts`
++   - 结果：找不到 `helper-submission-authorization`；0 pass、1 fail、1 error。
++   - GREEN：同命令；1 pass、0 fail、7 expects。
++2. 浏览器 multipart 状态
++   - RED：`npx --yes bun@1.4.0 test tests/browser-submission-state.test.ts`
++   - 结果：缺少 `ChatGptMultipartSubmissionState` export；0 pass、1 fail、1 error。
++   - GREEN：初始 1 pass；最终扩展为 3 pass，覆盖跨阶段 cooldown、ACK 防线、重复 final 与不可重试歧义。
++3. 父进程 turn 协议
++   - RED：`npx --yes bun@1.4.0 test tests/helper-turn-protocol-state.test.ts`
++   - 结果：缺少 `ChatGptHelperTurnProtocolState` export；0 pass、1 fail、1 error。
++   - GREEN：2 pass、0 fail、8 expects。
++4. 真实 helper client wire
++   - RED：`npx --yes bun@1.4.0 test tests/launcher-helper-client.test.ts -t "Bun daemon streams"`
++   - 结果：父进程把 `submission_attempt` 当成 unknown message，1 fail。
++   - GREEN：1 pass、0 fail、7 expects；之后增加 resume-selected multipart-3 全握手。
++5. cooldown 原地恢复
++   - RED：`npx --yes bun@1.4.0 test tests/browser-worker-contract.test.ts -t "current wait resumes"`
++   - 结果：已点击弹窗后仍抛 structured 429，1 fail。
++   - GREEN：当前 phase 继续，1 pass。
++6. turn controller
++   - RED：筛选 `turn cooldown controller`；缺少 `ChatGptRateLimitDialogController` export。
++   - GREEN：generation 仅在 hidden 后发布；重复三次弹窗直到 abort 的测试通过。
++7. prompt 选择只允许一次
++   - RED：`npx --yes bun@1.4.0 test tests/browser-helper-prompt-selection.test.ts`；重复 select 未抛错。
++   - GREEN：1 pass、0 fail、2 expects。
++8. unknown wire field
++   - RED：筛选 `unknown field`；带额外字段的 ready 帧仍保留 child，1 fail。
++   - GREEN：协议立即终止 child，1 pass。
++9. 不可逆失败规范化
++   - RED：缺少 `protectChatGptIrreversibleSubmissionFailure` export；0 pass、1 fail、1 error。
++   - GREEN：attempt 后普通错误变为 502 / `multipart_submission_ambiguous` / `retryable:false`。
++
++## 验证命令与结果
++
++- 协议/worker/helper 聚焦：
++  - `npx --yes bun@1.4.0 test tests/helper-submission-authorization.test.ts tests/helper-turn-protocol-state.test.ts tests/browser-helper-prompt-selection.test.ts tests/browser-submission-state.test.ts tests/launcher-helper-client.test.ts tests/browser-worker-contract.test.ts`
++  - 97 pass、0 fail、441 expects，6 files。
++- retained / broker / launcher host 定向：
++  - `npx --yes bun@1.4.0 test tests/retained-compaction.test.ts tests/turn-broker-lifecycle.test.ts tests/launcher-browser-host.test.ts`
++  - 40 pass、0 fail、147 expects，3 files。
++- core 全量：
++  - `npx --yes bun@1.4.0 run test -- --timeout 20000`
++  - 438 pass、0 fail、1983 expects，42 files，54.94s。
++- launcher 全量：
++  - `npx --yes bun@1.4.0 run --cwd launcher test -- tests/browser-host.test.cjs tests/control-server.test.cjs tests/runtime-host.test.cjs tests/runtime-supervisor.test.cjs`
++  - launcher script 自带 `tests/*.test.cjs`，实际跑完全套；210 pass、0 fail、2 skip（平台限定），212 tests。
++- core typecheck：`npx --yes bun@1.4.0 run typecheck`，exit 0。
++- launcher typecheck：`npx --yes bun@1.4.0 run --cwd launcher typecheck`，exit 0。
++- `git diff --check`：exit 0。
++
++环境说明：仓库锁定 Bun 1.4.0，但 `bun` 未在当前 PATH，因此所有验证通过 `npx --yes bun@1.4.0` 运行。最初裸 `bun` 的 PATH 失败不属于功能 RED。
++
++## 变更文件
++
++- `src/adapters/chatgpt-web/helper-submission-authorization.ts`
++- `src/adapters/chatgpt-web/browser-helper-main.ts`
++- `src/adapters/chatgpt-web/browser-helper-prompt-selection.ts`
++- `src/adapters/chatgpt-web/browser-worker.ts`
++- `src/adapters/chatgpt-web/launcher-helper-client.ts`
++- `tests/helper-submission-authorization.test.ts`
++- `tests/helper-turn-protocol-state.test.ts`
++- `tests/browser-helper-prompt-selection.test.ts`
++- `tests/browser-submission-state.test.ts`
++- `tests/browser-worker-contract.test.ts`
++- `tests/launcher-helper-client.test.ts`
++- `.superpowers/sdd/2026-08-29-webgpt-v405-pro-repair/task-2-report.md`
++
++## 自审
++
++### 规范轴
++
++- 只修改 Task 2 协议与测试；没有服务重启、生产配置、Router route、cookie/凭据读取、模型固定、备份或 installer 操作。
++- 所有编辑通过 `apply_patch`；没有覆盖用户已有无关改动。
++- 中文注释集中解释不可逆边界、pipe 歧义、generation hidden proof、cooldown 原地恢复与 rebind 设计原因；没有逐行复述显然代码。
++- 新测试调用真实状态机和 wire client 行为；已有少量 source-contract 测试保留，但不作为新协议的主要证明。
++
++### brief 轴
++
++- inline / multipart-2 / multipart-3、stage/final 一次性授权：已覆盖。
++- ACK 缺失/乱序阻止下一段和 final：已覆盖。
++- fresh/resume 与既有 prepared/send/submitted 握手共存：已覆盖真实 helper client。
++- 重复、未知字段、错误 transport / stage 失败关闭：已覆盖。
++- 已知多语言 cooldown、严格按钮、hidden proof、无限重复直到 abort：已覆盖。
++- stage send、accepted、ACK、effort、compaction、final send、final response 的 cooldown 原地恢复且发送计数始终为 1：已覆盖。
++- retained Pro compaction 与 canonical fallback 边界：定向套件通过。
++- core/launcher 全量与两套 typecheck：通过。
++
++## 关注点
++
++- `tests/chatgpt-web-harness.test.ts` 单文件隔离运行在 Windows 上两次停在既有 `revoking a turn rejects pending invocations and invalidates its binding`：broker 已打印 delivered，`revoke()` 已执行，但 pending named-pipe invocation 未及时向客户端结算。该测试与 `turn-broker.ts` 均未被 Task 2 修改；同一用例在 core 42 文件全量运行中通过，`turn-broker-lifecycle` 定向套件也通过。因此记录为非阻塞的既有/时序敏感 harness 关注点，未跨任务修改 broker 架构。
++- 未启动真实 ChatGPT/launcher/Router 生产实例；验证限定为仓库状态机、helper 子进程、broker/launcher 生命周期与全量自动化测试，符合任务对 live config/production services 的排除。
+diff --git a/src/adapters/chatgpt-web/browser-helper-main.ts b/src/adapters/chatgpt-web/browser-helper-main.ts
+index aa36d0e..169aea2 100644
+--- a/src/adapters/chatgpt-web/browser-helper-main.ts
++++ b/src/adapters/chatgpt-web/browser-helper-main.ts
+@@ -7,6 +7,11 @@ import type { ChatGptWebCapabilities } from "./model";
+ import { createProcessLineWriter } from "./process-line-writer";
+ import { createBrowserHelperPromptSelection } from "./browser-helper-prompt-selection";
+ import type { CompiledChatGptWebPrompt } from "./prompt";
++import {
++  ChatGptHelperSubmissionAuthorizationGate,
++  type ChatGptHelperSubmissionAuthorization,
++  type ChatGptHelperSubmissionTransport,
++} from "./helper-submission-authorization";
+ 
+ interface RunMessage {
+   type: "run";
+@@ -58,6 +63,7 @@ interface SmokeMessage {
+ type MaintenanceMessage = VerifyMessage | InspectMessage | SmokeMessage;
+ type InputMessage = RunMessage
+   | MaintenanceMessage
++  | ChatGptHelperSubmissionAuthorization
+   | { type: "prepared_selected_ack"; id: string; prepared: CompiledChatGptWebPrompt }
+   | { type: "send_activation_ack"; id: string }
+   | { type: "abort"; id: string }
+@@ -74,6 +80,10 @@ const diagnosticOutput = createProcessLineWriter(stderr, handleOutputFailure);
+ 
+ const writeProtocol = (message: unknown): boolean => protocolOutput.write(JSON.stringify(message));
+ 
++const submissionAuthorizations = new ChatGptHelperSubmissionAuthorizationGate(attempt => {
++  if (!writeProtocol(attempt)) throw new Error("Browser helper could not request submission authorization");
++});
++
+ const diagnostic = (...values: unknown[]): void => {
+   diagnosticOutput.write(values.map(value => typeof value === "string" ? value : JSON.stringify(value)).join(" "));
+ };
+@@ -100,6 +110,7 @@ function requestShutdown(): Promise<void> {
+   protocolOutput.close();
+   diagnosticOutput.close();
+   for (const controller of abortControllers.values()) controller.abort();
++  submissionAuthorizations.rejectAll(new DOMException("Browser helper is shutting down", "AbortError"));
+   for (const selection of preparedSelections.values()) selection.cancel();
+   preparedSelections.clear();
+   for (const waiter of sendActivationWaiters.values()) {
+@@ -121,6 +132,13 @@ function requestShutdown(): Promise<void> {
+   return shutdownPromise;
+ }
+ 
++function submissionTransport(prepared: CompiledChatGptWebPrompt): ChatGptHelperSubmissionTransport {
++  if (!prepared.multipart) return "inline";
++  const count = prepared.multipart.parts.length;
++  if (count !== 2 && count !== 3) throw new Error("Browser helper multipart transport is invalid");
++  return `multipart-${count}`;
++}
++
+ async function run(message: RunMessage): Promise<void> {
+   if (!/^[A-Za-z0-9_-]{6,128}$/.test(message.id) || message.id !== message.turn.traceId) {
+     throw new Error("Browser helper turn identity is invalid");
+@@ -164,7 +182,16 @@ async function run(message: RunMessage): Promise<void> {
+   abortControllers.set(message.id, abortController);
+   const promptSelection = createBrowserHelperPromptSelection();
+   preparedSelections.set(message.id, promptSelection);
+-  const prepareSelected = async () => ({ ...await promptSelection.wait(), release: () => {} });
++  let selectedTransport: ChatGptHelperSubmissionTransport | undefined;
++  const prepareSelected = async () => {
++    const prepared = await promptSelection.wait();
++    selectedTransport = submissionTransport(prepared);
++    return { ...prepared, release: () => {} };
++  };
++  const requireSelectedTransport = (): ChatGptHelperSubmissionTransport => {
++    if (!selectedTransport) throw new Error("Browser helper submission preceded prompt selection");
++    return selectedTransport;
++  };
+   const turn: BrowserTurn = {
+     traceId: message.turn.traceId,
+     modelId: message.turn.modelId,
+@@ -185,6 +212,43 @@ async function run(message: RunMessage): Promise<void> {
+       }
+       return promptSelection.wait().then(() => undefined);
+     },
++    onStageSubmissionAttempt: (stageIndex, signal) => {
++      if (stageIndex !== 1 && stageIndex !== 2) throw new Error("Browser helper submission stage is invalid");
++      return submissionAuthorizations.request({
++        type: "submission_attempt",
++        id: message.id,
++        transport: requireSelectedTransport(),
++        submission: stageIndex === 1 ? "stage-1" : "stage-2",
++      }, signal);
++    },
++    onStageSubmissionAccepted: stageIndex => {
++      if (!writeProtocol({
++        type: "event",
++        id: message.id,
++        event: "stage_submission_accepted",
++        transport: requireSelectedTransport(),
++        stageIndex,
++      })) {
++        throw new Error("Browser helper could not persist multipart submission evidence");
++      }
++    },
++    onStageAcknowledged: stageIndex => {
++      if (!writeProtocol({
++        type: "event",
++        id: message.id,
++        event: "stage_acknowledged",
++        transport: requireSelectedTransport(),
++        stageIndex,
++      })) {
++        throw new Error("Browser helper could not persist multipart acknowledgement evidence");
++      }
++    },
++    onFinalSubmissionAttempt: signal => submissionAuthorizations.request({
++      type: "submission_attempt",
++      id: message.id,
++      transport: requireSelectedTransport(),
++      submission: "final",
++    }, signal),
+     onSendActivated: () => new Promise<void>((resolve, reject) => {
+       if (sendActivationWaiters.has(message.id)) {
+         reject(new Error("Browser helper Send activation already awaits acknowledgement"));
+@@ -237,6 +301,10 @@ async function run(message: RunMessage): Promise<void> {
+       } : {}),
+     });
+   } finally {
++    submissionAuthorizations.rejectTurn(
++      message.id,
++      new DOMException("Browser helper turn ended before submission authorization", "AbortError"),
++    );
+     preparedSelections.get(message.id)?.cancel();
+     preparedSelections.delete(message.id);
+     const sendWaiter = sendActivationWaiters.get(message.id);
+@@ -308,7 +376,13 @@ input.on("line", line => {
+     writeProtocol({ type: "error", id: "protocol", message: "Browser helper received invalid JSON" });
+     return;
+   }
+-  if (message.type === "prepared_selected_ack") {
++  if (message.type === "submission_authorized") {
++    try { submissionAuthorizations.authorize(message); }
++    catch (error) {
++      diagnostic(`Browser helper submission authorization failed: ${error instanceof Error ? error.message : String(error)}`);
++      void requestShutdown();
++    }
++  } else if (message.type === "prepared_selected_ack") {
+     const prepared = message.prepared;
+     if (!prepared || typeof prepared.text !== "string" || !Array.isArray(prepared.images)) {
+       writeProtocol({ type: "error", id: message.id, message: "Browser helper prompt selection is invalid" });
+@@ -331,7 +405,16 @@ input.on("line", line => {
+       writeProtocol({ type: "error", id: message.id, message: "Browser helper has no pending prompt selection" });
+       return;
+     }
+-    selection.select(prepared);
++    try {
++      selection.select(prepared);
++    } catch (error) {
++      writeProtocol({
++        type: "error",
++        id: message.id,
++        message: error instanceof Error ? error.message : String(error),
++      });
++      abortControllers.get(message.id)?.abort();
++    }
+   } else if (message.type === "send_activation_ack") {
+     const waiter = sendActivationWaiters.get(message.id);
+     if (!waiter) {
+@@ -341,6 +424,10 @@ input.on("line", line => {
+     sendActivationWaiters.delete(message.id);
+     waiter.resolve();
+   } else if (message.type === "abort") {
++    submissionAuthorizations.rejectTurn(
++      message.id,
++      new DOMException("Launcher browser helper turn aborted", "AbortError"),
++    );
+     abortControllers.get(message.id)?.abort();
+     preparedSelections.get(message.id)?.cancel();
+     const waiter = sendActivationWaiters.get(message.id);
+diff --git a/src/adapters/chatgpt-web/browser-helper-prompt-selection.ts b/src/adapters/chatgpt-web/browser-helper-prompt-selection.ts
+index 8d3928c..028f792 100644
+--- a/src/adapters/chatgpt-web/browser-helper-prompt-selection.ts
++++ b/src/adapters/chatgpt-web/browser-helper-prompt-selection.ts
+@@ -16,7 +16,10 @@ export function createBrowserHelperPromptSelection(): BrowserHelperPromptSelecti
+     settle(prepared);
+   };
+   return {
+-    select: prepared => finish(prepared),
++    select: prepared => {
++      if (settled) throw new Error("Browser helper prompt was already selected");
++      finish(prepared);
++    },
+     cancel: () => finish(undefined),
+     wait: async () => {
+       const prepared = await selected;
+diff --git a/src/adapters/chatgpt-web/browser-worker.ts b/src/adapters/chatgpt-web/browser-worker.ts
+index 6229512..007dadf 100644
+--- a/src/adapters/chatgpt-web/browser-worker.ts
++++ b/src/adapters/chatgpt-web/browser-worker.ts
+@@ -324,19 +324,26 @@ export class ChatGptPromptAttachmentIntegrityError extends ChatGptWebAdapterErro
+ }
+ 
+ const chatGptRateLimitDialog = (page: Page): Locator => page.locator('[role="dialog"]')
+-  .filter({ hasText: /Too many requests|太多要求|太多请求|リクエストが多すぎます/i })
+-  .filter({ hasText: /making requests too quickly|過於頻繁|过于频繁|リクエストの頻度が高すぎます/i })
++  .filter({
++    hasText: /(?:Too many requests[\s\S]*making requests too quickly|(?:太多要求|太多请求)[\s\S]*(?:過於頻繁|过于频繁)|请求过于频繁[\s\S]*你的请求过于频繁[\s\S]*暂时限制你访问对话记录[\s\S]*请稍等几分钟后再重试|リクエストが多すぎます[\s\S]*リクエストの頻度が高すぎます)/i,
++  })
+   .last();
+ 
+ export async function throwIfChatGptRateLimitDialog(page: Page): Promise<void> {
+   const dialog = chatGptRateLimitDialog(page);
+   if (!await dialog.isVisible().catch(() => false)) return;
+ 
+-  const acknowledge = dialog.getByRole("button", { name: /^(Got it|知道了|了解)$/ }).last();
++  const acknowledge = dialog.getByRole("button", { name: /^(?:Got it|知道了|明白了|了解)$/ }).last();
+   if (await acknowledge.isVisible().catch(() => false)) {
+     try {
+       await acknowledge.press("Enter");
++      // 只有覆盖层真正消失，当前 effort/send/ACK/stream wait 才发布“可继续”；
++      // 否则同一弹窗会被误认成新一代并可能重复触发不可逆动作。
++      await dialog.waitFor({ state: "hidden", timeout: 10_000 });
++      return;
+     } catch (error) {
++      // 前台检查与后台 controller 可能同时命中；另一方已关闭时属于同一次成功。
++      if (!await dialog.isVisible().catch(() => false)) return;
+       throw new ChatGptWebAdapterError(
+         `ChatGPT rate limit: too many requests, and the dialog could not be dismissed (${error instanceof Error ? error.message : String(error)}). Try again in a few minutes.`,
+         { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: true },
+@@ -344,11 +351,118 @@ export async function throwIfChatGptRateLimitDialog(page: Page): Promise<void> {
+     }
+   }
+   throw new ChatGptWebAdapterError(
+-    "ChatGPT rate limit: too many requests. Try again in a few minutes.",
++    "ChatGPT rate limit dialog is visible, but its exact acknowledgement button is unavailable.",
+     { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: true },
+   );
+ }
+ 
++/** 同一 turn 内持续处理重复出现的已知 cooldown；它只关闭覆盖层，从不重发 prompt。 */
++export async function monitorChatGptRateLimitDialogs(
++  page: Page,
++  signal: AbortSignal,
++  onDismiss?: () => void,
++): Promise<void> {
++  while (!signal.aborted && !page.isClosed()) {
++    const dialog = chatGptRateLimitDialog(page);
++    try {
++      await dialog.waitFor({ state: "visible", timeout: 1_000, signal });
++    } catch (error) {
++      if (signal.aborted || page.isClosed()) return;
++      if (error instanceof Error && error.name === "TimeoutError") continue;
++      throw error;
++    }
++    await throwIfChatGptRateLimitDialog(page);
++    onDismiss?.();
++  }
++}
++
++export interface ChatGptRateLimitDialogObserver {
++  currentGeneration(): number;
++  waitForDismissal(afterGeneration: number, signal: AbortSignal): Promise<void>;
++  assertHealthy(): void;
++}
++
++interface ChatGptRateLimitDismissalWaiter {
++  afterGeneration: number;
++  signal: AbortSignal;
++  resolve(): void;
++  reject(error: unknown): void;
++  onAbort(): void;
++}
++
++/** generation 只在弹窗确认隐藏后递增，让 effort/send/ACK/stream 原地恢复。 */
++export class ChatGptRateLimitDialogController implements ChatGptRateLimitDialogObserver {
++  private readonly stopController = new AbortController();
++  private readonly task: Promise<void>;
++  private readonly waiters = new Set<ChatGptRateLimitDismissalWaiter>();
++  private generation = 0;
++  private monitorFailure: unknown;
++
++  constructor(
++    page: Page,
++    parentSignal?: AbortSignal,
++    private readonly onDismissed?: (generation: number) => void,
++  ) {
++    const signal = parentSignal
++      ? AbortSignal.any([this.stopController.signal, parentSignal])
++      : this.stopController.signal;
++    this.task = monitorChatGptRateLimitDialogs(page, signal, () => {
++      this.generation += 1;
++      this.onDismissed?.(this.generation);
++      this.releaseWaiters();
++    }).catch(error => {
++      this.monitorFailure = error;
++      this.releaseWaiters(error);
++    });
++  }
++
++  currentGeneration(): number {
++    return this.generation;
++  }
++
++  assertHealthy(): void {
++    if (this.monitorFailure !== undefined) throw this.monitorFailure;
++  }
++
++  async waitForDismissal(afterGeneration: number, signal: AbortSignal): Promise<void> {
++    this.assertHealthy();
++    if (this.generation > afterGeneration) return;
++    if (signal.aborted) throw new DOMException("ChatGPT rate-limit wait aborted", "AbortError");
++    await new Promise<void>((resolve, reject) => {
++      const waiter: ChatGptRateLimitDismissalWaiter = {
++        afterGeneration,
++        signal,
++        resolve,
++        reject,
++        onAbort: () => {
++          this.waiters.delete(waiter);
++          reject(new DOMException("ChatGPT rate-limit wait aborted", "AbortError"));
++        },
++      };
++      signal.addEventListener("abort", waiter.onAbort, { once: true });
++      this.waiters.add(waiter);
++      // 登记后复查一次，封住 generation 检查与 waiter 入队之间的竞态。
++      this.releaseWaiters();
++    });
++  }
++
++  async stop(assertHealthy = true): Promise<void> {
++    this.stopController.abort();
++    await this.task;
++    if (assertHealthy) this.assertHealthy();
++  }
++
++  private releaseWaiters(error?: unknown): void {
++    for (const waiter of [...this.waiters]) {
++      if (error === undefined && this.generation <= waiter.afterGeneration) continue;
++      this.waiters.delete(waiter);
++      waiter.signal.removeEventListener("abort", waiter.onAbort);
++      if (error === undefined) waiter.resolve();
++      else waiter.reject(error);
++    }
++  }
++}
++
+ const chatGptTemporaryChatOnboardingDialog = (page: Page): Locator => page
+   .locator('[role="dialog"]')
+   .filter({ hasText: "Not in history" })
+@@ -681,6 +795,174 @@ function withBrowserTurnAbort<T>(promise: Promise<T>, signal?: AbortSignal): Pro
+   });
+ }
+ 
++/**
++ * 浏览器本地提交状态只允许 accept -> exact ACK -> next 的单向跃迁。
++ * cooldown 只会唤醒当前等待，因此不能清除 attempt/accepted 标记或重新派发同一段。
++ */
++export class ChatGptMultipartSubmissionState {
++  private readonly attemptedStages = new Set<number>();
++  private readonly acceptedStages = new Set<number>();
++  private readonly acknowledgedStages = new Set<number>();
++  private finalAttempted = false;
++  private finalAccepted = false;
++
++  constructor(private readonly stageCount: number) {
++    if (!Number.isInteger(stageCount) || stageCount < 0 || stageCount > 2) {
++      throw new Error("ChatGPT multipart stage count is invalid");
++    }
++  }
++
++  assertStageCanSubmit(stageIndex: number): void {
++    this.assertStageIndex(stageIndex);
++    if (this.finalAccepted) throw new Error("ChatGPT final submission was already accepted");
++    if (this.acceptedStages.has(stageIndex)) {
++      throw new Error(`ChatGPT multipart stage ${stageIndex} was already accepted`);
++    }
++    if (this.attemptedStages.has(stageIndex)) {
++      throw new Error(`ChatGPT multipart stage ${stageIndex} was already attempted`);
++    }
++    if (stageIndex > 1 && !this.acknowledgedStages.has(stageIndex - 1)) {
++      throw new Error(`ChatGPT multipart stage ${stageIndex} requires stage ${stageIndex - 1} acknowledgement`);
++    }
++    if (stageIndex !== this.acknowledgedStages.size + 1) {
++      throw new Error(`ChatGPT multipart stage ${stageIndex} is out of order`);
++    }
++  }
++
++  markStageAttempted(stageIndex: number): void {
++    this.assertStageCanSubmit(stageIndex);
++    this.attemptedStages.add(stageIndex);
++  }
++
++  markStageAccepted(stageIndex: number): void {
++    this.assertStageIndex(stageIndex);
++    if (!this.attemptedStages.has(stageIndex)) {
++      throw new Error(`ChatGPT multipart stage ${stageIndex} acceptance preceded its submission attempt`);
++    }
++    if (this.acceptedStages.has(stageIndex)) {
++      throw new Error(`ChatGPT multipart stage ${stageIndex} was already accepted`);
++    }
++    this.acceptedStages.add(stageIndex);
++  }
++
++  markStageAcknowledged(stageIndex: number): void {
++    this.assertStageIndex(stageIndex);
++    if (!this.acceptedStages.has(stageIndex)) {
++      throw new Error(`ChatGPT multipart stage ${stageIndex} was not accepted`);
++    }
++    if (this.acknowledgedStages.has(stageIndex)) {
++      throw new Error(`ChatGPT multipart stage ${stageIndex} was already acknowledged`);
++    }
++    if (stageIndex !== this.acknowledgedStages.size + 1) {
++      throw new Error(`ChatGPT multipart stage ${stageIndex} acknowledgement is out of order`);
++    }
++    this.acknowledgedStages.add(stageIndex);
++  }
++
++  assertFinalCanSubmit(): void {
++    if (this.finalAccepted) throw new Error("ChatGPT final submission was already accepted");
++    if (this.finalAttempted) throw new Error("ChatGPT final submission was already attempted");
++    if (this.acknowledgedStages.size !== this.stageCount) {
++      throw new Error("ChatGPT final submission requires every multipart stage acknowledgement");
++    }
++  }
++
++  markFinalAttempted(): void {
++    this.assertFinalCanSubmit();
++    this.finalAttempted = true;
++  }
++
++  markFinalAccepted(): void {
++    if (!this.finalAttempted) throw new Error("ChatGPT final acceptance preceded its submission attempt");
++    if (this.finalAccepted) throw new Error("ChatGPT final submission was already accepted");
++    if (this.acknowledgedStages.size !== this.stageCount) {
++      throw new Error("ChatGPT final submission requires every multipart stage acknowledgement");
++    }
++    this.finalAccepted = true;
++  }
++
++  hasIrreversibleSubmission(): boolean {
++    return this.attemptedStages.size > 0 || this.finalAttempted;
++  }
++
++  hasUnconfirmedSubmissionAttempt(): boolean {
++    return [...this.attemptedStages].some(stage => !this.acceptedStages.has(stage))
++      || (this.finalAttempted && !this.finalAccepted);
++  }
++
++  private assertStageIndex(stageIndex: number): void {
++    if (!Number.isInteger(stageIndex) || stageIndex < 1 || stageIndex > this.stageCount) {
++      throw new Error(`ChatGPT multipart stage index ${stageIndex} is invalid`);
++    }
++  }
++}
++
++/** 将每段不可逆跃迁固定在真实 submit 与 ACK 两侧，调用方只能注入浏览器操作。 */
++export async function executeChatGptMultipartStages<Context, Evidence>(
++  state: ChatGptMultipartSubmissionState,
++  stageCount: number,
++  operations: {
++    prepareStage(stageIndex: number): Promise<Context>;
++    submitStage(stageIndex: number, context: Context, markAttempted: () => void): Promise<Evidence>;
++    onStageAccepted(stageIndex: number, evidence: Evidence): Promise<void> | void;
++    waitForStageAcknowledgement(stageIndex: number, context: Context, evidence: Evidence): Promise<void>;
++    onStageAcknowledged(stageIndex: number): Promise<void> | void;
++  },
++): Promise<void> {
++  if (!Number.isInteger(stageCount) || stageCount < 1 || stageCount > 2) {
++    throw new Error("ChatGPT multipart execution stage count is invalid");
++  }
++  for (let stageIndex = 1; stageIndex <= stageCount; stageIndex += 1) {
++    state.assertStageCanSubmit(stageIndex);
++    const context = await operations.prepareStage(stageIndex);
++    const evidence = await operations.submitStage(
++      stageIndex,
++      context,
++      () => state.markStageAttempted(stageIndex),
++    );
++    state.markStageAccepted(stageIndex);
++    await operations.onStageAccepted(stageIndex, evidence);
++    await operations.waitForStageAcknowledgement(stageIndex, context, evidence);
++    state.markStageAcknowledged(stageIndex);
++    await operations.onStageAcknowledged(stageIndex);
++  }
++}
++
++/** 最终 commit 沿用同一屏障，accepted 回调始终发生在后续 response wait 之前。 */
++export async function executeChatGptFinalSubmission<Evidence>(
++  state: ChatGptMultipartSubmissionState,
++  operations: {
++    submit(markAttempted: () => void): Promise<Evidence>;
++    onAccepted(evidence: Evidence): Promise<void> | void;
++  },
++): Promise<Evidence> {
++  state.assertFinalCanSubmit();
++  const evidence = await operations.submit(() => state.markFinalAttempted());
++  state.markFinalAccepted();
++  await operations.onAccepted(evidence);
++  return evidence;
++}
++
++export function protectChatGptIrreversibleSubmissionFailure(
++  state: ChatGptMultipartSubmissionState,
++  error: unknown,
++): unknown {
++  if (!state.hasIrreversibleSubmission()) return error;
++  if (!state.hasUnconfirmedSubmissionAttempt()
++    && error instanceof ChatGptWebAdapterError
++    && !error.retryable) return error;
++  const detail = error instanceof Error ? error.message : String(error);
++  return new ChatGptWebAdapterError(
++    `ChatGPT armed or accepted part of this browser submission before the remaining response became ambiguous (${detail}). The turn will not be retried automatically.`,
++    {
++      status: 502,
++      errorType: "server_error",
++      code: "multipart_submission_ambiguous",
++      retryable: false,
++    },
++  );
++}
++
+ export interface BrowserTurn {
+   traceId: string;
+   modelId: string;
+@@ -696,6 +978,12 @@ export interface BrowserTurn {
+   onPreparedSelected?: (reused: boolean) => void | Promise<void>;
+   abortSignal?: AbortSignal;
+   onHeartbeat?: () => void;
++  /** helper 父进程授权前不得跨过对应 stage 的真实 Enter 边界。 */
++  onStageSubmissionAttempt?: (stageIndex: number, signal?: AbortSignal) => Promise<void> | void;
++  onStageSubmissionAccepted?: (stageIndex: number) => void;
++  onStageAcknowledged?: (stageIndex: number) => void;
++  /** final 先完成逐 turn 授权，再进入既有 send_activated/submitted 握手。 */
++  onFinalSubmissionAttempt?: (signal?: AbortSignal) => Promise<void> | void;
+   /** Send activation is the ambiguity boundary after which a fresh surface must not replay this prompt. */
+   onSendActivated?: () => void | Promise<void>;
+   /** Semantic submission evidence proved that ChatGPT accepted the prompt. */
+@@ -1534,6 +1822,7 @@ export class ChatGptBrowserWorker {
+     reasoning: string | undefined,
+     capabilities: ChatGptWebCapabilities,
+     captureDiagnostic?: (checkpoint: string) => Promise<void>,
++    rateLimitObserver?: ChatGptRateLimitDialogObserver,
+   ): Promise<ChatGptWebModelMode> {
+     const mode = resolveChatGptWebModelMode(modelId, reasoning, capabilities);
+     const composer = await this.activeComposer(page);
+@@ -1541,6 +1830,7 @@ export class ChatGptBrowserWorker {
+     const uiEffortIndex = mode.uiEffortIndex;
+     if (uiEffortIndex === null) {
+       await settleChatGptUi();
++      rateLimitObserver?.assertHealthy();
+       await throwIfChatGptRateLimitDialog(page);
+       const visibleControls = composerForm.locator(CHATGPT_EFFORT_CONTROL_SELECTOR).filter({ visible: true });
+       if (await visibleControls.count() > 0) {
+@@ -1567,6 +1857,7 @@ export class ChatGptBrowserWorker {
+       effortWaitAbort.abort();
+     }
+     await settleChatGptUi();
++    rateLimitObserver?.assertHealthy();
+     await throwIfChatGptRateLimitDialog(page);
+     await captureDiagnostic?.("effort-control-ready");
+     const effortMenu = page.locator(CHATGPT_EFFORT_MENU_SELECTOR).last();
+@@ -1583,32 +1874,47 @@ export class ChatGptBrowserWorker {
+     const effortChoices = effortMenu.locator(CHATGPT_EFFORT_ITEM_SELECTOR);
+     const effortChoice = effortChoices.nth(uiEffortIndex);
+     const effortSlider = page.locator(CHATGPT_EFFORT_SLIDER_SELECTOR).filter({ visible: true }).last();
+-    const waitAbort = new AbortController();
+-    let ready: "effort" | "slider" | "rate-limit" | "session-expired";
+-    try {
+-      ready = await Promise.race([
+-        effortChoice.waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "effort" as const),
+-        effortSlider.waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "slider" as const),
+-        chatGptRateLimitDialog(page).waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "rate-limit" as const),
+-        chatGptExpiredSessionAlert(page).waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "session-expired" as const),
+-      ]);
+-      if (ready === "rate-limit") await throwIfChatGptRateLimitDialog(page);
+-      if (ready === "session-expired") await throwIfChatGptSessionFailureAlert(page);
+-      // The current picker exposes model rows as menuitemradio alongside the effort slider.
+-      // Those rows can win the locator race even though they are not effort choices.
+-      if (ready !== "slider" && await effortSlider.isVisible().catch(() => false)) ready = "slider";
+-      await captureDiagnostic?.(ready === "slider" ? "effort-slider-visible" : "effort-choice-visible");
+-    } catch (error) {
+-      if (error instanceof ChatGptWebAdapterError) throw error;
+-      await throwIfChatGptRateLimitDialog(page);
+-      await throwIfChatGptSessionFailureAlert(page);
+-      throw new ChatGptWebAdapterError(
+-        `ChatGPT effort menu did not expose item index ${uiEffortIndex}`
+-        + `; item count: ${await effortChoices.count().catch(() => 0)}`,
+-        { status: 502, errorType: "server_error", code: "upstream_server_error", retryable: false },
+-      );
+-    } finally {
+-      waitAbort.abort();
++    let ready: "effort" | "slider";
++    for (;;) {
++      rateLimitObserver?.assertHealthy();
++      const generation = rateLimitObserver?.currentGeneration();
++      const waitAbort = new AbortController();
++      try {
++        const outcome = await Promise.race([
++          effortChoice.waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "effort" as const),
++          effortSlider.waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "slider" as const),
++          chatGptExpiredSessionAlert(page).waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "session-expired" as const),
++          ...(rateLimitObserver && generation !== undefined
++            ? [rateLimitObserver.waitForDismissal(generation, waitAbort.signal).then(() => "cooldown" as const)]
++            : [chatGptRateLimitDialog(page).waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "rate-limit" as const)]),
++        ]);
++        if (outcome === "cooldown") continue;
++        if (outcome === "rate-limit") {
++          await throwIfChatGptRateLimitDialog(page);
++          continue;
++        }
++        if (outcome === "session-expired") {
++          await throwIfChatGptSessionFailureAlert(page);
++          continue;
++        }
++        ready = outcome;
++        // The current picker exposes model rows as menuitemradio alongside the effort slider.
++        if (ready !== "slider" && await effortSlider.isVisible().catch(() => false)) ready = "slider";
++        await captureDiagnostic?.(ready === "slider" ? "effort-slider-visible" : "effort-choice-visible");
++        break;
++      } catch (error) {
++        if (error instanceof ChatGptWebAdapterError) throw error;
++        rateLimitObserver?.assertHealthy();
++        await throwIfChatGptRateLimitDialog(page);
++        await throwIfChatGptSessionFailureAlert(page);
++        throw new ChatGptWebAdapterError(
++          `ChatGPT effort menu did not expose item index ${uiEffortIndex}`
++          + `; item count: ${await effortChoices.count().catch(() => 0)}`,
++          { status: 502, errorType: "server_error", code: "upstream_server_error", retryable: false },
++        );
++      } finally {
++        waitAbort.abort();
++      }
+     }
+     if (ready === "slider") {
+       let sliderState = parseChatGptEffortSliderState(
+@@ -1632,6 +1938,7 @@ export class ChatGptBrowserWorker {
+       }
+       const sliderControl = effortSlider.locator("xpath=ancestor::*[@role='menuitem'][1]");
+       while (sliderState.value !== targetValue) {
++        rateLimitObserver?.assertHealthy();
+         await throwIfChatGptRateLimitDialog(page);
+         const direction = targetValue > sliderState.value ? 1 : -1;
+         const key = direction > 0 ? "ArrowRight" : "ArrowLeft";
+@@ -1962,6 +2269,7 @@ export class ChatGptBrowserWorker {
+     deadline: number | undefined,
+     signal?: AbortSignal,
+     externalProgress?: ChatGptExternalTurnProgress,
++    rateLimitObserver?: ChatGptRateLimitDialogObserver,
+   ): Promise<ChatGptAssistantTurnBinding> {
+     let responseDeadline = Math.min(
+       deadline ?? Number.POSITIVE_INFINITY,
+@@ -1983,6 +2291,7 @@ export class ChatGptBrowserWorker {
+       if (Date.now() >= responseDeadline && (progress?.activeToolCalls ?? 0) === 0) {
+         throw new Error("ChatGPT accepted the message but did not expose its assistant turn in the DOM");
+       }
++      rateLimitObserver?.assertHealthy();
+       await throwIfChatGptSessionFailureAlert(page);
+       await throwIfChatGptRateLimitDialog(page);
+       let state: ChatGptSubmissionDomState;
+@@ -2292,6 +2601,8 @@ export class ChatGptBrowserWorker {
+     abortSignal?: AbortSignal,
+     externalProgress?: ChatGptExternalTurnProgress,
+     submissionLifecycle?: Pick<BrowserTurn, "onSendActivated" | "onSubmitted">,
++    onSubmissionAttempt?: () => Promise<void> | void,
++    rateLimitObserver?: ChatGptRateLimitDialogObserver,
+   ): Promise<ChatGptSubmissionEvidence> {
+     const composer = await this.activeComposer(page);
+     const sendButton = composer
+@@ -2303,8 +2614,14 @@ export class ChatGptBrowserWorker {
+     }
+     await settleChatGptUi();
+     await captureDiagnostic?.("send-ready");
++    // 授权前最后一次确认 cooldown 已结束；一旦发出 attempt，后续任何歧义都必须按不可逆提交处理。
++    rateLimitObserver?.assertHealthy();
++    await throwIfChatGptRateLimitDialog(page);
++    rateLimitObserver?.assertHealthy();
+     await throwIfChatGptSessionFailureAlert(page);
+     const initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0;
++    // 授权紧贴真实按键：之后页面关闭、pipe 失败或超时都只能按“可能已提交”处理。
++    await onSubmissionAttempt?.();
+     await submissionLifecycle?.onSendActivated?.();
+     await sendButton.press("Enter");
+     const evidence = await this.waitForSubmissionAccepted(
+@@ -2325,6 +2642,7 @@ export class ChatGptBrowserWorker {
+     stage: ChatGptWebMultipartStage,
+     deadline: number | undefined,
+     abortSignal?: AbortSignal,
++    rateLimitObserver?: ChatGptRateLimitDialogObserver,
+   ): Promise<void> {
+     const completionTracker = new ChatGptCompletionTracker();
+     const domHealthTracker = new ChatGptTurnDomHealthTracker();
+@@ -2341,6 +2659,8 @@ export class ChatGptBrowserWorker {
+       if (deadline !== undefined && Date.now() >= deadline) {
+         throw new Error("ChatGPT Bigger Context transaction timed out while awaiting a stage acknowledgement");
+       }
++      rateLimitObserver?.assertHealthy();
++      await throwIfChatGptRateLimitDialog(page);
+       await throwIfChatGptSessionFailureAlert(page);
+       await throwIfChatGptTerminalErrorAlert(responseTurn.locator);
+       let snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
+@@ -3092,9 +3412,13 @@ export class ChatGptBrowserWorker {
+       turn.traceId,
+       this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns"),
+     );
++    const submissionState = new ChatGptMultipartSubmissionState(
++      prepared.multipart ? prepared.multipart.parts.length - 1 : 0,
++    );
+     let turnConnection: Browser | undefined;
+     let managedPage: Page | undefined;
+     let diagnosticPage: Page | undefined;
++    let rateLimitController: ChatGptRateLimitDialogController | undefined;
+     try {
+       if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+       const multipartTransactionId = prepared.multipart
+@@ -3188,6 +3512,7 @@ export class ChatGptBrowserWorker {
+       });
+       if (!maintenancePage && !launcherSurfaceId) managedPage = page;
+       diagnosticPage = page;
++      rateLimitController = new ChatGptRateLimitDialogController(page, turn.abortSignal);
+       const rebindLauncherPage = async (attempt: number, cause: Error): Promise<void> => {
+         if (!launcherSurfaceId || !this.config.browserHostDescriptorPath) throw cause;
+         console.warn(
+@@ -3213,9 +3538,11 @@ export class ChatGptBrowserWorker {
+             return rebound;
+           },
+         );
++        await rateLimitController?.stop(false);
+         turnConnection = connection.browser;
+         page = connection.page;
+         diagnosticPage = page;
++        rateLimitController = new ChatGptRateLimitDialogController(page, turn.abortSignal);
+         if (previousConnection && previousConnection !== connection.browser) {
+           await previousConnection.close().catch(error => {
+             console.warn(
+@@ -3256,6 +3583,7 @@ export class ChatGptBrowserWorker {
+             stagingMode.effort,
+             browserCapabilities,
+             checkpoint => diagnostics.capture(page, checkpoint),
++            rateLimitController,
+           )
+         ));
+       }
+@@ -3263,52 +3591,78 @@ export class ChatGptBrowserWorker {
+ 
+       let finalPrompt = prepared.text;
+       if (prepared.multipart && multipartStages && multipartTransactionId && multipartFinalPrompt) {
+-        for (let index = 0; index < multipartStages.length; index += 1) {
+-          const stage = multipartStages[index]!;
+-          const stageBaseline = await this.captureSubmissionBaseline(page);
+-          await this.runStage(
+-            turn.traceId,
+-            `multipart_stage_${index + 1}_attachment`,
+-            browserStageTimeouts.promptAttachment,
+-            (stageSignal) => this.attachPrompt(
+-              page,
+-              stage.text,
+-              false,
+-              checkpoint => diagnostics.capture(page, `multipart-${index + 1}-${checkpoint}`),
+-              turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal,
+-            ),
+-          );
+-          await diagnostics.capture(page, `multipart-stage-${index + 1}-attachment-complete`);
+-          const evidence = await this.runStage(
++        await executeChatGptMultipartStages(submissionState, multipartStages.length, {
++          prepareStage: async stageIndex => {
++            const stage = multipartStages[stageIndex - 1]!;
++            const stageBaseline = await this.captureSubmissionBaseline(page);
++            await this.runStage(
++              turn.traceId,
++              `multipart_stage_${stageIndex}_attachment`,
++              browserStageTimeouts.promptAttachment,
++              stageSignal => this.attachPrompt(
++                page,
++                stage.text,
++                false,
++                checkpoint => diagnostics.capture(page, `multipart-${stageIndex}-${checkpoint}`),
++                turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal,
++              ),
++            );
++            await diagnostics.capture(page, `multipart-stage-${stageIndex}-attachment-complete`);
++            return { stage, stageBaseline };
++          },
++          submitStage: (stageIndex, context, markAttempted) => this.runStage(
+             turn.traceId,
+-            `multipart_stage_${index + 1}_send`,
++            `multipart_stage_${stageIndex}_send`,
+             browserStageTimeouts.send,
+-            (stageSignal) => this.sendAttachedPrompt(
++            stageSignal => {
++              const signal = turn.abortSignal
++                ? AbortSignal.any([stageSignal, turn.abortSignal])
++                : stageSignal;
++              return this.sendAttachedPrompt(
++                page,
++                context.stageBaseline,
++                checkpoint => diagnostics.capture(page, `multipart-${stageIndex}-${checkpoint}`),
++                signal,
++                undefined,
++                undefined,
++                async () => {
++                  markAttempted();
++                  await turn.onStageSubmissionAttempt?.(stageIndex, signal);
++                },
++                rateLimitController,
++              );
++            },
++          ),
++          onStageAccepted: (stageIndex, evidence) => {
++            turn.onStageSubmissionAccepted?.(stageIndex);
++            console.info(
++              `[chatgpt-web] browser turn ${turn.traceId} multipart part ${stageIndex}/${prepared.multipart!.parts.length} submission accepted evidence=${evidence}`,
++            );
++          },
++          waitForStageAcknowledgement: async (_stageIndex, context) => {
++            const responseTurn = await this.waitForNewAssistantTurn(
+               page,
+-              stageBaseline,
+-              checkpoint => diagnostics.capture(page, `multipart-${index + 1}-${checkpoint}`),
+-              turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal,
+-            ),
+-          );
+-          const responseTurn = await this.waitForNewAssistantTurn(
+-            page,
+-            stageBaseline,
+-            deadline,
+-            turn.abortSignal,
+-          );
+-          console.info(
+-            `[chatgpt-web] browser turn ${turn.traceId} multipart part ${index + 1}/${prepared.multipart.parts.length} submission accepted evidence=${evidence}`,
+-          );
+-          await this.waitForMultipartAcknowledgement(
+-            page,
+-            responseTurn,
+-            stageBaseline,
+-            stage,
+-            deadline,
+-            turn.abortSignal,
+-          );
+-          await diagnostics.capture(page, `multipart-stage-${index + 1}-acknowledged`);
+-        }
++              context.stageBaseline,
++              deadline,
++              turn.abortSignal,
++              undefined,
++              rateLimitController,
++            );
++            await this.waitForMultipartAcknowledgement(
++              page,
++              responseTurn,
++              context.stageBaseline,
++              context.stage,
++              deadline,
++              turn.abortSignal,
++              rateLimitController,
++            );
++          },
++          onStageAcknowledged: async stageIndex => {
++            turn.onStageAcknowledged?.(stageIndex);
++            await diagnostics.capture(page, `multipart-stage-${stageIndex}-acknowledged`);
++          },
++        });
+         if (mode.effort !== requestedMode.effort) {
+           mode = await this.runStage(
+             turn.traceId,
+@@ -3320,6 +3674,7 @@ export class ChatGptBrowserWorker {
+               requestedMode.effort,
+               browserCapabilities,
+               checkpoint => diagnostics.capture(page, `final-part-${checkpoint}`),
++              rateLimitController,
+             ),
+           );
+           await diagnostics.capture(page, "final-part-effort-selected");
+@@ -3370,6 +3725,7 @@ export class ChatGptBrowserWorker {
+                 turn.reasoning,
+                 turn.capabilities,
+                 checkpoint => diagnostics.capture(page, checkpoint),
++                rateLimitController,
+               );
+               submissionBaseline = await this.captureSubmissionBaseline(page);
+             },
+@@ -3382,25 +3738,39 @@ export class ChatGptBrowserWorker {
+         this.attachFiles(page, prepared)
+       ));
+       await diagnostics.capture(page, "file-attachment-complete");
+-      const finalSubmissionEvidence = await this.runStage(
+-        turn.traceId,
+-        "send",
+-        browserStageTimeouts.send,
+-        (stageSignal) => this.sendAttachedPrompt(
+-          page,
+-          submissionBaseline,
+-          checkpoint => diagnostics.capture(page, checkpoint),
+-          turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal,
+-          turn.externalProgress,
+-          turn,
++      const finalSubmissionEvidence = await executeChatGptFinalSubmission(submissionState, {
++        submit: markAttempted => this.runStage(
++          turn.traceId,
++          "send",
++          browserStageTimeouts.send,
++          stageSignal => {
++            const signal = turn.abortSignal
++              ? AbortSignal.any([stageSignal, turn.abortSignal])
++              : stageSignal;
++            return this.sendAttachedPrompt(
++              page,
++              submissionBaseline,
++              checkpoint => diagnostics.capture(page, checkpoint),
++              signal,
++              turn.externalProgress,
++              turn,
++              async () => {
++                markAttempted();
++                await turn.onFinalSubmissionAttempt?.(signal);
++              },
++              rateLimitController,
++            );
++          },
+         ),
+-      );
++        onAccepted: () => {},
++      });
+       let responseTurn = await this.waitForNewAssistantTurn(
+         page,
+         submissionBaseline,
+         deadline,
+         turn.abortSignal,
+         turn.externalProgress,
++        rateLimitController,
+       );
+       console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted evidence=${finalSubmissionEvidence}`);
+       await diagnostics.capture(page, "send-accepted");
+@@ -3435,6 +3805,7 @@ export class ChatGptBrowserWorker {
+       const responseDomCache: ChatGptResponseDomCache = {};
+       let consecutiveObservationRebinds = 0;
+       for (;;) {
++        rateLimitController.assertHealthy();
+         if (page.isClosed()) {
+           throw chatGptBrowserTabClosedError();
+         }
+@@ -3609,6 +3980,8 @@ export class ChatGptBrowserWorker {
+         `[chatgpt-web] browser turn ${turn.traceId} completed`
+         + ` (markdownChars=${finalText.length}, domFullScans=${responseDomCache.fullScans ?? 0}, domCacheHits=${responseDomCache.cacheHits ?? 0})`,
+       );
++      await rateLimitController.stop();
++      rateLimitController = undefined;
+       return finalText;
+     } catch (error) {
+       console.error(
+@@ -3618,8 +3991,9 @@ export class ChatGptBrowserWorker {
+       if (diagnosticPage && !diagnosticPage.isClosed()) {
+         await diagnostics.capture(diagnosticPage, "turn-failed", error);
+       }
+-      throw error;
++      throw protectChatGptIrreversibleSubmissionFailure(submissionState, error);
+     } finally {
++      await rateLimitController?.stop(false);
+       prepared.release();
+       if (turnConnection) {
+         await turnConnection.close().catch(error => {
+diff --git a/src/adapters/chatgpt-web/helper-submission-authorization.ts b/src/adapters/chatgpt-web/helper-submission-authorization.ts
+new file mode 100644
+index 0000000..190c616
+--- /dev/null
++++ b/src/adapters/chatgpt-web/helper-submission-authorization.ts
+@@ -0,0 +1,154 @@
++export type ChatGptHelperSubmissionTransport = "inline" | "multipart-2" | "multipart-3";
++export type ChatGptHelperSubmissionIdentity = "stage-1" | "stage-2" | "final";
++
++export interface ChatGptHelperSubmissionAttempt {
++  type: "submission_attempt";
++  id: string;
++  transport: ChatGptHelperSubmissionTransport;
++  submission: ChatGptHelperSubmissionIdentity;
++}
++
++export interface ChatGptHelperSubmissionAuthorization {
++  type: "submission_authorized";
++  id: string;
++  transport: ChatGptHelperSubmissionTransport;
++  submission: ChatGptHelperSubmissionIdentity;
++}
++
++function assertExactKeys(value: Record<string, unknown>, expected: readonly string[]): void {
++  const keys = Object.keys(value).sort();
++  const allowed = [...expected].sort();
++  if (keys.length !== allowed.length || keys.some((key, index) => key !== allowed[index])) {
++    throw new Error("Launcher browser submission handshake has unknown or missing fields");
++  }
++}
++
++function parseTransport(value: unknown): ChatGptHelperSubmissionTransport {
++  if (value === "inline" || value === "multipart-2" || value === "multipart-3") return value;
++  throw new Error("Launcher browser submission handshake transport is invalid");
++}
++
++function parseIdentity(value: unknown): ChatGptHelperSubmissionIdentity {
++  if (value === "stage-1" || value === "stage-2" || value === "final") return value;
++  throw new Error("Launcher browser submission handshake identity is invalid");
++}
++
++function parseFrame(
++  value: unknown,
++  type: ChatGptHelperSubmissionAttempt["type"] | ChatGptHelperSubmissionAuthorization["type"],
++): Omit<ChatGptHelperSubmissionAttempt, "type"> {
++  if (!value || typeof value !== "object" || Array.isArray(value)) {
++    throw new Error("Launcher browser submission handshake is not an object");
++  }
++  const frame = value as Record<string, unknown>;
++  assertExactKeys(frame, ["type", "id", "transport", "submission"]);
++  if (frame.type !== type) throw new Error("Launcher browser submission handshake type is invalid");
++  if (typeof frame.id !== "string" || !/^[A-Za-z0-9_-]{6,128}$/.test(frame.id)) {
++    throw new Error("Launcher browser submission handshake turn identity is invalid");
++  }
++  return {
++    id: frame.id,
++    transport: parseTransport(frame.transport),
++    submission: parseIdentity(frame.submission),
++  };
++}
++
++/** 父进程只接收 turn、transport 与 stage/final 身份，额外 prompt/hash/DOM 字段一律拒绝。 */
++export function parseChatGptHelperSubmissionAttempt(value: unknown): ChatGptHelperSubmissionAttempt {
++  return { type: "submission_attempt", ...parseFrame(value, "submission_attempt") };
++}
++
++/** helper 以同一封闭字段集合校验授权，防止错 turn 或错 stage 解锁真实 Enter。 */
++export function parseChatGptHelperSubmissionAuthorization(
++  value: unknown,
++): ChatGptHelperSubmissionAuthorization {
++  return { type: "submission_authorized", ...parseFrame(value, "submission_authorized") };
++}
++
++interface PendingAuthorization {
++  attempt: ChatGptHelperSubmissionAttempt;
++  resolve(): void;
++  reject(error: Error): void;
++  timer: ReturnType<typeof setTimeout>;
++  signal?: AbortSignal;
++  abortListener?: () => void;
++}
++
++/**
++ * helper 在发 attempt 前先登记 waiter；只有完全匹配的父进程授权才能跨过不可逆派发边界。
++ * timeout、abort 与 shutdown 都会回收 waiter，避免遗留授权误解锁后续提交。
++ */
++export class ChatGptHelperSubmissionAuthorizationGate {
++  private readonly pending = new Map<string, PendingAuthorization>();
++
++  constructor(
++    private readonly emitAttempt: (attempt: ChatGptHelperSubmissionAttempt) => void,
++    private readonly timeoutMs = 30_000,
++  ) {
++    if (!Number.isInteger(timeoutMs) || timeoutMs < 1) {
++      throw new Error("Launcher browser submission authorization timeout is invalid");
++    }
++  }
++
++  request(value: ChatGptHelperSubmissionAttempt, signal?: AbortSignal): Promise<void> {
++    const attempt = parseChatGptHelperSubmissionAttempt(value);
++    if (this.pending.has(attempt.id)) {
++      throw new Error(`Launcher browser submission authorization is already pending for ${attempt.id}`);
++    }
++    if (signal?.aborted) {
++      return Promise.reject(new DOMException("Launcher browser submission authorization aborted", "AbortError"));
++    }
++    return new Promise<void>((resolve, reject) => {
++      const timer = setTimeout(() => {
++        this.rejectTurn(attempt.id, new Error("Launcher browser submission authorization timed out"));
++      }, this.timeoutMs);
++      const pending: PendingAuthorization = { attempt, resolve, reject, timer, signal };
++      if (signal) {
++        pending.abortListener = () => this.rejectTurn(
++          attempt.id,
++          new DOMException("Launcher browser submission authorization aborted", "AbortError"),
++        );
++        signal.addEventListener("abort", pending.abortListener, { once: true });
++      }
++      this.pending.set(attempt.id, pending);
++      try {
++        this.emitAttempt(attempt);
++      } catch (error) {
++        this.rejectTurn(attempt.id, error instanceof Error ? error : new Error(String(error)));
++      }
++    });
++  }
++
++  authorize(value: unknown): void {
++    const authorization = parseChatGptHelperSubmissionAuthorization(value);
++    const pending = this.pending.get(authorization.id);
++    if (!pending) throw new Error("Launcher browser submission authorization has no pending attempt");
++    if (authorization.transport !== pending.attempt.transport
++      || authorization.submission !== pending.attempt.submission) {
++      throw new Error("Launcher browser submission authorization does not match its pending attempt");
++    }
++    this.cleanup(pending);
++    this.pending.delete(authorization.id);
++    pending.resolve();
++  }
++
++  rejectTurn(id: string, error: Error): boolean {
++    const pending = this.pending.get(id);
++    if (!pending) return false;
++    this.cleanup(pending);
++    this.pending.delete(id);
++    pending.reject(error);
++    return true;
++  }
++
++  rejectAll(error: Error): void {
++    for (const id of [...this.pending.keys()]) this.rejectTurn(id, error);
++  }
++
++  private cleanup(pending: PendingAuthorization): void {
++    clearTimeout(pending.timer);
++    if (pending.signal && pending.abortListener) {
++      pending.signal.removeEventListener("abort", pending.abortListener);
++    }
++  }
++}
+diff --git a/src/adapters/chatgpt-web/launcher-helper-client.ts b/src/adapters/chatgpt-web/launcher-helper-client.ts
+index 99356a0..9c36b17 100644
+--- a/src/adapters/chatgpt-web/launcher-helper-client.ts
++++ b/src/adapters/chatgpt-web/launcher-helper-client.ts
+@@ -8,6 +8,223 @@ import {
+   parseChatGptLunaCheckpoint,
+   type ChatGptLunaCheckpoint,
+ } from "./rolling-checkpoint";
++import {
++  parseChatGptHelperSubmissionAttempt,
++  type ChatGptHelperSubmissionAttempt,
++  type ChatGptHelperSubmissionTransport,
++} from "./helper-submission-authorization";
++
++function chatGptHelperSubmissionTransport(
++  prepared: CompiledChatGptWebPrompt,
++): ChatGptHelperSubmissionTransport {
++  if (!prepared.multipart) return "inline";
++  const partCount = prepared.multipart.parts.length;
++  if (partCount !== 2 && partCount !== 3) {
++    throw new Error(`Launcher browser helper multipart transport is invalid (${partCount} parts)`);
++  }
++  return `multipart-${partCount}`;
++}
++
++/** 父进程以实际 prepared transport 为权威，attempt -> accepted -> ACK 只能单向前进。 */
++class ChatGptHelperSubmissionState {
++  private readonly stageCount: number;
++  private attemptedStageIndex?: number;
++  private acceptedStageIndex?: number;
++  private nextStageIndex = 1;
++  private finalAttempted = false;
++  private sendActivated = false;
++  private finalAccepted = false;
++  private irreversible = false;
++
++  constructor(private readonly transport: ChatGptHelperSubmissionTransport) {
++    this.stageCount = transport === "inline" ? 0 : Number(transport.at(-1)) - 1;
++  }
++
++  observeAttempt(event: ChatGptHelperSubmissionAttempt): void {
++    if (event.transport !== this.transport) {
++      throw new Error(`Launcher browser helper submission transport changed from ${this.transport} to ${event.transport}`);
++    }
++    if (event.submission === "final") {
++      if (this.finalAttempted || this.finalAccepted) {
++        throw new Error("Launcher browser helper emitted a duplicate final attempt");
++      }
++      if (this.attemptedStageIndex !== undefined
++        || this.acceptedStageIndex !== undefined
++        || this.nextStageIndex <= this.stageCount) {
++        throw new Error(`Launcher browser helper final attempt requires stage ${this.nextStageIndex} acknowledgement`);
++      }
++      this.finalAttempted = true;
++      // 父进程在写 authorization 前先立不可重试屏障；写失败也不能把该 turn 当作可安全重放。
++      this.irreversible = true;
++      return;
++    }
++    const stageIndex = event.submission === "stage-1" ? 1 : 2;
++    if (this.stageCount === 0 || stageIndex > this.stageCount) {
++      throw new Error(`Launcher browser helper stage ${stageIndex} exceeds ${this.transport} transport`);
++    }
++    if (this.attemptedStageIndex !== undefined || this.acceptedStageIndex !== undefined
++      || stageIndex !== this.nextStageIndex || this.finalAttempted || this.finalAccepted) {
++      throw new Error(`Launcher browser helper stage ${stageIndex} attempt is duplicate or out of order`);
++    }
++    this.attemptedStageIndex = stageIndex;
++    this.irreversible = true;
++  }
++
++  observeStageAccepted(stageIndex: number): void {
++    this.assertStageIndex(stageIndex);
++    if (this.acceptedStageIndex === stageIndex) {
++      throw new Error(`Launcher browser helper emitted a duplicate stage ${stageIndex} acceptance`);
++    }
++    if (this.attemptedStageIndex !== stageIndex) {
++      throw new Error(`Launcher browser helper stage ${stageIndex} acceptance arrived before its attempt`);
++    }
++    if (this.acceptedStageIndex !== undefined || stageIndex !== this.nextStageIndex) {
++      throw new Error(`Launcher browser helper stage ${stageIndex} acceptance is out of order`);
++    }
++    this.attemptedStageIndex = undefined;
++    this.acceptedStageIndex = stageIndex;
++  }
++
++  observeStageAcknowledged(stageIndex: number): void {
++    this.assertStageIndex(stageIndex);
++    if (this.acceptedStageIndex === undefined) {
++      throw new Error(`Launcher browser helper stage ${stageIndex} acknowledgement arrived before acceptance`);
++    }
++    if (stageIndex !== this.acceptedStageIndex) {
++      throw new Error(`Launcher browser helper stage ${stageIndex} acknowledgement is out of order`);
++    }
++    this.acceptedStageIndex = undefined;
++    this.nextStageIndex += 1;
++  }
++
++  observeSendActivated(): void {
++    if (!this.finalAttempted) {
++      throw new Error("Launcher browser helper Send activation arrived before final authorization");
++    }
++    if (this.sendActivated) throw new Error("Launcher browser helper duplicated Send activation");
++    if (this.finalAccepted) throw new Error("Launcher browser helper activated Send after final acceptance");
++    this.sendActivated = true;
++  }
++
++  observeFinalAccepted(): void {
++    if (this.finalAccepted) throw new Error("Launcher browser helper emitted a duplicate final acceptance");
++    if (!this.finalAttempted || !this.sendActivated) {
++      throw new Error("Launcher browser helper final acceptance arrived before Send activation");
++    }
++    if (this.acceptedStageIndex !== undefined || this.nextStageIndex <= this.stageCount) {
++      throw new Error(`Launcher browser helper final acceptance requires stage ${this.nextStageIndex} acknowledgement`);
++    }
++    this.finalAccepted = true;
++  }
++
++  hasIrreversibleSubmission(): boolean {
++    return this.irreversible;
++  }
++
++  isComplete(): boolean {
++    return this.finalAccepted;
++  }
++
++  matchesTransport(transport: ChatGptHelperSubmissionTransport): boolean {
++    return this.transport === transport;
++  }
++
++  private assertStageIndex(stageIndex: number): void {
++    if (!Number.isInteger(stageIndex) || stageIndex < 1 || stageIndex > this.stageCount) {
++      throw new Error(`Launcher browser helper stage ${stageIndex} exceeds ${this.transport} transport`);
++    }
++  }
++}
++
++/**
++ * v4 fresh/resume 选择仍由 prepared_selected 握手决定；本状态机只在其确认后建立对应 transport，
++ * 再把逐段授权与既有 send_activated/submitted 串成一个不可分叉的协议。
++ */
++export class ChatGptHelperTurnProtocolState {
++  private preparedSelection?: boolean;
++  private submission?: ChatGptHelperSubmissionState;
++
++  constructor(private readonly id: string) {
++    if (!/^[A-Za-z0-9_-]{6,128}$/.test(id)) throw new Error("Launcher browser helper turn identity is invalid");
++  }
++
++  observePreparedSelected(reused: boolean): void {
++    if (typeof reused !== "boolean") throw new Error("Launcher browser helper prompt selection is invalid");
++    if (this.preparedSelection !== undefined) {
++      throw new Error("Launcher browser helper emitted a duplicate prompt selection");
++    }
++    this.preparedSelection = reused;
++  }
++
++  acknowledgePrepared(transport: ChatGptHelperSubmissionTransport): void {
++    if (this.preparedSelection === undefined) {
++      throw new Error("Launcher browser helper prompt acknowledgement preceded selection");
++    }
++    if (this.submission) throw new Error("Launcher browser helper duplicated prompt acknowledgement");
++    this.submission = new ChatGptHelperSubmissionState(transport);
++  }
++
++  observeAttempt(event: ChatGptHelperSubmissionAttempt): void {
++    if (event.id !== this.id) throw new Error("Launcher browser helper submission attempt changed turn identity");
++    this.requireSubmission().observeAttempt(event);
++  }
++
++  observeStageAccepted(transport: ChatGptHelperSubmissionTransport, stageIndex: number): void {
++    this.assertTransport(transport);
++    this.requireSubmission().observeStageAccepted(stageIndex);
++  }
++
++  observeStageAcknowledged(transport: ChatGptHelperSubmissionTransport, stageIndex: number): void {
++    this.assertTransport(transport);
++    this.requireSubmission().observeStageAcknowledged(stageIndex);
++  }
++
++  observeSendActivated(): void {
++    this.requireSubmission().observeSendActivated();
++  }
++
++  observeSubmitted(): void {
++    this.requireSubmission().observeFinalAccepted();
++  }
++
++  hasIrreversibleSubmission(): boolean {
++    return this.submission?.hasIrreversibleSubmission() ?? false;
++  }
++
++  isComplete(): boolean {
++    return this.submission?.isComplete() ?? false;
++  }
++
++  private assertTransport(transport: ChatGptHelperSubmissionTransport): void {
++    const actual = this.requireSubmission();
++    if (!actual.matchesTransport(transport)) {
++      throw new Error("Launcher browser helper submission transport changed after prompt selection");
++    }
++  }
++
++  private requireSubmission(): ChatGptHelperSubmissionState {
++    if (!this.submission) throw new Error("Launcher browser helper submission preceded prompt acknowledgement");
++    return this.submission;
++  }
++}
++
++function chatGptHelperSubmissionAmbiguousError(detail: string): ChatGptWebAdapterError {
++  return new ChatGptWebAdapterError(
++    `ChatGPT armed or accepted part of this browser submission before the helper connection became ambiguous (${detail}). The turn will not be retried automatically.`,
++    {
++      status: 502,
++      errorType: "server_error",
++      code: "multipart_submission_ambiguous",
++      retryable: false,
++    },
++  );
++}
++
++function protectHelperIrreversibleFailure(pending: PendingTurn, error: Error): Error {
++  if (!pending.protocolState.hasIrreversibleSubmission()) return error;
++  if (error instanceof ChatGptWebAdapterError && !error.retryable) return error;
++  return chatGptHelperSubmissionAmbiguousError(error.message);
++}
+ 
+ interface PendingTurn {
+   turn: BrowserTurn;
+@@ -17,12 +234,21 @@ interface PendingTurn {
+   sent?: boolean;
+   prepared?: CompiledChatGptWebPrompt & { release: () => void };
+   localFailure?: Error;
++  protocolState: ChatGptHelperTurnProtocolState;
+ }
+ 
+ type HelperMessage =
+   | { type: "ready" }
++  | ChatGptHelperSubmissionAttempt
+   | { type: "event"; id: string; event: "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean }
+   | { type: "event"; id: string; event: "prepared_selected"; reused: boolean }
++  | {
++      type: "event";
++      id: string;
++      event: "stage_submission_accepted" | "stage_acknowledged";
++      transport: ChatGptHelperSubmissionTransport;
++      stageIndex: number;
++    }
+   | { type: "event"; id: string; event: "luna_checkpoint"; checkpoint: ChatGptLunaCheckpoint; answerHash: string }
+   | { type: "result"; id: string; text: string }
+   | {
+@@ -36,19 +262,37 @@ type HelperMessage =
+       retryable?: boolean;
+     };
+ 
++function assertExactHelperKeys(value: Record<string, unknown>, expected: readonly string[]): void {
++  const keys = Object.keys(value).sort();
++  const allowed = [...expected].sort();
++  if (keys.length !== allowed.length || keys.some((key, index) => key !== allowed[index])) {
++    throw new Error("Launcher browser helper state frame has unknown or missing fields");
++  }
++}
++
++function parseChatGptHelperTransport(value: unknown): ChatGptHelperSubmissionTransport {
++  if (value === "inline" || value === "multipart-2" || value === "multipart-3") return value;
++  throw new Error("Launcher browser helper submission transport is invalid");
++}
++
+ function parseHelperMessage(line: string): HelperMessage {
+   const value = JSON.parse(line) as unknown;
+   if (!value || typeof value !== "object" || Array.isArray(value)) {
+     throw new Error("Launcher browser helper message is not an object");
+   }
+   const message = value as Record<string, unknown>;
+-  if (message.type === "ready") return { type: "ready" };
++  if (message.type === "ready") {
++    assertExactHelperKeys(message, ["type"]);
++    return { type: "ready" };
++  }
++  if (message.type === "submission_attempt") return parseChatGptHelperSubmissionAttempt(message);
+   if (typeof message.id !== "string" || !message.id) {
+     throw new Error("Launcher browser helper message has no turn identity");
+   }
+   if (message.type === "event") {
+     const event = message.event;
+     if (event === "luna_checkpoint") {
++      assertExactHelperKeys(message, ["type", "id", "event", "checkpoint", "answerHash"]);
+       if (typeof message.answerHash !== "string" || !/^[a-f0-9]{64}$/.test(message.answerHash)) {
+         throw new Error("Launcher browser helper Luna checkpoint answer hash is invalid");
+       }
+@@ -63,11 +307,30 @@ function parseHelperMessage(line: string): HelperMessage {
+     const text = message.text;
+     const continuation = message.continuation;
+     if (event === "prepared_selected") {
++      assertExactHelperKeys(message, ["type", "id", "event", "reused"]);
+       if (typeof message.reused !== "boolean") {
+         throw new Error("Launcher browser helper prompt selection is invalid");
+       }
+       return { type: "event", id: message.id, event, reused: message.reused };
+     }
++    if (event === "stage_submission_accepted" || event === "stage_acknowledged") {
++      assertExactHelperKeys(message, ["type", "id", "event", "transport", "stageIndex"]);
++      if (!Number.isInteger(message.stageIndex)
++        || (message.stageIndex as number) < 1
++        || (message.stageIndex as number) > 2) {
++        throw new Error("Launcher browser helper multipart stage event is invalid");
++      }
++      return {
++        type: "event",
++        id: message.id,
++        event,
++        transport: parseChatGptHelperTransport(message.transport),
++        stageIndex: message.stageIndex as number,
++      };
++    }
++    if (event === "send_activated" || event === "submitted") {
++      assertExactHelperKeys(message, ["type", "id", "event"]);
++    }
+     if (!["heartbeat", "send_activated", "submitted", "reasoning", "commentary", "text"].includes(String(event))) {
+       throw new Error("Launcher browser helper emitted an unknown event");
+     }
+@@ -77,6 +340,20 @@ function parseHelperMessage(line: string): HelperMessage {
+     if (continuation !== undefined && typeof continuation !== "boolean") {
+       throw new Error("Launcher browser helper continuation flag is invalid");
+     }
++    if (event === "heartbeat") {
++      assertExactHelperKeys(message, ["type", "id", "event"]);
++    } else if (event === "text") {
++      assertExactHelperKeys(message, ["type", "id", "event", "text"]);
++      if (typeof text !== "string") throw new Error("Launcher browser helper text event is invalid");
++    } else if (event === "reasoning" || event === "commentary") {
++      assertExactHelperKeys(
++        message,
++        continuation === undefined
++          ? ["type", "id", "event", "text"]
++          : ["type", "id", "event", "text", "continuation"],
++      );
++      if (typeof text !== "string") throw new Error("Launcher browser helper streamed event text is invalid");
++    }
+     return {
+       type: "event",
+       id: message.id,
+@@ -86,6 +363,7 @@ function parseHelperMessage(line: string): HelperMessage {
+     };
+   }
+   if (message.type === "result") {
++    assertExactHelperKeys(message, ["type", "id", "text"]);
+     const text = message.text;
+     if (typeof text !== "string") {
+       throw new Error("Launcher browser helper result text is invalid");
+@@ -103,6 +381,12 @@ function parseHelperMessage(line: string): HelperMessage {
+       || errorType !== undefined
+       || code !== undefined
+       || retryable !== undefined;
++    assertExactHelperKeys(
++      message,
++      structured
++        ? ["type", "id", "message", ...(errorName === undefined ? [] : ["name"]), "status", "errorType", "code", "retryable"]
++        : ["type", "id", "message", ...(errorName === undefined ? [] : ["name"])],
++    );
+     if (typeof errorMessage !== "string"
+       || (errorName !== undefined && typeof errorName !== "string")
+       || (structured && (
+@@ -151,7 +435,12 @@ export class LauncherBrowserHelperClient {
+           rejectResult(new Error(`Duplicate launcher browser turn: ${turn.traceId}`));
+           return;
+         }
+-        const pending: PendingTurn = { turn, resolve: resolveResult, reject: rejectResult };
++        const pending: PendingTurn = {
++          turn,
++          resolve: resolveResult,
++          reject: rejectResult,
++          protocolState: new ChatGptHelperTurnProtocolState(turn.traceId),
++        };
+         this.pending.set(turn.traceId, pending);
+         if (turn.abortSignal) {
+           const abortListener = () => {
+@@ -165,7 +454,10 @@ export class LauncherBrowserHelperClient {
+             void this.send({ type: "abort", id: turn.traceId }).catch(error => {
+               this.finishWithError(
+                 turn.traceId,
+-                error instanceof Error ? error : new Error(String(error)),
++                protectHelperIrreversibleFailure(
++                  pending,
++                  error instanceof Error ? error : new Error(String(error)),
++                ),
+               );
+             });
+           };
+@@ -213,7 +505,9 @@ export class LauncherBrowserHelperClient {
+     this.readyResolve = undefined;
+     this.readyReject = undefined;
+     for (const id of [...this.pending.keys()]) {
+-      this.finishWithError(id, new DOMException("Launcher browser helper is closing", "AbortError"));
++      const pending = this.pending.get(id);
++      const error = new DOMException("Launcher browser helper is closing", "AbortError");
++      this.finishWithError(id, pending ? protectHelperIrreversibleFailure(pending, error) : error);
+     }
+     if (!child) return;
+     await this.sendTo(child, { type: "shutdown" }).catch(() => {});
+@@ -300,10 +594,7 @@ export class LauncherBrowserHelperClient {
+     try { message = parseHelperMessage(line); }
+     catch (error) {
+       const detail = error instanceof Error ? error.message : String(error);
+-      this.handleExit(child, new Error(`Launcher browser helper emitted invalid protocol data: ${detail}`));
+-      void this.terminateChild(child, 0).catch(error => {
+-        console.error(`[chatgpt-web-helper] invalid-protocol cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+-      });
++      this.failProtocol(child, detail);
+       return;
+     }
+     if (message.type === "ready") {
+@@ -313,10 +604,38 @@ export class LauncherBrowserHelperClient {
+       return;
+     }
+     const pending = this.pending.get(message.id);
+-    if (!pending) return;
++    if (!pending) {
++      if (message.type === "submission_attempt") {
++        this.failProtocol(child, "Launcher browser helper attempt has no pending turn");
++      }
++      return;
++    }
++    if (message.type === "submission_attempt") {
++      try { pending.protocolState.observeAttempt(message); }
++      catch (error) {
++        this.failProtocol(child, error instanceof Error ? error.message : String(error));
++        return;
++      }
++      // 状态先于 pipe ACK 前进；一旦授权帧写失败，也必须保留“可能已提交”的不可重试边界。
++      void this.sendTo(child, {
++        type: "submission_authorized",
++        id: message.id,
++        transport: message.transport,
++        submission: message.submission,
++      }).catch(error => this.failProtocol(
++        child,
++        `Launcher browser helper submission authorization failed: ${error instanceof Error ? error.message : String(error)}`,
++      ));
++      return;
++    }
+     if (message.type === "event") {
+       if (message.event === "heartbeat") pending.turn.onHeartbeat?.();
+       else if (message.event === "send_activated") {
++        try { pending.protocolState.observeSendActivated(); }
++        catch (error) {
++          this.failProtocol(child, error instanceof Error ? error.message : String(error));
++          return;
++        }
+         void Promise.resolve().then(() => pending.turn.onSendActivated?.()).then(() => {
+           if (this.pending.get(message.id) !== pending) return;
+           return this.send({ type: "send_activation_ack", id: message.id });
+@@ -326,8 +645,20 @@ export class LauncherBrowserHelperClient {
+           pending,
+         ));
+       }
+-      else if (message.event === "submitted") pending.turn.onSubmitted?.();
++      else if (message.event === "submitted") {
++        try { pending.protocolState.observeSubmitted(); }
++        catch (error) {
++          this.failProtocol(child, error instanceof Error ? error.message : String(error));
++          return;
++        }
++        pending.turn.onSubmitted?.();
++      }
+       else if (message.event === "prepared_selected") {
++        try { pending.protocolState.observePreparedSelected(message.reused); }
++        catch (error) {
++          this.failProtocol(child, error instanceof Error ? error.message : String(error));
++          return;
++        }
+         const prepare = message.reused ? pending.turn.prepareResume : pending.turn.prepare;
+         void Promise.resolve().then(() => prepare?.()).then(prepared => {
+           if (!prepared) throw new Error("Launcher browser helper selected an unavailable continuation prompt");
+@@ -336,6 +667,7 @@ export class LauncherBrowserHelperClient {
+             return;
+           }
+           pending.prepared = prepared;
++          pending.protocolState.acknowledgePrepared(chatGptHelperSubmissionTransport(prepared));
+           return Promise.resolve(pending.turn.onPreparedSelected?.(message.reused)).then(() => {
+             if (this.pending.get(message.id) !== pending) return;
+             return this.send({
+@@ -357,6 +689,18 @@ export class LauncherBrowserHelperClient {
+           pending,
+         ));
+       }
++      else if (message.event === "stage_submission_accepted") {
++        try { pending.protocolState.observeStageAccepted(message.transport, message.stageIndex); }
++        catch (error) {
++          this.failProtocol(child, error instanceof Error ? error.message : String(error));
++        }
++      }
++      else if (message.event === "stage_acknowledged") {
++        try { pending.protocolState.observeStageAcknowledged(message.transport, message.stageIndex); }
++        catch (error) {
++          this.failProtocol(child, error instanceof Error ? error.message : String(error));
++        }
++      }
+       else if (message.event === "luna_checkpoint") {
+         if (!pending.turn.captureLunaCheckpoint || !pending.turn.onLunaCheckpoint) {
+           this.finishWithError(message.id, new Error("Launcher browser helper emitted an unexpected Luna checkpoint"));
+@@ -372,6 +716,10 @@ export class LauncherBrowserHelperClient {
+       return;
+     }
+     if (message.type === "result") {
++      if (!pending.protocolState.isComplete()) {
++        this.failProtocol(child, "Launcher browser helper returned a result before final submission evidence");
++        return;
++      }
+       this.finish(message.id);
+       if (pending.localFailure) pending.reject(pending.localFailure);
+       else pending.resolve(message.text);
+@@ -387,13 +735,20 @@ export class LauncherBrowserHelperClient {
+           ? new DOMException(message.message, "AbortError")
+           : new Error(message.message);
+       this.finish(message.id);
+-      pending.reject(pending.localFailure ?? error);
++      pending.reject(pending.localFailure ?? protectHelperIrreversibleFailure(pending, error));
+     }
+   }
+ 
++  private failProtocol(child: ChildProcessWithoutNullStreams, detail: string): void {
++    this.handleExit(child, new Error(`Launcher browser helper emitted invalid protocol data: ${detail}`));
++    void this.terminateChild(child, 0).catch(error => {
++      console.error(`[chatgpt-web-helper] invalid-protocol cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
++    });
++  }
++
+   private abortWithLocalFailure(id: string, error: Error, pending: PendingTurn): void {
+     if (this.pending.get(id) !== pending || pending.localFailure) return;
+-    pending.localFailure = error;
++    pending.localFailure = protectHelperIrreversibleFailure(pending, error);
+     void this.send({ type: "abort", id }).catch(sendError => {
+       if (this.pending.get(id) !== pending) return;
+       this.finishWithError(
+@@ -441,11 +796,14 @@ export class LauncherBrowserHelperClient {
+         status: "failed",
+         message: "Launcher browser helper exited before completing the turn",
+       }).then(
+-        () => this.finishWithError(id, pending.localFailure ?? error),
++        () => this.finishWithError(id, pending.localFailure ?? protectHelperIrreversibleFailure(pending, error)),
+         controlError => this.finishWithError(
+           id,
+           new AggregateError(
+-            [pending.localFailure ?? error, controlError instanceof Error ? controlError : new Error(String(controlError))],
++            [
++              pending.localFailure ?? protectHelperIrreversibleFailure(pending, error),
++              controlError instanceof Error ? controlError : new Error(String(controlError)),
++            ],
+             `Launcher browser helper exited and failed to release turn ${id}`,
+           ),
+         ),
+diff --git a/tests/browser-helper-prompt-selection.test.ts b/tests/browser-helper-prompt-selection.test.ts
+new file mode 100644
+index 0000000..64e2474
+--- /dev/null
++++ b/tests/browser-helper-prompt-selection.test.ts
+@@ -0,0 +1,12 @@
++import { expect, test } from "bun:test";
++import { createBrowserHelperPromptSelection } from "../src/adapters/chatgpt-web/browser-helper-prompt-selection";
++
++test("helper prompt selection accepts exactly one fresh or resume acknowledgement", async () => {
++  const selection = createBrowserHelperPromptSelection();
++  selection.select({ text: "resume", images: [] });
++
++  expect(() => selection.select({ text: "conflicting fresh", images: [] }))
++    .toThrow("already selected");
++  await expect(selection.wait()).resolves.toMatchObject({ text: "resume" });
++  selection.cancel();
++});
+diff --git a/tests/browser-submission-state.test.ts b/tests/browser-submission-state.test.ts
+new file mode 100644
+index 0000000..f3bac10
+--- /dev/null
++++ b/tests/browser-submission-state.test.ts
+@@ -0,0 +1,133 @@
++import { expect, test } from "bun:test";
++import type { Page } from "playwright-core";
++import {
++  ChatGptMultipartSubmissionState,
++  executeChatGptFinalSubmission,
++  executeChatGptMultipartStages,
++  protectChatGptIrreversibleSubmissionFailure,
++  throwIfChatGptRateLimitDialog,
++} from "../src/adapters/chatgpt-web/browser-worker";
++
++async function dismissCooldown(boundary: string, transitions: string[]): Promise<void> {
++  let visible = true;
++  const button = {
++    last: () => button,
++    isVisible: async () => visible,
++    press: async () => { visible = false; },
++  };
++  const dialog = {
++    filter: () => dialog,
++    last: () => dialog,
++    isVisible: async () => visible,
++    waitFor: async ({ state }: { state: string }) => {
++      if (state === "hidden" && visible) throw new Error("dialog stayed visible");
++    },
++    getByRole: () => button,
++  };
++  await throwIfChatGptRateLimitDialog({ locator: () => dialog } as unknown as Page);
++  transitions.push(`cooldown-${boundary}`);
++}
++
++test("a three-part browser transaction resumes in place without repeating an accepted submission", async () => {
++  const state = new ChatGptMultipartSubmissionState(2);
++  const sends = [0, 0, 0];
++  const transitions: string[] = [];
++
++  await executeChatGptMultipartStages(state, 2, {
++    prepareStage: async stageIndex => {
++      await dismissCooldown(stageIndex === 1 ? "stage-1-send" : "stage-2-effort", transitions);
++      transitions.push(`prepared-${stageIndex}`);
++      return { stageIndex };
++    },
++    submitStage: async (stageIndex, _context, markAttempted) => {
++      markAttempted();
++      sends[stageIndex - 1] += 1;
++      transitions.push(`accepted-${stageIndex}`);
++      return `stage-${stageIndex}`;
++    },
++    onStageAccepted: async stageIndex => {
++      transitions.push(`recorded-${stageIndex}`);
++      await dismissCooldown(`stage-${stageIndex}-accepted`, transitions);
++    },
++    waitForStageAcknowledgement: async stageIndex => {
++      // cooldown 消失只唤醒当前 ACK wait，不重新进入 submitStage。
++      await dismissCooldown(`stage-${stageIndex}-ack`, transitions);
++      transitions.push(`ack-visible-${stageIndex}`);
++    },
++    onStageAcknowledged: stageIndex => { transitions.push(`acknowledged-${stageIndex}`); },
++  });
++
++  let compactionAttempts = 0;
++  while (compactionAttempts < 2) {
++    compactionAttempts += 1;
++    if (compactionAttempts === 1) continue;
++    await dismissCooldown("compaction-final-ready", transitions);
++  }
++
++  await executeChatGptFinalSubmission(state, {
++    submit: async markAttempted => {
++      await dismissCooldown("final-send", transitions);
++      markAttempted();
++      sends[2] += 1;
++      return "final";
++    },
++    onAccepted: async () => {
++      transitions.push("final-accepted");
++      await dismissCooldown("final-response", transitions);
++    },
++  });
++
++  expect(sends).toEqual([1, 1, 1]);
++  expect(compactionAttempts).toBe(2);
++  expect(transitions).toEqual([
++    "cooldown-stage-1-send", "prepared-1", "accepted-1", "recorded-1",
++    "cooldown-stage-1-accepted", "cooldown-stage-1-ack", "ack-visible-1", "acknowledged-1",
++    "cooldown-stage-2-effort", "prepared-2", "accepted-2", "recorded-2",
++    "cooldown-stage-2-accepted", "cooldown-stage-2-ack", "ack-visible-2", "acknowledged-2",
++    "cooldown-compaction-final-ready", "cooldown-final-send", "final-accepted",
++    "cooldown-final-response",
++  ]);
++  await expect(executeChatGptFinalSubmission(state, {
++    submit: async () => "duplicate",
++    onAccepted() {},
++  })).rejects.toThrow("already accepted");
++  expect(sends).toEqual([1, 1, 1]);
++});
++
++test("a missing stage acknowledgement blocks every later stage and final commit", async () => {
++  const state = new ChatGptMultipartSubmissionState(2);
++  const sends = [0, 0, 0];
++
++  await expect(executeChatGptMultipartStages(state, 2, {
++    prepareStage: async stageIndex => stageIndex,
++    submitStage: async (stageIndex, _context, markAttempted) => {
++      markAttempted();
++      sends[stageIndex - 1] += 1;
++      return stageIndex;
++    },
++    onStageAccepted() {},
++    waitForStageAcknowledgement: async () => { throw new Error("stage ACK timed out"); },
++    onStageAcknowledged() {},
++  })).rejects.toThrow("stage ACK timed out");
++
++  expect(sends).toEqual([1, 0, 0]);
++  await expect(executeChatGptFinalSubmission(state, {
++    submit: async markAttempted => { markAttempted(); sends[2] += 1; return "final"; },
++    onAccepted() {},
++  })).rejects.toThrow("every multipart stage acknowledgement");
++  expect(sends).toEqual([1, 0, 0]);
++});
++
++test("an irreversible stage failure is normalized to a non-retryable ambiguity", () => {
++  const state = new ChatGptMultipartSubmissionState(1);
++  state.markStageAttempted(1);
++
++  expect(protectChatGptIrreversibleSubmissionFailure(
++    state,
++    new Error("helper pipe closed after authorization"),
++  )).toMatchObject({
++    status: 502,
++    code: "multipart_submission_ambiguous",
++    retryable: false,
++  });
++});
+diff --git a/tests/browser-worker-contract.test.ts b/tests/browser-worker-contract.test.ts
+index 9ce62dc..5473dcc 100644
+--- a/tests/browser-worker-contract.test.ts
++++ b/tests/browser-worker-contract.test.ts
+@@ -1,7 +1,7 @@
+ import { expect, test } from "bun:test";
+ import { readFileSync } from "node:fs";
+ import type { Page } from "playwright-core";
+-import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptConnectorAttachmentMode, chatGptEffortSelectionRequired, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout } from "../src/adapters/chatgpt-web/browser-worker";
++import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptRateLimitDialogController, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptConnectorAttachmentMode, chatGptEffortSelectionRequired, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, monitorChatGptRateLimitDialogs, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout } from "../src/adapters/chatgpt-web/browser-worker";
+ import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
+ import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
+ import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
+@@ -1158,15 +1158,23 @@ test("an unrelated Continue dialog is never auto-accepted", async () => {
+   expect(lookedForButton).toBeFalse();
+ });
+ 
+-function dialogPage(text: string, buttonText = "Got it"): { page: Page; pressed: string[] } {
++function dialogPage(
++  text: string,
++  buttonText = "Got it",
++  options: { remainVisibleAfterPress?: boolean } = {},
++): { page: Page; pressed: string[] } {
+   const pressed: string[] = [];
+   const createDialog = () => {
+     let matches = true;
+     let buttonMatches = true;
++    let visible = true;
+     const button = {
+       last: () => button,
+-      isVisible: async () => matches && buttonMatches,
+-      press: async (key: string) => { pressed.push(key); },
++      isVisible: async () => matches && buttonMatches && visible,
++      press: async (key: string) => {
++        pressed.push(key);
++        if (!options.remainVisibleAfterPress) visible = false;
++      },
+     };
+     const dialog = {
+       filter: ({ hasText }: { hasText: string | RegExp }) => {
+@@ -1174,7 +1182,11 @@ function dialogPage(text: string, buttonText = "Got it"): { page: Page; pressed:
+         return dialog;
+       },
+       last: () => dialog,
+-      isVisible: async () => matches,
++      isVisible: async () => matches && visible,
++      waitFor: async ({ state }: { state: "visible" | "hidden" }) => {
++        if (state === "hidden" && matches && visible) throw new Error("dialog stayed visible");
++        if (state === "visible" && (!matches || !visible)) throw new Error("dialog stayed hidden");
++      },
+       getByRole: (_role: string, options?: { name?: string | RegExp }) => {
+         const name = options?.name;
+         buttonMatches = name === undefined
+@@ -1193,56 +1205,65 @@ function dialogPage(text: string, buttonText = "Got it"): { page: Page; pressed:
+   };
+ }
+ 
+-test("the known ChatGPT rate-limit dialog is acknowledged and returns a structured 429", async () => {
++test("the known ChatGPT rate-limit dialog is acknowledged and the current wait resumes", async () => {
+   const fixture = dialogPage("Too many requests. You're making requests too quickly.");
+ 
+-  await expect(throwIfChatGptRateLimitDialog(fixture.page)).rejects.toMatchObject({
+-    name: "ChatGptWebAdapterError",
+-    status: 429,
+-    errorType: "rate_limit_error",
+-    code: "rate_limit_exceeded",
+-    retryable: true,
+-    message: "ChatGPT rate limit: too many requests. Try again in a few minutes.",
+-  });
++  await throwIfChatGptRateLimitDialog(fixture.page);
+   expect(fixture.pressed).toEqual(["Enter"]);
+ });
+ 
+-test("the Traditional Chinese ChatGPT rate-limit dialog is acknowledged and returns a structured 429", async () => {
++test("the Traditional Chinese ChatGPT cooldown is acknowledged and resumes the current wait", async () => {
+   const fixture = dialogPage("太多要求。你提出要求的頻率過於頻繁。", "知道了");
+ 
+-  await expect(throwIfChatGptRateLimitDialog(fixture.page)).rejects.toMatchObject({
+-    name: "ChatGptWebAdapterError",
+-    status: 429,
+-    errorType: "rate_limit_error",
+-    code: "rate_limit_exceeded",
+-    retryable: true,
+-  });
++  await throwIfChatGptRateLimitDialog(fixture.page);
+   expect(fixture.pressed).toEqual(["Enter"]);
+ });
+ 
+-test("the Simplified Chinese ChatGPT rate-limit dialog is acknowledged and returns a structured 429", async () => {
++test("the Simplified Chinese ChatGPT cooldown is acknowledged and resumes the current wait", async () => {
+   const fixture = dialogPage("太多请求。你提出请求的频率过于频繁。", "知道了");
+ 
++  await throwIfChatGptRateLimitDialog(fixture.page);
++  expect(fixture.pressed).toEqual(["Enter"]);
++});
++
++test("the Japanese ChatGPT cooldown is acknowledged and resumes the current wait", async () => {
++  const fixture = dialogPage(
++    "リクエストが多すぎます リクエストの頻度が高すぎます。お客様のデータを保護するため、会話へのアクセスを一時的に制限しています。 数分待ってから、もう一度お試しください。",
++    "了解",
++  );
++
++  await throwIfChatGptRateLimitDialog(fixture.page);
++  expect(fixture.pressed).toEqual(["Enter"]);
++});
++
++test("the screenshot Simplified Chinese cooldown uses its exact acknowledgement", async () => {
++  const fixture = dialogPage(
++    "请求过于频繁。你的请求过于频繁。为保障数据安全，我们已暂时限制你访问对话记录。请稍等几分钟后再重试。",
++    "明白了",
++  );
++
++  await throwIfChatGptRateLimitDialog(fixture.page);
++  expect(fixture.pressed).toEqual(["Enter"]);
++});
++
++test("a known cooldown fails closed when its exact acknowledgement is missing", async () => {
++  const fixture = dialogPage("Too many requests. You're making requests too quickly.", "Cancel");
+   await expect(throwIfChatGptRateLimitDialog(fixture.page)).rejects.toMatchObject({
+-    name: "ChatGptWebAdapterError",
+     status: 429,
+-    errorType: "rate_limit_error",
+     code: "rate_limit_exceeded",
+     retryable: true,
+   });
+-  expect(fixture.pressed).toEqual(["Enter"]);
++  expect(fixture.pressed).toEqual([]);
+ });
+ 
+-test("the Japanese ChatGPT rate-limit dialog is acknowledged and returns a structured 429", async () => {
++test("a known cooldown fails closed when acknowledgement does not hide it", async () => {
+   const fixture = dialogPage(
+-    "リクエストが多すぎます リクエストの頻度が高すぎます。お客様のデータを保護するため、会話へのアクセスを一時的に制限しています。 数分待ってから、もう一度お試しください。",
+-    "了解",
++    "Too many requests. You're making requests too quickly.",
++    "Got it",
++    { remainVisibleAfterPress: true },
+   );
+-
+   await expect(throwIfChatGptRateLimitDialog(fixture.page)).rejects.toMatchObject({
+-    name: "ChatGptWebAdapterError",
+     status: 429,
+-    errorType: "rate_limit_error",
+     code: "rate_limit_exceeded",
+     retryable: true,
+   });
+@@ -1256,6 +1277,103 @@ test("unrelated ChatGPT dialogs are left untouched", async () => {
+   expect(fixture.pressed).toEqual([]);
+ });
+ 
++test("the turn cooldown controller publishes a new generation only after the dialog disappears", async () => {
++  let visible = false;
++  let releaseVisibleWait!: () => void;
++  const visibleGate = new Promise<void>(resolve => { releaseVisibleWait = resolve; });
++  const button = {
++    last: () => button,
++    isVisible: async () => visible,
++    press: async () => { visible = false; },
++  };
++  let firstWait = true;
++  const dialog = {
++    filter: () => dialog,
++    last: () => dialog,
++    isVisible: async () => visible,
++    waitFor: async ({ state, signal }: { state: "visible" | "hidden"; signal?: AbortSignal }) => {
++      if (state === "hidden") {
++        expect(visible).toBeFalse();
++        return;
++      }
++      if (firstWait) {
++        firstWait = false;
++        await visibleGate;
++        return;
++      }
++      await new Promise<void>((_resolve, reject) => {
++        signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
++      });
++    },
++    getByRole: () => button,
++  };
++  const page = { isClosed: () => false, locator: () => dialog } as unknown as Page;
++  const generations: number[] = [];
++  const controller = new ChatGptRateLimitDialogController(
++    page,
++    undefined,
++    generation => generations.push(generation),
++  );
++  const waitAbort = new AbortController();
++  const dismissed = controller.waitForDismissal(controller.currentGeneration(), waitAbort.signal);
++
++  visible = true;
++  releaseVisibleWait();
++  await dismissed;
++  expect(controller.currentGeneration()).toBe(1);
++  expect(generations).toEqual([1]);
++  await controller.stop();
++});
++
++test("cooldown monitoring keeps handling repeated known dialogs until the turn aborts", async () => {
++  const abort = new AbortController();
++  const pressed: string[] = [];
++  let remaining = 3;
++  let visible = false;
++  const text = "请求过于频繁。你的请求过于频繁。为保障数据安全，我们已暂时限制你访问对话记录。请稍等几分钟后再重试。";
++  const page = {
++    isClosed: () => false,
++    locator: () => {
++      let matches = true;
++      const dialog = {
++        filter: ({ hasText }: { hasText: RegExp }) => { matches &&= hasText.test(text); return dialog; },
++        last: () => dialog,
++        isVisible: async () => matches && visible,
++        waitFor: async ({ state, signal }: { state: "visible" | "hidden"; signal?: AbortSignal }) => {
++          if (state === "hidden") {
++            expect(visible).toBeFalse();
++            return;
++          }
++          if (remaining > 0) {
++            visible = true;
++            return;
++          }
++          await new Promise<void>((_resolve, reject) => {
++            signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
++          });
++        },
++        getByRole: (_role: string, options: { name: RegExp }) => {
++          const button = {
++            last: () => button,
++            isVisible: async () => matches && visible && options.name.test("明白了"),
++            press: async (key: string) => {
++              pressed.push(key);
++              visible = false;
++              remaining -= 1;
++              if (remaining === 0) abort.abort();
++            },
++          };
++          return button;
++        },
++      };
++      return dialog;
++    },
++  } as unknown as Page;
++
++  await monitorChatGptRateLimitDialogs(page, abort.signal);
++  expect(pressed).toEqual(["Enter", "Enter", "Enter"]);
++});
++
+ test("the known terminal ChatGPT error alert returns a structured retryable failure", async () => {
+   const fixture = dialogPage(
+     "Something went wrong. If this issue persists please contact us through our help center at help.openai.com.",
+@@ -1482,7 +1600,7 @@ test("a proven current-turn MCP call accepts only the final browser submission",
+   expect(stagingSend).not.toContain("turn.externalProgress");
+   expect(finalSend).toContain("turn.externalProgress");
+   expect(stagingSend).not.toMatch(/turn,\s*\n\s*\)/);
+-  expect(finalSend).toMatch(/turn,\s*\n\s*\)/);
++  expect(finalSend).toContain("turn.onFinalSubmissionAttempt");
+ });
+ 
+ test("unrelated ChatGPT alerts are not terminal", async () => {
+diff --git a/tests/helper-submission-authorization.test.ts b/tests/helper-submission-authorization.test.ts
+new file mode 100644
+index 0000000..0225741
+--- /dev/null
++++ b/tests/helper-submission-authorization.test.ts
+@@ -0,0 +1,56 @@
++import { expect, test } from "bun:test";
++import {
++  ChatGptHelperSubmissionAuthorizationGate,
++  parseChatGptHelperSubmissionAttempt,
++} from "../src/adapters/chatgpt-web/helper-submission-authorization";
++
++test("helper submission authorization releases only the exact pending transport boundary", async () => {
++  const attempts: unknown[] = [];
++  const gate = new ChatGptHelperSubmissionAuthorizationGate(attempt => attempts.push(attempt), 1_000);
++  let released = false;
++  const pending = gate.request({
++    type: "submission_attempt",
++    id: "turn_auth_123",
++    transport: "multipart-3",
++    submission: "stage-1",
++  }).then(() => { released = true; });
++
++  await Promise.resolve();
++  expect(released).toBeFalse();
++  expect(attempts).toEqual([{
++    type: "submission_attempt",
++    id: "turn_auth_123",
++    transport: "multipart-3",
++    submission: "stage-1",
++  }]);
++  expect(() => gate.authorize({
++    type: "submission_authorized",
++    id: "turn_auth_123",
++    transport: "multipart-3",
++    submission: "final",
++  })).toThrow("does not match");
++  expect(released).toBeFalse();
++
++  gate.authorize({
++    type: "submission_authorized",
++    id: "turn_auth_123",
++    transport: "multipart-3",
++    submission: "stage-1",
++  });
++  await pending;
++  expect(released).toBeTrue();
++  expect(() => gate.authorize({
++    type: "submission_authorized",
++    id: "turn_auth_123",
++    transport: "multipart-3",
++    submission: "stage-1",
++  })).toThrow("no pending attempt");
++
++  expect(() => parseChatGptHelperSubmissionAttempt({
++    type: "submission_attempt",
++    id: "turn_auth_123",
++    transport: "inline",
++    submission: "final",
++    prompt: "must stay private",
++  })).toThrow("unknown or missing fields");
++});
+diff --git a/tests/helper-turn-protocol-state.test.ts b/tests/helper-turn-protocol-state.test.ts
+new file mode 100644
+index 0000000..abf1b2a
+--- /dev/null
++++ b/tests/helper-turn-protocol-state.test.ts
+@@ -0,0 +1,57 @@
++import { expect, test } from "bun:test";
++import { ChatGptHelperTurnProtocolState } from "../src/adapters/chatgpt-web/launcher-helper-client";
++import { parseChatGptHelperSubmissionAttempt } from "../src/adapters/chatgpt-web/helper-submission-authorization";
++
++test("parent protocol composes resume selection, staged authorization, Send activation, and submission evidence", () => {
++  const state = new ChatGptHelperTurnProtocolState("turn_resume_123");
++  state.observePreparedSelected(true);
++  state.acknowledgePrepared("multipart-3");
++
++  const stageOne = parseChatGptHelperSubmissionAttempt({
++    type: "submission_attempt",
++    id: "turn_resume_123",
++    transport: "multipart-3",
++    submission: "stage-1",
++  });
++  state.observeAttempt(stageOne);
++  expect(() => state.observeAttempt(stageOne)).toThrow("duplicate or out of order");
++  state.observeStageAccepted("multipart-3", 1);
++  expect(() => state.observeStageAccepted("multipart-3", 1)).toThrow("duplicate stage 1 acceptance");
++  state.observeStageAcknowledged("multipart-3", 1);
++
++  state.observeAttempt(parseChatGptHelperSubmissionAttempt({
++    type: "submission_attempt",
++    id: "turn_resume_123",
++    transport: "multipart-3",
++    submission: "stage-2",
++  }));
++  state.observeStageAccepted("multipart-3", 2);
++  state.observeStageAcknowledged("multipart-3", 2);
++  state.observeAttempt(parseChatGptHelperSubmissionAttempt({
++    type: "submission_attempt",
++    id: "turn_resume_123",
++    transport: "multipart-3",
++    submission: "final",
++  }));
++  state.observeSendActivated();
++  state.observeSubmitted();
++
++  expect(state.isComplete()).toBeTrue();
++  expect(state.hasIrreversibleSubmission()).toBeTrue();
++  expect(() => state.observePreparedSelected(false)).toThrow("duplicate prompt selection");
++  expect(() => state.observeSubmitted()).toThrow("duplicate final acceptance");
++});
++
++test("parent protocol fails closed when final authorization precedes the required stage ACK", () => {
++  const state = new ChatGptHelperTurnProtocolState("turn_order_123");
++  state.observePreparedSelected(false);
++  state.acknowledgePrepared("multipart-2");
++
++  expect(() => state.observeAttempt(parseChatGptHelperSubmissionAttempt({
++    type: "submission_attempt",
++    id: "turn_order_123",
++    transport: "multipart-2",
++    submission: "final",
++  }))).toThrow("stage 1 acknowledgement");
++  expect(state.hasIrreversibleSubmission()).toBeFalse();
++});
+diff --git a/tests/launcher-helper-client.test.ts b/tests/launcher-helper-client.test.ts
+index 232f4be..9fffde9 100644
+--- a/tests/launcher-helper-client.test.ts
++++ b/tests/launcher-helper-client.test.ts
+@@ -3,7 +3,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+ import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
+-import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
++import {
++  ChatGptHelperTurnProtocolState,
++  LauncherBrowserHelperClient,
++} from "../src/adapters/chatgpt-web/launcher-helper-client";
+ import type { BrowserTurn, ResolvedBrowserConfig } from "../src/adapters/chatgpt-web/browser-worker";
+ import { LAUNCHER_BROWSER_HOST_KIND } from "../src/launcher-browser-host";
+ 
+@@ -30,6 +33,10 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
+         return;
+       }
+       if (message.type === "prepared_selected_ack") {
++        send({ type: "submission_attempt", id: message.id, transport: "inline", submission: "final" });
++        return;
++      }
++      if (message.type === "submission_authorized") {
+         send({ type: "event", id: message.id, event: "send_activated" });
+         return;
+       }
+@@ -131,7 +138,7 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
+   }
+ });
+ 
+-test("launcher helper protocol preserves multipart context and the compaction flag", async () => {
++test("launcher helper protocol preserves resume-selected multipart context and the compaction flag", async () => {
+   const sent: Record<string, unknown>[] = [];
+   const client = new LauncherBrowserHelperClient({
+     appName: "Codex Native2 DEV",
+@@ -148,6 +155,7 @@ test("launcher helper protocol preserves multipart context and the compaction fl
+     child?: unknown;
+     ensureChild(): Promise<void>;
+     send(message: Record<string, unknown>): Promise<void>;
++    sendTo(child: unknown, message: Record<string, unknown>): Promise<void>;
+     finish(id: string): void;
+     handleLine(child: unknown, line: string): void;
+   };
+@@ -162,16 +170,56 @@ test("launcher helper protocol preserves multipart context and the compaction fl
+         type: "event",
+         id: message.id,
+         event: "prepared_selected",
+-        reused: false,
++        reused: true,
+       })));
+     } else if (message.type === "prepared_selected_ack") {
+       queueMicrotask(() => internal.handleLine(child, JSON.stringify({
+-        type: "result",
++        type: "submission_attempt",
+         id: message.id,
+-        text: "done",
++        transport: "multipart-3",
++        submission: "stage-1",
+       })));
++    } else if (message.type === "submission_authorized") {
++      const submission = message.submission;
++      queueMicrotask(() => {
++        if (submission === "stage-1" || submission === "stage-2") {
++          const stageIndex = submission === "stage-1" ? 1 : 2;
++          internal.handleLine(child, JSON.stringify({
++            type: "event",
++            id: message.id,
++            event: "stage_submission_accepted",
++            transport: "multipart-3",
++            stageIndex,
++          }));
++          internal.handleLine(child, JSON.stringify({
++            type: "event",
++            id: message.id,
++            event: "stage_acknowledged",
++            transport: "multipart-3",
++            stageIndex,
++          }));
++          internal.handleLine(child, JSON.stringify({
++            type: "submission_attempt",
++            id: message.id,
++            transport: "multipart-3",
++            submission: stageIndex === 1 ? "stage-2" : "final",
++          }));
++        } else {
++          internal.handleLine(child, JSON.stringify({
++            type: "event",
++            id: message.id,
++            event: "send_activated",
++          }));
++        }
++      });
++    } else if (message.type === "send_activation_ack") {
++      queueMicrotask(() => {
++        internal.handleLine(child, JSON.stringify({ type: "event", id: message.id, event: "submitted" }));
++        internal.handleLine(child, JSON.stringify({ type: "result", id: message.id, text: "done" }));
++      });
+     }
+   };
++  internal.sendTo = async (_child, message) => internal.send(message);
+ 
+   await expect(client.run({
+     traceId: "multipart-123",
+@@ -179,7 +227,8 @@ test("launcher helper protocol preserves multipart context and the compaction fl
+     reasoning: "high",
+     capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+     compaction: true,
+-    prepare: async () => ({
++    prepare: async () => { throw new Error("fresh prompt must not be selected"); },
++    prepareResume: async () => ({
+       text: "commit",
+       images: [],
+       multipart: { parts: ["{\"part\":1}", "{\"part\":2}", "{\"part\":3}"], commit: "commit" },
+@@ -271,6 +320,7 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
+       turn: BrowserTurn;
+       resolve: (value: string) => void;
+       reject: (error: Error) => void;
++      protocolState: ChatGptHelperTurnProtocolState;
+     }>;
+     handleLine(child: unknown, line: string): void;
+   };
+@@ -287,6 +337,7 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
+       },
+       resolve: resolveResult,
+       reject: rejectResult,
++      protocolState: new ChatGptHelperTurnProtocolState("rate-limit-123"),
+     });
+   });
+ 
+@@ -310,3 +361,31 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
+     retryable: true,
+   });
+ });
++
++test("helper wire protocol fails closed when a frame carries an unknown field", () => {
++  const client = new LauncherBrowserHelperClient({
++    appName: "Codex Native",
++    browserHost: "launcher",
++    browserHostDescriptorPath: "/durable/launcher.json",
++    storageStatePath: "/durable/unused-state.json",
++    chromeExecutablePath: "/durable/unused-chrome",
++    turnTimeoutMs: 60_000,
++    headed: true,
++    autoApproveToolCalls: false,
++  });
++  const internal = client as unknown as {
++    child?: unknown;
++    handleLine(child: unknown, line: string): void;
++    terminateChild(child: unknown, timeoutMs: number): Promise<void>;
++  };
++  const child = { pid: process.pid };
++  internal.child = child;
++  internal.terminateChild = async () => {};
++
++  internal.handleLine(child, JSON.stringify({
++    type: "ready",
++    capabilities: "must-not-be-guessed",
++  }));
++
++  expect(internal.child).toBeUndefined();
++});
+-- 
+2.55.0.windows.2
+

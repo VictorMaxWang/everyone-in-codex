@@ -1,0 +1,494 @@
+From 8e011f549f9b10123379a144fbd2bd539418800d Mon Sep 17 00:00:00 2001
+From: wangwang <1280424159@qq.com>
+Date: Sat, 29 Aug 2026 19:03:31 +0800
+Subject: [PATCH 03/11] fix: complete external Router setup flow
+
+
+diff --git a/launcher/electron/main.cjs b/launcher/electron/main.cjs
+index 9905cef..4887ff1 100644
+--- a/launcher/electron/main.cjs
++++ b/launcher/electron/main.cjs
+@@ -572,8 +572,11 @@ function registerIpc({ logger, stateStore }) {
+     const result = IS_DEV_PROFILE ? await runtimeHost.setupDevCore() : await runtimeHost.setupCore();
+     stateStore.update({
+       coreSetupComplete: true,
+-      codexCatalogVerified: IS_DEV_PROFILE ? true : false,
+-      codexRestartRequired: IS_DEV_PROFILE ? false : true,
++      externalCoreStaged: !IS_DEV_PROFILE && result.staged === true,
++      // external 没有可由 launcher 验证的 managed catalog；这里的 true 只表示 UI 工作流可以继续，
++      // Router catalog refresh 与完整 Codex 重启仍由 codexRestartRequired 独立提示。
++      codexCatalogVerified: IS_DEV_PROFILE || EXTERNAL_ROUTER_BUILD,
++      codexRestartRequired: IS_DEV_PROFILE || result.staged === true ? false : true,
+       ...(result.mode === "full" ? {
+         mcpRuntimeInstalled: true,
+         mcpSetupComplete: false,
+@@ -591,7 +594,7 @@ function registerIpc({ logger, stateStore }) {
+     });
+     // external setup 仅提示刷新 Router catalog 与完整重启 Codex，不探测托管 route。
+     if (!IS_DEV_PROFILE && !EXTERNAL_ROUTER_BUILD) startCatalogVerificationMonitor({ logger, stateStore });
+-    return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
++    return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE && result.staged !== true };
+   });
+   handle("launcher:setup-mcp", async (_event, input) => {
+     await browserHost.reveal();
+@@ -604,6 +607,8 @@ function registerIpc({ logger, stateStore }) {
+       replace: input?.replace === true,
+     });
+     stateStore.update({
++      externalCoreStaged: false,
++      codexCatalogVerified: IS_DEV_PROFILE || EXTERNAL_ROUTER_BUILD,
+       mcpRuntimeInstalled: true,
+       mcpSetupComplete: false,
+       mcpGuideStep: 2,
+@@ -629,7 +634,7 @@ function registerIpc({ logger, stateStore }) {
+     const result = await runtimeHost.setBiggerContext(enabled === true);
+     const state = stateStore.update({
+       experimentalBiggerContext: result.enabled,
+-      codexCatalogVerified: IS_DEV_PROFILE ? true : false,
++      codexCatalogVerified: IS_DEV_PROFILE || EXTERNAL_ROUTER_BUILD,
+       codexRestartRequired: IS_DEV_PROFILE ? false : true,
+     });
+     send("launcher:state-changed", state);
+@@ -756,8 +761,8 @@ async function start() {
+   const persistedState = stateStore.read();
+   if (persistedState.coreSetupComplete === true && persistedState.codexCatalogVerified === undefined) {
+     stateStore.update({
+-      coreSetupComplete: false,
+-      codexCatalogVerified: false,
++      coreSetupComplete: EXTERNAL_ROUTER_BUILD && persistedState.externalCoreStaged === true,
++      codexCatalogVerified: EXTERNAL_ROUTER_BUILD && persistedState.externalCoreStaged === true,
+       codexRestartRequired: false,
+     });
+   }
+@@ -928,7 +933,8 @@ async function start() {
+     if (upgrade.updated) {
+       const state = stateStore.update({
+         coreSetupComplete: true,
+-        codexCatalogVerified: false,
++        externalCoreStaged: false,
++        codexCatalogVerified: EXTERNAL_ROUTER_BUILD,
+         codexRestartRequired: true,
+         experimentalBiggerContext: runtimeHost.runtimeConfigSnapshot().config?.experimentalBiggerContext === true,
+         ...(upgrade.mode === "full" ? {
+@@ -965,6 +971,8 @@ async function start() {
+       const current = stateStore.read();
+       const patch = {
+         coreSetupComplete: true,
++        externalCoreStaged: false,
++        codexCatalogVerified: EXTERNAL_ROUTER_BUILD ? true : current.codexCatalogVerified,
+         mcpRuntimeInstalled: config.mode === "full",
+         experimentalBiggerContext: config.experimentalBiggerContext === true,
+         ...(runtime.bridgeRouteChanged ? {
+@@ -986,7 +994,9 @@ async function start() {
+     if (runtime.status === "not-configured") {
+       const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+       const current = stateStore.read();
+-      if (current.coreSetupComplete || current.mcpRuntimeInstalled || current.mcpSetupComplete) {
++      // clean external install 在 MCP 提交前故意没有 runtime config；重启也必须保留该阶段。
++      if (!current.externalCoreStaged
++        && (current.coreSetupComplete || current.mcpRuntimeInstalled || current.mcpSetupComplete)) {
+         const state = stateStore.update({
+           coreSetupComplete: false,
+           codexCatalogVerified: false,
+diff --git a/launcher/electron/runtime.cjs b/launcher/electron/runtime.cjs
+index 5ab69b2..5ff35de 100644
+--- a/launcher/electron/runtime.cjs
++++ b/launcher/electron/runtime.cjs
+@@ -725,6 +725,17 @@ class RuntimeHost {
+         + " remove it with the matching stock release first",
+       );
+     }
++    if (!existing.configured) {
++      // clean install 的 core 步骤只完成 launcher 工作流预检；browser-only 不属于生产四元组，
++      // 真正的 runtime 配置由 MCP setup 事务一次性提交为 Full，失败时不会留下半安装状态。
++      return {
++        code: 0,
++        stdout: "External Router ownership confirmed; continue to MCP setup to commit the Full runtime.\n",
++        stderr: "",
++        mode: "browser-only",
++        staged: true,
++      };
++    }
+     const mode = existing.mode;
+     const args = [
+       "setup",
+diff --git a/launcher/electron/state.cjs b/launcher/electron/state.cjs
+index 907dbb7..5840feb 100644
+--- a/launcher/electron/state.cjs
++++ b/launcher/electron/state.cjs
+@@ -68,6 +68,7 @@ function readState(filePath) {
+     }
+     for (const key of [
+       "coreSetupComplete",
++      "externalCoreStaged",
+       "codexCatalogVerified",
+       "mcpSetupComplete",
+       "mcpRuntimeInstalled",
+diff --git a/launcher/src/types.ts b/launcher/src/types.ts
+index 65986cf..d4e7766 100644
+--- a/launcher/src/types.ts
++++ b/launcher/src/types.ts
+@@ -17,6 +17,7 @@ export interface LauncherState {
+   browserSmokePassed?: boolean;
+   browserSmokeVersion?: string | null;
+   coreSetupComplete?: boolean;
++  externalCoreStaged?: boolean;
+   codexCatalogVerified?: boolean;
+   mcpSetupComplete?: boolean;
+   mcpRuntimeInstalled?: boolean;
+diff --git a/launcher/tests/renderer-wiring.test.cjs b/launcher/tests/renderer-wiring.test.cjs
+index 9054933..3f3e1ba 100644
+--- a/launcher/tests/renderer-wiring.test.cjs
++++ b/launcher/tests/renderer-wiring.test.cjs
+@@ -101,6 +101,15 @@ test("the external Router launcher exposes no managed bridge or automatic update
+   assert.match(electronMain, /const EXTERNAL_ROUTER_BUILD = true/);
+   assert.match(electronMain, /packaged: app\.isPackaged && !IS_DEV_PROFILE && !EXTERNAL_ROUTER_BUILD/);
+   assert.match(electronMain, /if \(!launcherSmokeTest && !EXTERNAL_ROUTER_BUILD\) void updateController\.checkOnce\(\)/);
++  assert.match(
++    electronMain,
++    /coreSetupComplete: true,[\s\S]*?codexCatalogVerified: IS_DEV_PROFILE \|\| EXTERNAL_ROUTER_BUILD/,
++  );
++  assert.match(
++    electronMain,
++    /handle\("launcher:setup-mcp"[\s\S]*?externalCoreStaged: false,[\s\S]*?mcpRuntimeInstalled: true/,
++  );
++  assert.match(electronMain, /if \(!current\.externalCoreStaged[\s\S]*?current\.coreSetupComplete/);
+ });
+ 
+ test("MCP connection remains unavailable until the model catalog is verified", () => {
+diff --git a/launcher/tests/runtime-host.test.cjs b/launcher/tests/runtime-host.test.cjs
+index 5b2dade..e99c2f3 100644
+--- a/launcher/tests/runtime-host.test.cjs
++++ b/launcher/tests/runtime-host.test.cjs
+@@ -82,16 +82,12 @@ test("core setup replaces the known legacy connector identity with the direct-tu
+   assert.deepEqual(fixture.invocation().args.slice(-2), ["--app-name", "Codex Native2"]);
+ });
+ 
+-test("core setup starts in browser-only mode when no installation exists", async () => {
++test("core setup stages launcher workflow state without creating a production runtime config", async () => {
+   const fixture = hostFor(null);
+   const result = await fixture.host.setupCore();
+   assert.equal(result.mode, "browser-only");
+-  assert.deepEqual(fixture.invocation().args.slice(0, 2), ["setup", "--browser-only"]);
+-  assert.equal(fixture.invocation().args.includes("--refresh-account-capabilities"), true);
+-  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
+-  assert.equal(fixture.invocation().args.includes("--no-codex-route"), true);
+-  assert.equal(fixture.invocation().args.includes("native"), true);
+-  assert.equal(fixture.invocation().args.includes("--chrome"), false);
++  assert.equal(result.staged, true);
++  assert.equal(fixture.invocation(), undefined);
+ });
+ 
+ test("DEV core setup configures only the isolated harness contract", async () => {
+@@ -740,12 +736,15 @@ test("failed first-time setup removes its route before restoring the unconfigure
+   }
+ });
+ 
+-test("external browser-only setup is staged without starting a non-production runtime tuple", async () => {
++test("clean external install stages outside runtime config and atomically commits Full during MCP setup", async () => {
+   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-external-staging-"));
+   const coreHome = path.join(root, "core");
+   const configPath = path.join(coreHome, "config.json");
++  const codexConfigPath = path.join(root, "codex", "config.toml");
++  const routerConfigPath = path.join(root, "router", "model-picker.json");
+   let config = null;
+   let starts = 0;
++  const invocations = [];
+   const supervisor = {
+     coreHome,
+     configPath,
+@@ -754,7 +753,18 @@ test("external browser-only setup is staged without starting a non-production ru
+     stopForSetup: async () => ({ status: "stopped" }),
+     startIfConfigured: async () => {
+       starts += 1;
+-      return { status: "needs-setup", detail: "browser-only is not a production tuple" };
++      assert.deepEqual(config && {
++        mode: config.mode,
++        codexIntegration: config.codexIntegration,
++        subagentProtocol: config.subagentProtocol,
++        browserHost: config.browserHost,
++      }, {
++        mode: "full",
++        codexIntegration: "external",
++        subagentProtocol: "native",
++        browserHost: "launcher",
++      });
++      return { status: "ready" };
+     },
+   };
+   const host = new RuntimeHost({
+@@ -766,23 +776,118 @@ test("external browser-only setup is staged without starting a non-production ru
+     codexHome: path.join(root, "codex"),
+     supervisor,
+   });
+-  host.run = async () => {
++  host.run = async (_name, args) => {
++    invocations.push([...args]);
+     config = {
+-      mode: "browser-only",
++      mode: args.includes("--full") ? "full" : "browser-only",
+       browserHost: "launcher",
+       codexIntegration: "external",
+       subagentProtocol: "native",
++      appName: "Codex Native2",
+     };
+     fs.mkdirSync(coreHome, { recursive: true });
+     fs.writeFileSync(configPath, `${JSON.stringify(config)}\n`);
+-    return { stdout: "staged\n" };
++    return { stdout: "configured\n" };
+   };
+ 
+   try {
+-    const result = await host.runSetup("core-setup", ["setup", "--browser-only", "--no-codex-route"], {});
+-    assert.equal(result.stdout, "staged\n");
++    fs.mkdirSync(path.dirname(codexConfigPath), { recursive: true });
++    fs.mkdirSync(path.dirname(routerConfigPath), { recursive: true });
++    fs.writeFileSync(codexConfigPath, "openai_base_url = \"http://127.0.0.1:4202/router\"\n");
++    fs.writeFileSync(routerConfigPath, "{\"models\":[\"preserve-me\"]}\n");
++    const protectedBytes = new Map([
++      [codexConfigPath, fs.readFileSync(codexConfigPath)],
++      [routerConfigPath, fs.readFileSync(routerConfigPath)],
++    ]);
++
++    const staged = await host.setupCore();
++    assert.equal(staged.mode, "browser-only");
+     assert.equal(starts, 0);
+-    assert.equal(fs.existsSync(configPath), true);
++    assert.equal(fs.existsSync(configPath), false);
++    assert.deepEqual(invocations, []);
++
++    await host.setupMcp({
++      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
++      runtimeKey: "external-runtime-key-0123456789",
++      replace: true,
++    });
++    assert.equal(starts, 1);
++    assert.equal(invocations.length, 1);
++    assert.equal(invocations[0].includes("--full"), true);
++    assert.equal(invocations[0].includes("--no-codex-route"), true);
++    assert.deepEqual(JSON.parse(fs.readFileSync(configPath, "utf8")), config);
++    for (const [filePath, bytes] of protectedBytes) {
++      assert.deepEqual(fs.readFileSync(filePath), bytes);
++    }
++  } finally {
++    fs.rmSync(root, { recursive: true, force: true });
++  }
++});
++
++test("failed clean external Full commit rolls back WebGPT state without touching Router ownership", async () => {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-external-full-rollback-"));
++  const coreHome = path.join(root, "core");
++  const configPath = path.join(coreHome, "config.json");
++  const codexConfigPath = path.join(root, "codex", "config.toml");
++  const routerConfigPath = path.join(root, "router", "model-picker.json");
++  let cleared = 0;
++  const calls = [];
++  const readConfig = () => fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, "utf8")) : null;
++  const supervisor = {
++    coreHome,
++    configPath,
++    readConfig,
++    readSetupConfig: readConfig,
++    stopForSetup: async () => ({ status: "stopped" }),
++    startIfConfigured: async () => ({ status: fs.existsSync(configPath) ? "ready" : "not-configured" }),
++    clearState: () => { cleared += 1; },
++  };
++  const host = new RuntimeHost({
++    app: { getPath: () => root },
++    logger: { info() {}, warn() {}, error() {} },
++    sourceRoot: "/source",
++    browserDescriptorPath: path.join(root, "launcher-browser.json"),
++    codexHome: path.join(root, "codex"),
++    supervisor,
++  });
++  host.run = async (_name, args) => {
++    calls.push([...args]);
++    fs.mkdirSync(coreHome, { recursive: true });
++    fs.writeFileSync(configPath, `${JSON.stringify({
++      mode: "full",
++      codexIntegration: "external",
++      subagentProtocol: "native",
++      browserHost: "launcher",
++    })}\n`);
++    throw new Error("synthetic external Full setup failure");
++  };
++
++  try {
++    fs.mkdirSync(path.dirname(codexConfigPath), { recursive: true });
++    fs.mkdirSync(path.dirname(routerConfigPath), { recursive: true });
++    fs.writeFileSync(codexConfigPath, "openai_base_url = \"http://127.0.0.1:4202/router\"\n");
++    fs.writeFileSync(routerConfigPath, "{\"models\":[\"preserve-me\"]}\n");
++    const protectedBytes = new Map([
++      [codexConfigPath, fs.readFileSync(codexConfigPath)],
++      [routerConfigPath, fs.readFileSync(routerConfigPath)],
++    ]);
++
++    await assert.rejects(
++      host.setupMcp({
++        tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
++        runtimeKey: "external-runtime-key-0123456789",
++        replace: true,
++      }),
++      /synthetic external Full setup failure; incomplete first-time setup was rolled back/,
++    );
++    assert.equal(fs.existsSync(configPath), false);
++    assert.equal(fs.existsSync(path.join(coreHome, "codex", "integration-journal.json")), false);
++    assert.equal(cleared, 1);
++    assert.equal(calls.length, 1);
++    assert.equal(calls[0].includes("--no-codex-route"), true);
++    for (const [filePath, bytes] of protectedBytes) {
++      assert.deepEqual(fs.readFileSync(filePath), bytes);
++    }
+   } finally {
+     fs.rmSync(root, { recursive: true, force: true });
+   }
+diff --git a/launcher/tests/state.test.cjs b/launcher/tests/state.test.cjs
+index 0e2ae18..f7836ca 100644
+--- a/launcher/tests/state.test.cjs
++++ b/launcher/tests/state.test.cjs
+@@ -38,6 +38,7 @@ test("launcher state persists onboarding, language, and autostart atomically", (
+       keepRunningOnClose: false,
+       browserSmokePassed: true,
+       browserSmokeVersion: "0.2.0",
++      externalCoreStaged: true,
+     });
+     assert.deepEqual(createStateStore(file).read(), {
+       version: 1,
+@@ -51,6 +52,7 @@ test("launcher state persists onboarding, language, and autostart atomically", (
+       experimentalBiggerContext: false,
+       browserSmokePassed: true,
+       browserSmokeVersion: "0.2.0",
++      externalCoreStaged: true,
+       sidebarOpen: true,
+       sidebarWidth: 252,
+       mcpGuideStep: 0,
+diff --git a/src/doctor.ts b/src/doctor.ts
+index 8bd493a..87b2f8d 100644
+--- a/src/doctor.ts
++++ b/src/doctor.ts
+@@ -138,13 +138,23 @@ export async function runDoctor(): Promise<DoctorReport> {
+     }
+   }
+ 
+-  const codex = inspectCodexIntegration();
+-  if (!codex.installed) {
+-    checks.push({ id: "codex", status: "error", message: "Codex model route is not installed" });
+-  } else if (codex.errors.length > 0) {
+-    checks.push({ id: "codex", status: "error", message: "Codex integration is inconsistent", detail: codex.errors.join("; ") });
++  if (config.codexIntegration === "external") {
++    // external 的健康边界是当前 WebGPT runtime；managed journal 和 Codex route 归 Router 所有，
++    // doctor 连只读探测也不能做，否则残留/无关 journal 会把健康安装误报为损坏。
++    checks.push({
++      id: "codex",
++      status: "ok",
++      message: "Codex routing is externally managed; managed route state was not inspected",
++    });
+   } else {
+-    checks.push({ id: "codex", status: "ok", message: "Codex native model route is installed" });
++    const codex = inspectCodexIntegration();
++    if (!codex.installed) {
++      checks.push({ id: "codex", status: "error", message: "Codex model route is not installed" });
++    } else if (codex.errors.length > 0) {
++      checks.push({ id: "codex", status: "error", message: "Codex integration is inconsistent", detail: codex.errors.join("; ") });
++    } else {
++      checks.push({ id: "codex", status: "ok", message: "Codex native model route is installed" });
++    }
+   }
+ 
+   const service = getServiceStatus();
+diff --git a/tests/external-integration.test.ts b/tests/external-integration.test.ts
+index 116bad7..d1ca411 100644
+--- a/tests/external-integration.test.ts
++++ b/tests/external-integration.test.ts
+@@ -40,7 +40,7 @@ async function availableLoopbackPort(): Promise<number> {
+   return address.port;
+ }
+ 
+-test("external setup, catalog refresh, Bigger Context, and uninstall preserve Codex Router ownership", async () => {
++test("external setup, doctor, catalog refresh, Bigger Context, and uninstall preserve Codex Router ownership", async () => {
+   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-external-"));
+   const appHome = join(root, "app");
+   const codexHome = join(root, "codex");
+@@ -55,15 +55,17 @@ test("external setup, catalog refresh, Bigger Context, and uninstall preserve Co
+     [join(routerHome, "user-models.json"), "{\"favorites\":[\"preserve-me\"]}\n"],
+   ]);
+   let inspections = 0;
++  const inspectionModes: boolean[] = [];
++  let health: ReturnType<typeof createServer> | undefined;
+   const control = createServer(async (request, response) => {
+     const chunks: Buffer[] = [];
+     for await (const chunk of request) chunks.push(Buffer.from(chunk));
+     expect(request.url).toBe("/v1/session/inspect");
+     expect(request.headers.authorization).toBe(`Bearer ${controlToken}`);
+     inspections += 1;
+-    expect(JSON.parse(Buffer.concat(chunks).toString("utf8"))).toEqual({
+-      detectCapabilities: inspections !== 2,
+-    });
++    const requestBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { detectCapabilities: boolean };
++    expect(typeof requestBody.detectCapabilities).toBe("boolean");
++    inspectionModes.push(requestBody.detectCapabilities);
+     response.writeHead(200, { "content-type": "application/json" });
+     response.end(JSON.stringify({
+       authenticated: true,
+@@ -138,6 +140,42 @@ test("external setup, catalog refresh, Bigger Context, and uninstall preserve Co
+     });
+     expect(existsSync(join(appHome, "codex", "integration-journal.json"))).toBe(false);
+ 
++    const configured = JSON.parse(readFileSync(join(appHome, "config.json"), "utf8"));
++    mkdirSync(join(appHome, "codex"), { recursive: true });
++    writeFileSync(join(appHome, "codex", "integration-journal.json"), "{broken managed journal\n");
++    writeFileSync(join(appHome, "runtime", "launcher-supervisor.json"), `${JSON.stringify({
++      version: 1,
++      ownerPid: process.pid,
++      daemonPid: process.pid,
++      status: "ready",
++    })}\n`);
++    health = createServer((_request, response) => {
++      response.writeHead(200, { "content-type": "application/json" });
++      response.end(JSON.stringify({
++        service: "codex-chatgpt-web",
++        status: "ok",
++        mode: "browser-only",
++        version: configured.releaseVersion,
++        accepting_turns: true,
++        pid: process.pid,
++      }));
++    });
++    await new Promise<void>((resolveListen, rejectListen) => {
++      health!.once("error", rejectListen);
++      health!.listen(responsesPort, "127.0.0.1", resolveListen);
++    });
++    const doctor = await runCli(["doctor", "--json"], environment);
++    expect({ exitCode: doctor.exitCode, stderr: doctor.stderr }).toEqual({ exitCode: 0, stderr: "" });
++    const doctorReport = JSON.parse(doctor.stdout);
++    expect(doctorReport.ok).toBe(true);
++    expect(doctorReport.checks).toContainEqual({
++      id: "codex",
++      status: "ok",
++      message: "Codex routing is externally managed; managed route state was not inspected",
++    });
++    await new Promise<void>(resolveClose => health!.close(() => resolveClose()));
++    health = undefined;
++
+     const biggerContext = await runCli([
+       "setup",
+       "--browser-only",
+@@ -203,12 +241,14 @@ test("external setup, catalog refresh, Bigger Context, and uninstall preserve Co
+     });
+     expect({ exitCode: uninstall.exitCode, stderr: uninstall.stderr }).toEqual({ exitCode: 0, stderr: "" });
+     expect(existsSync(appHome)).toBe(false);
+-    expect(inspections).toBe(3);
++    expect(inspections).toBe(4);
++    expect(inspectionModes).toEqual([true, false, false, true]);
+     for (const [filePath, contents] of protectedFiles) {
+       expect(readFileSync(filePath, "utf8")).toBe(contents);
+       expect(statSync(filePath).mtimeMs).toBe(protectedMtimes.get(filePath)!);
+     }
+   } finally {
++    if (health) await new Promise<void>(resolveClose => health!.close(() => resolveClose()));
+     await new Promise<void>(resolveClose => control.close(() => resolveClose()));
+     rmSync(root, { recursive: true, force: true });
+   }
+-- 
+2.55.0.windows.2
+

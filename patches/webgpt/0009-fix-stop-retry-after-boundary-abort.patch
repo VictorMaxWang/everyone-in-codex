@@ -1,0 +1,50 @@
+From 760beae4944daeeb4d33cdecfb52a5dc1be462f1 Mon Sep 17 00:00:00 2001
+From: wangwang <1280424159@qq.com>
+Date: Sat, 29 Aug 2026 22:29:40 +0800
+Subject: [PATCH 09/11] fix: stop retry after boundary abort
+
+
+diff --git a/src/adapters/chatgpt-web/browser-helper-navigation-retry.ts b/src/adapters/chatgpt-web/browser-helper-navigation-retry.ts
+index 5ea56fd..d6741b7 100644
+--- a/src/adapters/chatgpt-web/browser-helper-navigation-retry.ts
++++ b/src/adapters/chatgpt-web/browser-helper-navigation-retry.ts
+@@ -93,6 +93,9 @@ export async function runBrowserHelperNavigationRetry<T>(options: {
+       BROWSER_HELPER_NAVIGATION_RETRY_DELAY_MS,
+       options.abortSignal,
+     );
++    if (options.abortSignal?.aborted) {
++      throw new DOMException("Browser helper turn aborted", "AbortError");
++    }
+     if (options.hasIrreversibleSubmission?.()) throw error;
+     return options.runAttempt(2);
+   }
+diff --git a/tests/browser-helper-navigation-retry.test.ts b/tests/browser-helper-navigation-retry.test.ts
+index 2b3ce63..a930351 100644
+--- a/tests/browser-helper-navigation-retry.test.ts
++++ b/tests/browser-helper-navigation-retry.test.ts
+@@ -133,6 +133,22 @@ test("aborting the fixed retry delay ends with AbortError before a second surfac
+   expect(attempts).toBe(1);
+ });
+ 
++test("an abort at the retry-delay boundary prevents the second surface", async () => {
++  const controller = new AbortController();
++  let attempts = 0;
++  const run = runBrowserHelperNavigationRetry({
++    abortSignal: controller.signal,
++    runAttempt: async () => {
++      attempts += 1;
++      throw brandChatGptInitialNavigationError(new Error("net::ERR_CONNECTION_CLOSED"))!;
++    },
++    waitBeforeRetry: async () => { controller.abort(); },
++  });
++
++  await expect(run).rejects.toMatchObject({ name: "AbortError" });
++  expect(attempts).toBe(1);
++});
++
+ test("the second surface suppresses an identical prepared-selection prelude and rejects a conflict", async () => {
+   const gate = new BrowserHelperPreparedSelectionReplayGate();
+   const published: boolean[] = [];
+-- 
+2.55.0.windows.2
+

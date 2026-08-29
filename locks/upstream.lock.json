@@ -3,13 +3,85 @@
   "codexhost": {
     "repository": "https://github.com/BytePioneer-AI/codex-host.git",
     "tag": "v0.3.5",
-    "commit": "c2b3b9984f23405f66c6f061a6889569b30c37ae"
+    "commit": "c2b3b9984f23405f66c6f061a6889569b30c37ae",
+    "baseTree": "5fe8c129523e1a3e52a42e394ff5c3d009380deb",
+    "patchedTree": "3931921182f037815eac509b6e296b3040c2d4e5",
+    "patchSeries": [
+      {
+        "file": "0001-feat-isolate-Codex-Desktop-profiles.patch",
+        "sha256": "1b567a10a0eec0ff0384e39a8b5be01c00d6851f9ed4d0a8358d756c92b75343"
+      }
+    ]
   },
   "webgpt": {
     "repository": "https://github.com/miuuyy/codex-chatgpt-web.git",
     "tag": "v4.0.5",
     "baseCommit": "d638315",
-    "integrationCommit": "46ba4a6abfeb70cdd4a396882568149d4655fbea"
+    "integrationCommit": "46ba4a6abfeb70cdd4a396882568149d4655fbea",
+    "baseTree": "8c4259081ef945f9246d64a304900fa4edcab37b",
+    "integrationTree": "665cd4a2ca69ad9a5d4dc789baddeb2dd1f460c4",
+    "patchSeries": [
+      {
+        "file": "0001-docs-record-v4.0.5-migration-plan.patch",
+        "sha256": "777add7a70c7e9d03ed78805178e1d6ecbe574efc1d597ebd1926e1bd32a8380"
+      },
+      {
+        "file": "0002-feat-preserve-external-Router-ownership.patch",
+        "sha256": "1846d94006d938282e24af051e38cf9141b9a98c7ad2fdb484ee058c243104fa"
+      },
+      {
+        "file": "0003-fix-complete-external-Router-setup-flow.patch",
+        "sha256": "e6d7e03c84c5b73715b02f9cb41038e8644f3235c5bd9a6c6018db1561aefa9a"
+      },
+      {
+        "file": "0004-docs-refine-Bigger-Context-migration-task.patch",
+        "sha256": "5d43dcd7676c53227d8ad090c76d4c355385a5f75add039c1905cf9dcb959d94"
+      },
+      {
+        "file": "0005-fix-harden-Bigger-Context-submission-protocol.patch",
+        "sha256": "0e9d9c0e3b1cce2a0e56707677f06caffa59ee4e48341154754d3b11861dfd0e"
+      },
+      {
+        "file": "0006-fix-close-browser-helper-protocol-review-gaps.patch",
+        "sha256": "6a3db8cb0e66c041ebaf2508fe44fed566b68ca216109c9bd9aca4d629884403"
+      },
+      {
+        "file": "0007-fix-close-browser-helper-protocol-races.patch",
+        "sha256": "5258f7a5ba5c2892012b725b460b56700c2c5134fa47c62845296b1bc77f88fa"
+      },
+      {
+        "file": "0008-fix-retry-initial-ChatGPT-navigation-once.patch",
+        "sha256": "33eb5a6a0bbe8a94b8691a9b27623756d14c2cf474d8467f28f11d943f75b8c2"
+      },
+      {
+        "file": "0009-fix-stop-retry-after-boundary-abort.patch",
+        "sha256": "554ebbb4123a1b8e79d39fa16bfbfb472854045db852e42972e6a953a02ea36e"
+      },
+      {
+        "file": "0010-feat-restore-bundled-Pro-advisor-runtime.patch",
+        "sha256": "72161c2de29d1ba0eebb18981bb7128795aeadd995b5ce3d9c96e30f1c654805"
+      },
+      {
+        "file": "0011-fix-close-cancelled-advisors-and-cap-downloads.patch",
+        "sha256": "0baf5c89bd9f4c584c3ad1f6152d5b64de20ccc4aceb60f12bf37146eb3a7810"
+      }
+    ],
+    "runtimeArtifacts": {
+      "bundleId": "08e499f85cd098ba4a3c79c72fd6e8e7b53e9a3c2d31aca48a13a2bdea9729e1",
+      "manifestSha256": "1a1228463864ff4957f9f1b226edd16fe8505a7eceb6b101ec8cc9da5d713cfe",
+      "advisorEntrypoint": "app/advisor-mcp-main.js",
+      "advisorEntrypointSha256": "accc0570340c07ee82d846e98c08d58719c66f95b66dc9f8ffc602e674c8970e",
+      "windowsInstallerSha256": "fec941741fb8e863bfd8c0e82d6ec3f5927b9a34d59f6c4265fab7b1593639bc"
+    },
+    "advisorTools": [
+      "spawn_pro_agent",
+      "send_message_to_pro_agent",
+      "wait_pro_agents",
+      "cancel_pro_agent",
+      "close_pro_agent",
+      "list_pro_agents"
+    ],
+    "advisorArtifactTool": "deliver_artifact"
   },
   "router": {
     "minimumVersion": "0.4.0-beta.4",

@@ -1,0 +1,31 @@
+From 31f0fad1a72b94a7b8558c402fdf9d142a45501c Mon Sep 17 00:00:00 2001
+From: wangwang <1280424159@qq.com>
+Date: Sat, 29 Aug 2026 19:13:04 +0800
+Subject: [PATCH 04/11] docs: refine Bigger Context migration task
+
+
+diff --git a/docs/superpowers/plans/2026-08-29-webgpt-v405-pro-repair.md b/docs/superpowers/plans/2026-08-29-webgpt-v405-pro-repair.md
+index 5325593..00d7ed6 100644
+--- a/docs/superpowers/plans/2026-08-29-webgpt-v405-pro-repair.md
++++ b/docs/superpowers/plans/2026-08-29-webgpt-v405-pro-repair.md
+@@ -28,9 +28,14 @@
+ 
+ ### Task 2: Bigger Context 与不可逆提交协议
+ 
+-- [ ] 迁移 inline/两段/三段、ACK、final commit、冷却弹窗续跑和 retained lease 安全逻辑。
+-- [ ] 合并 v4 `prepared_selected`、`send_activated`、`submitted`，保持本地授权为最终 Enter 防线。
+-- [ ] 证明 Pro compaction 复用同一 Pro/max retained chat，丢失时才 fallback。
++- [ ] 以 v3 提交 `a01780d`、`3536f30`、`63fd33a` 为行为参考，保留 v4 continuous/retained/native-compaction 实现，不整文件复制。
++- [ ] 迁移 helper 逐阶段授权：helper 发出 `submission_attempt`，父进程仅对当前 transport 和 stage/final 返回一次 `submission_authorized`；未授权前不得按 Enter。
++- [ ] v4 `prepared_selected(_ack)` 负责 fresh/resume prompt 选择，`send_activated(_ack)` 与 `submitted` 保留；本地授权发生在所有不可逆发送动作之前，两个状态机重复、乱序、缺字段或冲突时失败关闭。
++- [ ] inline、multipart-2、multipart-3 各 stage 只能提交一次；stage ACK 缺失、错误或超时不得发送下一段，final commit 只能一次，图片/附件/connector 只在 final。
++- [ ] 将现有 429 弹窗一次性抛错改为 turn 级后台 cooldown controller：精确识别既有英/简中/繁中/日文目标与严格按钮，点击后等待弹窗消失并发布 generation；effort、menu、stage send、ACK、final response 和 compaction 等等待均在同一阶段续跑，不重发已接受 submission。
++- [ ] controller 在用户取消或 turn 结束前持续工作，不设次数上限；按钮缺失、弹窗不消失或无关对话框必须失败关闭，必要时返回结构化可重试 429。
++- [ ] 保留 v4 同一 thread/model/effort/epoch 的 `conversationKey`、`connectorIdentity`、`requireRetainedConversation`、`retain`、`connectorBound`；Pro compaction 必须继续复用同一 Pro/max retained chat，source 消失时才 canonical fallback。
++- [ ] 新增真实状态机测试覆盖 ACK 防线、逐阶段授权、冷却出现在各阶段、v4 fresh/resume 握手共存、无重复提交和 unknown-field fail-closed；运行 browser worker、helper client、harness、retained compaction、broker/launcher lifecycle 定向套件及核心/launcher 全套与 typecheck。
+ 
+ ### Task 3: Pro UI 与一次发送前网络重试
+ 
+-- 
+2.55.0.windows.2
+

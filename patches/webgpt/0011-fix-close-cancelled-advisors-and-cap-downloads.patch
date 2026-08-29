@@ -1,0 +1,254 @@
+From 46ba4a6abfeb70cdd4a396882568149d4655fbea Mon Sep 17 00:00:00 2001
+From: wangwang <1280424159@qq.com>
+Date: Sat, 29 Aug 2026 23:33:06 +0800
+Subject: [PATCH 11/11] fix: close cancelled advisors and cap downloads
+
+
+diff --git a/src/adapters/chatgpt-web/advisor/artifacts.ts b/src/adapters/chatgpt-web/advisor/artifacts.ts
+index 3b4c65a..0e875f3 100644
+--- a/src/adapters/chatgpt-web/advisor/artifacts.ts
++++ b/src/adapters/chatgpt-web/advisor/artifacts.ts
+@@ -1,6 +1,6 @@
+ import { closeSync, createWriteStream, openSync, rmSync, statSync, writeFileSync } from "node:fs";
+ import { extname, isAbsolute, join } from "node:path";
+-import type { Readable } from "node:stream";
++import { Transform, type Readable } from "node:stream";
+ import { pipeline } from "node:stream/promises";
+ import type { ChatGptDownloadedArtifact } from "../browser-worker";
+ import { resolveLocalReadPath } from "./workspace";
+@@ -11,6 +11,7 @@ interface AdvisorDownloadLike {
+ }
+ 
+ const WINDOWS_RESERVED_NAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i;
++const ADVISOR_ARTIFACT_MAX_BYTES = 20 * 1024 * 1024;
+ 
+ export function isChatGptArtifactHref(value: string): boolean {
+   if (typeof value !== "string" || !value) return false;
+@@ -99,7 +100,7 @@ export function extractAdvisorArtifactBlocks(text: string): {
+       throw new Error("ChatGPT returned an invalid codex-artifact contract");
+     }
+     const data = Buffer.from(value.data, "base64");
+-    if (data.length === 0 || data.length > 20 * 1024 * 1024) {
++    if (data.length === 0 || data.length > ADVISOR_ARTIFACT_MAX_BYTES) {
+       throw new Error("ChatGPT codex-artifact is empty or exceeds 20 MB");
+     }
+     artifacts.push({
+@@ -116,7 +117,7 @@ export async function saveAdvisorArtifactBytes(
+   artifact: { filename: string; mimeType?: string; data: Uint8Array },
+   options: { outputDirectory: string; allowedRoots: readonly string[]; agentId: string },
+ ): Promise<ChatGptDownloadedArtifact> {
+-  if (!(artifact.data instanceof Uint8Array) || artifact.data.byteLength === 0 || artifact.data.byteLength > 20 * 1024 * 1024) {
++  if (!(artifact.data instanceof Uint8Array) || artifact.data.byteLength === 0 || artifact.data.byteLength > ADVISOR_ARTIFACT_MAX_BYTES) {
+     throw new Error("Advisor fallback artifact is empty or exceeds 20 MB");
+   }
+   const outputDirectory = artifactOutputDirectory(options);
+@@ -151,8 +152,21 @@ export async function saveAdvisorDownload(
+   if (!stream) throw new Error("ChatGPT artifact download did not expose a readable stream");
+ 
+   const { descriptor, target } = allocateArtifactTarget(outputDirectory, suggested, options.agentId);
++  let receivedBytes = 0;
++  const limiter = new Transform({
++    transform(chunk, encoding, callback) {
++      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding);
++      receivedBytes += bytes.byteLength;
++      if (receivedBytes > ADVISOR_ARTIFACT_MAX_BYTES) {
++        callback(new Error("ChatGPT artifact download exceeds 20 MB"));
++        return;
++      }
++      callback(null, chunk);
++    },
++  });
+   try {
+-    await pipeline(stream, createWriteStream(target, { fd: descriptor, autoClose: true }));
++    // 在流写入期间计数，避免先完整落盘再检查导致超限文件短暂占用任意磁盘空间。
++    await pipeline(stream, limiter, createWriteStream(target, { fd: descriptor, autoClose: true }));
+   } catch (error) {
+     rmSync(target, { force: true });
+     throw error;
+diff --git a/src/adapters/chatgpt-web/advisor/job-manager.ts b/src/adapters/chatgpt-web/advisor/job-manager.ts
+index d447944..76d2454 100644
+--- a/src/adapters/chatgpt-web/advisor/job-manager.ts
++++ b/src/adapters/chatgpt-web/advisor/job-manager.ts
+@@ -24,6 +24,12 @@ export interface AdvisorRuntime {
+   close?(): Promise<void>;
+ }
+ 
++export interface AdvisorCancelResult {
++  agentId: string;
++  cancelled: boolean;
++  closed: true;
++}
++
+ export interface AdvisorJobEvent {
+   cursor: number;
+   type: "status" | "queue" | "commentary" | "text" | "answer" | "artifacts" | "cancelled" | "error";
+@@ -122,19 +128,27 @@ export class AdvisorJobManager {
+     return this.snapshot(job, 0);
+   }
+ 
+-  async cancel(agentIdValue: string): Promise<AdvisorJobSnapshot> {
++  async cancel(agentIdValue: string): Promise<AdvisorCancelResult> {
+     const job = this.job(agentIdValue);
+-    if (!job.controller || !job.operation) return this.snapshot(job, 0);
+-    job.status = "cancelling";
+-    this.append(job, "status", "cancelling");
+-    job.controller.abort();
+-    await job.operation.catch(() => {});
+-    if (this.jobs.has(job.agentId) && job.status === "cancelling") {
+-      job.status = "idle";
+-      this.append(job, "cancelled");
+-      this.armIdleTimer(job);
++    let cancelled = false;
++    try {
++      if (job.controller && job.operation) {
++        job.status = "cancelling";
++        this.append(job, "status", "cancelling");
++        job.controller.abort();
++        await job.operation.catch(() => {});
++        cancelled = true;
++      }
++      if (job.idleTimer) clearTimeout(job.idleTimer);
++      // v4 不保留 aborted browser turn；取消后若继续宣称 idle，下一次 follow-up 必然找不到 retained chat。
++      // 因此 cancel 同时释放并关闭该 Advisor，调用方需要显式 spawn 一个新 agent。
++      await this.options.runtime.release(job.agentId);
++      return { agentId: job.agentId, cancelled, closed: true };
++    } finally {
++      if (job.idleTimer) clearTimeout(job.idleTimer);
++      this.jobs.delete(job.agentId);
++      this.notify();
+     }
+-    return this.snapshot(job, 0);
+   }
+ 
+   async close(agentIdValue: string): Promise<{ closed: boolean }> {
+diff --git a/src/adapters/chatgpt-web/advisor/mcp-server.ts b/src/adapters/chatgpt-web/advisor/mcp-server.ts
+index eb98258..3ffbcd6 100644
+--- a/src/adapters/chatgpt-web/advisor/mcp-server.ts
++++ b/src/adapters/chatgpt-web/advisor/mcp-server.ts
+@@ -249,9 +249,9 @@ export function createChatGptProAdvisorMcpServer(options: {
+     "cancel_pro_agent",
+     {
+       title: "Cancel a ChatGPT Pro advisor turn",
+-      description: "Stop the current Pro generation while keeping its Temporary Chat available for a follow-up.",
++      description: "Stop the current Pro generation and close the advisor; spawn a new advisor for later work.",
+       inputSchema: { agent_id: z.string().regex(/^advisor_[A-Za-z0-9_-]{10,128}$/) },
+-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
++      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+     },
+     async ({ agent_id }) => result(await manager.cancel(agent_id) as unknown as Record<string, unknown>),
+   );
+diff --git a/tests/advisor-artifacts.test.ts b/tests/advisor-artifacts.test.ts
+index b16547b..ff8d1aa 100644
+--- a/tests/advisor-artifacts.test.ts
++++ b/tests/advisor-artifacts.test.ts
+@@ -1,5 +1,5 @@
+ import { expect, test } from "bun:test";
+-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
++import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+ import { Readable } from "node:stream";
+@@ -53,6 +53,25 @@ test("advisor downloads only ChatGPT artifacts and never overwrites a workspace
+     rmSync(root, { recursive: true, force: true });
+   }
+ });
++
++test("advisor removes a partial browser download that exceeds 20 MiB", async () => {
++  const module = await import("../src/adapters/chatgpt-web/advisor/artifacts");
++  const root = mkdtempSync(join(tmpdir(), "advisor-artifact-limit-"));
++  try {
++    const chunks = Array.from({ length: 21 }, () => Buffer.alloc(1024 * 1024));
++    await expect(module.saveAdvisorDownload({
++      suggestedFilename: () => "oversized.bin",
++      createReadStream: async () => Readable.from(chunks),
++    }, {
++      outputDirectory: root,
++      allowedRoots: [root],
++      agentId: "advisor_artifact_limit_123",
++    })).rejects.toThrow("exceeds 20 MB");
++    expect(readdirSync(root)).toEqual([]);
++  } finally {
++    rmSync(root, { recursive: true, force: true });
++  }
++});
+ test("browser worker downloads only artifact links from the completed assistant turn", async () => {
+   const root = mkdtempSync(join(tmpdir(), "advisor-artifact-dom-"));
+   const clicked: string[] = [];
+diff --git a/tests/advisor-core.test.ts b/tests/advisor-core.test.ts
+index 23e6a9e..47724a6 100644
+--- a/tests/advisor-core.test.ts
++++ b/tests/advisor-core.test.ts
+@@ -436,11 +436,15 @@ test("advisor manager behaves like a five-slot follow-up-capable subagent pool",
+   const followup = manager.send(first.agentId, { prompt: "Follow up", attachments: [] });
+   expect(followup.agentId).toBe(first.agentId);
+   expect(calls.at(-1)).toEqual({ agentId: first.agentId, prompt: "Follow up", continuation: true });
+-  await manager.cancel(first.agentId);
+-  expect(manager.list().find(job => job.agentId === first.agentId)?.status).toBe("idle");
+-  await manager.close(first.agentId);
++  await expect(manager.cancel(first.agentId)).resolves.toEqual({
++    agentId: first.agentId,
++    cancelled: true,
++    closed: true,
++  });
+   expect(releases).toContain(first.agentId);
+   expect(manager.list().some(job => job.agentId === first.agentId)).toBeFalse();
++  expect(() => manager.send(first.agentId, { prompt: "After cancel", attachments: [] }))
++    .toThrow("Unknown Pro advisor");
+ });
+ 
+ test("advisor closeAll forgets an aborted job even when retained release fails", async () => {
+diff --git a/tests/advisor-mcp.test.ts b/tests/advisor-mcp.test.ts
+index 98d290c..a1a5c4d 100644
+--- a/tests/advisor-mcp.test.ts
++++ b/tests/advisor-mcp.test.ts
+@@ -83,7 +83,10 @@ test("advisor MCP exposes the six subagent lifecycle tools", async () => {
+       calls.push({ name: "wait", value: { value, timeout } });
+       return { agents: [snapshot], timedOut: false };
+     },
+-    cancel: async (agentId: string) => { calls.push({ name: "cancel", value: agentId }); return snapshot; },
++    cancel: async (agentId: string) => {
++      calls.push({ name: "cancel", value: agentId });
++      return { agentId, cancelled: true, closed: true as const };
++    },
+     close: async (agentId: string) => { calls.push({ name: "close", value: agentId }); return { closed: true }; },
+     list: () => { calls.push({ name: "list" }); return [snapshot]; },
+     closeAll: async () => {},
+@@ -128,7 +131,7 @@ test("advisor MCP exposes the six subagent lifecycle tools", async () => {
+       cancel_pro_agent: {
+         readOnlyHint: false,
+         destructiveHint: true,
+-        idempotentHint: true,
++        idempotentHint: false,
+         openWorldHint: true,
+       },
+       close_pro_agent: {
+@@ -144,6 +147,8 @@ test("advisor MCP exposes the six subagent lifecycle tools", async () => {
+         openWorldHint: false,
+       },
+     });
++    expect(tools.tools.find(tool => tool.name === "cancel_pro_agent")?.description)
++      .toContain("close the advisor");
+     await client.callTool({
+       name: "spawn_pro_agent",
+       arguments: {
+@@ -462,7 +467,7 @@ test("advisor falls back to Codex turn metadata when the client has no roots cap
+     spawn: () => snapshot,
+     send: () => snapshot,
+     wait: async () => ({ agents: [snapshot], timedOut: false }),
+-    cancel: async () => snapshot,
++    cancel: async (agentId: string) => ({ agentId, cancelled: true, closed: true as const }),
+     close: async () => ({ closed: true }),
+     list: () => [snapshot],
+     closeAll: async () => {},
+@@ -510,7 +515,7 @@ test("advisor accepts a trusted plugin turn without workspace metadata", async (
+     spawn: () => { spawned = true; return snapshot; },
+     send: () => snapshot,
+     wait: async () => ({ agents: [snapshot], timedOut: false }),
+-    cancel: async () => snapshot,
++    cancel: async (agentId: string) => ({ agentId, cancelled: true, closed: true as const }),
+     close: async () => ({ closed: true }),
+     list: () => [snapshot],
+     closeAll: async () => {},
+-- 
+2.55.0.windows.2
+

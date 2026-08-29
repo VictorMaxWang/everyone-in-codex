@@ -1,0 +1,396 @@
+From 1a57b56730ce2ea05982902874f57ec63e7ba63a Mon Sep 17 00:00:00 2001
+From: wangwang <1280424159@qq.com>
+Date: Sat, 29 Aug 2026 21:44:10 +0800
+Subject: [PATCH 07/11] fix: close browser helper protocol races
+
+
+diff --git a/src/adapters/chatgpt-web/browser-helper-protocol.ts b/src/adapters/chatgpt-web/browser-helper-protocol.ts
+index 8d827b6..2c98ad9 100644
+--- a/src/adapters/chatgpt-web/browser-helper-protocol.ts
++++ b/src/adapters/chatgpt-web/browser-helper-protocol.ts
+@@ -105,6 +105,21 @@ function parsePrepared(value: unknown): CompiledChatGptWebPrompt {
+   if (typeof prepared.text !== "string" || !Array.isArray(prepared.images)) {
+     throw new Error("Browser helper prepared prompt is invalid");
+   }
++  const images = prepared.images.map((value): CompiledChatGptWebPrompt["images"][number] => {
++    const image = record(value, "prepared image");
++    assertKeys(image, ["ref", "imageUrl"], ["detail"]);
++    if (typeof image.ref !== "string" || !image.ref.trim()
++      || typeof image.imageUrl !== "string" || !image.imageUrl.trim()
++      || (image.detail !== undefined
++        && (typeof image.detail !== "string" || !["auto", "low", "high"].includes(image.detail)))) {
++      throw new Error("Browser helper prepared image is invalid");
++    }
++    return {
++      ref: image.ref,
++      imageUrl: image.imageUrl,
++      ...(image.detail !== undefined ? { detail: image.detail } : {}),
++    };
++  });
+   let multipart: CompiledChatGptWebPrompt["multipart"];
+   if (prepared.multipart !== undefined) {
+     const rawMultipart = record(prepared.multipart, "multipart prompt");
+@@ -127,7 +142,7 @@ function parsePrepared(value: unknown): CompiledChatGptWebPrompt {
+   }
+   return {
+     text: prepared.text,
+-    images: prepared.images as CompiledChatGptWebPrompt["images"],
++    images,
+     ...(multipart ? { multipart } : {}),
+     ...(prepared.trimmedCompactionMessages !== undefined
+       ? { trimmedCompactionMessages: prepared.trimmedCompactionMessages as number }
+@@ -260,20 +275,28 @@ interface InboundTurnPhase {
+   preparedSelectionPending: boolean;
+   preparedAcknowledged: boolean;
+   sendActivationPending: boolean;
++  aborted: boolean;
++}
++
++interface InboundOperationPhase {
++  aborted: boolean;
+ }
+ 
+ /** helper stdin 的 turn phase 独立于浏览器 DOM；错误 turn、重复或乱序 ACK 一律不能落到运行逻辑。 */
+ export class BrowserHelperInboundProtocolState {
+   private readonly turns = new Map<string, InboundTurnPhase>();
+-  private readonly operations = new Set<string>();
++  private readonly operations = new Map<string, InboundOperationPhase>();
+ 
+   beginTurn(id: string): void {
+     turnId(id);
+-    if (this.turns.has(id)) throw new Error(`Browser helper turn ${id} is duplicate`);
++    if (this.turns.has(id) || this.operations.has(id)) {
++      throw new Error(`Browser helper turn ${id} is duplicate`);
++    }
+     this.turns.set(id, {
+       preparedSelectionPending: false,
+       preparedAcknowledged: false,
+       sendActivationPending: false,
++      aborted: false,
+     });
+   }
+ 
+@@ -317,9 +340,16 @@ export class BrowserHelperInboundProtocolState {
+   }
+ 
+   observeAbort(id: string): void {
+-    if (!this.turns.has(id) && !this.operations.has(id)) {
+-      throw new Error(`Browser helper turn ${id} is not active`);
++    const turn = this.turns.get(id);
++    if (turn) {
++      if (turn.aborted) throw new Error(`Browser helper turn ${id} abort is duplicate`);
++      turn.aborted = true;
++      return;
+     }
++    const operation = this.operations.get(id);
++    if (!operation) throw new Error(`Browser helper turn ${id} is not active`);
++    if (operation.aborted) throw new Error(`Browser helper operation ${id} abort is duplicate`);
++    operation.aborted = true;
+   }
+ 
+   endTurn(id: string): void {
+@@ -331,7 +361,7 @@ export class BrowserHelperInboundProtocolState {
+     if (this.operations.has(id) || this.turns.has(id)) {
+       throw new Error(`Browser helper operation ${id} is duplicate`);
+     }
+-    this.operations.add(id);
++    this.operations.set(id, { aborted: false });
+   }
+ 
+   endOperation(id: string): void {
+@@ -341,6 +371,7 @@ export class BrowserHelperInboundProtocolState {
+   private requireTurn(id: string): InboundTurnPhase {
+     const phase = this.turns.get(id);
+     if (!phase) throw new Error(`Browser helper turn ${id} is not active`);
++    if (phase.aborted) throw new Error(`Browser helper turn ${id} is already aborted`);
+     return phase;
+   }
+ }
+diff --git a/src/adapters/chatgpt-web/browser-worker.ts b/src/adapters/chatgpt-web/browser-worker.ts
+index 4f3d27c..6b27c33 100644
+--- a/src/adapters/chatgpt-web/browser-worker.ts
++++ b/src/adapters/chatgpt-web/browser-worker.ts
+@@ -407,7 +407,7 @@ async function assertChatGptIrreversibleBoundaryClear(
+ }
+ 
+ /**
+- * 将授权与真实 Enter 放在同一可执行边界；未知 dialog 在授权前或授权等待期间出现都不会被点击或发送。
++ * 将授权与真实 Enter 放在同一可执行边界；每段异步握手后都重新分类 dialog，避免等待窗口绕过发送前检查。
+  */
+ export async function crossChatGptIrreversibleSendBoundary(
+   page: Page,
+@@ -422,6 +422,8 @@ export async function crossChatGptIrreversibleSendBoundary(
+   await lifecycle.authorize();
+   await assertChatGptIrreversibleBoundaryClear(page, rateLimitObserver);
+   await lifecycle.activate();
++  // activation 可能跨进程等待 helper/parent ACK；该等待期间出现的 modal 仍必须阻断真实 Enter。
++  await assertChatGptIrreversibleBoundaryClear(page, rateLimitObserver);
+   await sendButton.press("Enter");
+ }
+ 
+@@ -514,23 +516,70 @@ export class ChatGptRateLimitDialogController implements ChatGptRateLimitDialogO
+   }
+ }
+ 
+-/** 新连接就绪后仍须停止并复查旧监控；获取期间出现的 cooldown 故障不能被换页掩盖。 */
++function attachChatGptRebindSecondaryFailure(
++  primary: unknown,
++  secondary: unknown,
++  message: string,
++): unknown {
++  if (!(primary instanceof Error)) return primary;
++  const previousCause = (primary as Error & { cause?: unknown }).cause;
++  Object.defineProperty(primary, "cause", {
++    configurable: true,
++    value: previousCause === undefined
++      ? secondary
++      : new AggregateError([previousCause, secondary], message),
++  });
++  return primary;
++}
++
++/** 所有重连路径都停止并复查旧监控；controller 故障优先于并发的 acquire/cleanup 次级错误。 */
+ export async function acquireChatGptRebindAfterControllerStop<T>(
+   controller: Pick<ChatGptRateLimitDialogController, "assertHealthy" | "stop"> | undefined,
+   acquire: () => Promise<T>,
+   discard: (acquired: T) => Promise<void>,
+ ): Promise<T> {
+-  controller?.assertHealthy();
+-  const acquired = await acquire();
++  if (controller) {
++    try {
++      controller.assertHealthy();
++    } catch (controllerError) {
++      try {
++        await controller.stop(false);
++      } catch (stopError) {
++        attachChatGptRebindSecondaryFailure(
++          controllerError,
++          stopError,
++          "ChatGPT cooldown controller health check and stop both failed",
++        );
++      }
++      throw controllerError;
++    }
++  }
++  let acquired: T;
++  try {
++    acquired = await acquire();
++  } catch (acquisitionError) {
++    try {
++      await controller?.stop();
++    } catch (controllerError) {
++      throw attachChatGptRebindSecondaryFailure(
++        controllerError,
++        acquisitionError,
++        "ChatGPT cooldown controller and replacement acquisition both failed",
++      );
++    }
++    throw acquisitionError;
++  }
+   try {
+     await controller?.stop();
+   } catch (error) {
+     try {
+       await discard(acquired);
+     } catch (cleanupError) {
+-      if (error instanceof Error) {
+-        Object.defineProperty(error, "cause", { configurable: true, value: cleanupError });
+-      }
++      attachChatGptRebindSecondaryFailure(
++        error,
++        cleanupError,
++        "ChatGPT cooldown controller and replacement cleanup both failed",
++      );
+     }
+     throw error;
+   }
+diff --git a/tests/browser-helper-protocol.test.ts b/tests/browser-helper-protocol.test.ts
+index 952f83f..50edeed 100644
+--- a/tests/browser-helper-protocol.test.ts
++++ b/tests/browser-helper-protocol.test.ts
+@@ -37,6 +37,58 @@ test("browser helper preserves the default run contract without an absolute turn
+   expect(message.config.turnTimeoutMs).toBeUndefined();
+ });
+ 
++test.each([
++  {
++    name: "unknown field",
++    image: { ref: "codex-input-image-1", imageUrl: "data:image/png;base64,AA==", extra: true },
++  },
++  {
++    name: "missing field",
++    image: { ref: "codex-input-image-1" },
++  },
++  {
++    name: "wrong field type",
++    image: { ref: 1, imageUrl: "data:image/png;base64,AA==" },
++  },
++  {
++    name: "wrong optional field type",
++    image: { ref: "codex-input-image-1", imageUrl: "data:image/png;base64,AA==", detail: 1 },
++  },
++])("browser helper rejects a prepared image with $name", ({ image }) => {
++  expect(() => parseBrowserHelperInputMessage({
++    type: "prepared_selected_ack",
++    id: "turn_image_123",
++    prepared: { text: "inspect", images: [image] },
++  })).toThrow();
++});
++
++test("browser helper accepts only exact prepared image and multipart nesting", () => {
++  const parsed = parseBrowserHelperInputMessage({
++    type: "prepared_selected_ack",
++    id: "turn_nested_123",
++    prepared: {
++      text: "inspect",
++      images: [{
++        ref: "codex-input-image-1",
++        imageUrl: "data:image/png;base64,AA==",
++        detail: "high",
++      }],
++      multipart: { parts: ["part 1", "part 2"], commit: "finish" },
++    },
++  });
++  expect(parsed.type).toBe("prepared_selected_ack");
++
++  expect(() => parseBrowserHelperInputMessage({
++    type: "prepared_selected_ack",
++    id: "turn_nested_123",
++    prepared: {
++      text: "inspect",
++      images: [],
++      multipart: { parts: ["part 1", "part 2"], commit: "finish", extra: true },
++    },
++  })).toThrow("unknown or missing fields");
++});
++
+ test("browser helper inbound phases reject wrong-turn, duplicate, and out-of-order acknowledgements", () => {
+   const state = new BrowserHelperInboundProtocolState();
+   state.beginTurn("turn_phase_123");
+@@ -49,6 +101,8 @@ test("browser helper inbound phases reject wrong-turn, duplicate, and out-of-ord
+   state.expectSendActivationAck("turn_phase_123");
+   state.observeSendActivationAck("turn_phase_123");
+   expect(() => state.observeSendActivationAck("turn_phase_123")).toThrow("not pending");
++  state.observeAbort("turn_phase_123");
++  expect(() => state.observeAbort("turn_phase_123")).toThrow("duplicate");
+   state.endTurn("turn_phase_123");
+   expect(() => state.observeAbort("turn_phase_123")).toThrow("not active");
+ });
+diff --git a/tests/browser-worker-contract.test.ts b/tests/browser-worker-contract.test.ts
+index 88cd515..c297ffc 100644
+--- a/tests/browser-worker-contract.test.ts
++++ b/tests/browser-worker-contract.test.ts
+@@ -1255,7 +1255,7 @@ test("a known cooldown fails closed when acknowledgement does not hide it", asyn
+   expect(fixture.pressed).toEqual(["Enter"]);
+ });
+ 
+-function sendBoundaryPage(unknownDialogVisible = false): Page {
++function sendBoundaryPage(unknownDialogVisible: boolean | (() => boolean) = false): Page {
+   const invisible = {
+     filter: () => invisible,
+     last: () => invisible,
+@@ -1263,7 +1263,9 @@ function sendBoundaryPage(unknownDialogVisible = false): Page {
+   };
+   const unknownDialogs = {
+     filter: () => unknownDialogs,
+-    count: async () => unknownDialogVisible ? 1 : 0,
++    count: async () => (typeof unknownDialogVisible === "function"
++      ? unknownDialogVisible()
++      : unknownDialogVisible) ? 1 : 0,
+   };
+   return {
+     locator: (selector: string) => selector.includes("[aria-modal=\"true\"]")
+@@ -1304,6 +1306,35 @@ test("an unrelated visible dialog blocks authorization and leaves Enter untouche
+   expect(pressed).toEqual([]);
+ });
+ 
++test("a dialog appearing during Send activation blocks Enter after authorization", async () => {
++  let dialogVisible = false;
++  let authorizationCalls = 0;
++  let releaseActivation!: () => void;
++  let activationStarted!: () => void;
++  const activation = new Promise<void>(resolve => { releaseActivation = resolve; });
++  const activationPending = new Promise<void>(resolve => { activationStarted = resolve; });
++  const pressed: string[] = [];
++  const send = crossChatGptIrreversibleSendBoundary(
++    sendBoundaryPage(() => dialogVisible),
++    { press: async (key: string) => { pressed.push(key); } } as never,
++    {
++      authorize: () => { authorizationCalls += 1; },
++      activate: () => {
++        activationStarted();
++        return activation;
++      },
++    },
++  );
++
++  await activationPending;
++  expect(authorizationCalls).toBe(1);
++  expect(pressed).toEqual([]);
++  dialogVisible = true;
++  releaseActivation();
++  await expect(send).rejects.toMatchObject({ code: "unexpected_chatgpt_dialog", retryable: false });
++  expect(pressed).toEqual([]);
++});
++
+ test("the turn cooldown controller publishes a new generation only after the dialog disappears", async () => {
+   let visible = false;
+   let releaseVisibleWait!: () => void;
+@@ -1396,6 +1427,53 @@ test("a cooldown failure racing with page acquisition aborts rebind and discards
+   expect(discarded).toEqual(["new-connection"]);
+ });
+ 
++test("a cooldown failure remains authoritative when replacement acquisition also fails", async () => {
++  const controllerFailure = new Error("cooldown monitor failed during rejected acquisition");
++  const acquisitionFailure = new Error("replacement connection failed");
++  let failed = false;
++  let stopCalls = 0;
++  const controller = {
++    assertHealthy: () => { if (failed) throw controllerFailure; },
++    stop: async () => {
++      stopCalls += 1;
++      if (failed) throw controllerFailure;
++    },
++  };
++
++  await expect(acquireChatGptRebindAfterControllerStop(
++    controller,
++    async () => {
++      failed = true;
++      await Promise.resolve();
++      throw acquisitionFailure;
++    },
++    async () => { throw new Error("no replacement connection should be discarded"); },
++  )).rejects.toBe(controllerFailure);
++  expect(stopCalls).toBe(1);
++  expect(controllerFailure.cause).toBe(acquisitionFailure);
++});
++
++test("a preexisting cooldown failure stops the old controller before skipping acquisition", async () => {
++  const controllerFailure = new Error("cooldown monitor already failed");
++  let stopCalls = 0;
++  let acquireCalls = 0;
++  const controller = {
++    assertHealthy: () => { throw controllerFailure; },
++    stop: async (assertHealthy = true) => {
++      stopCalls += 1;
++      expect(assertHealthy).toBeFalse();
++    },
++  };
++
++  await expect(acquireChatGptRebindAfterControllerStop(
++    controller,
++    async () => { acquireCalls += 1; return "new-connection"; },
++    async () => {},
++  )).rejects.toBe(controllerFailure);
++  expect(stopCalls).toBe(1);
++  expect(acquireCalls).toBe(0);
++});
++
+ test("cooldown monitoring keeps handling repeated known dialogs until the turn aborts", async () => {
+   const abort = new AbortController();
+   const pressed: string[] = [];
+-- 
+2.55.0.windows.2
+
