@@ -5,11 +5,11 @@
     "tag": "v0.3.5",
     "commit": "c2b3b9984f23405f66c6f061a6889569b30c37ae",
     "baseTree": "5fe8c129523e1a3e52a42e394ff5c3d009380deb",
-    "patchedTree": "781d13ff3b0979241959b6971e5a80444afae2e1",
+    "patchedTree": "f990c55c0696240fd8fc3bf75dbd4ef7b1c4a7ca",
     "patchSeries": [
       {
         "file": "0001-feat-isolate-Codex-Desktop-profiles.patch",
-        "sha256": "fb96c10d7496b7b273c7df9ac51ed8bbd86ac21b487240d304425c654e62be4d"
+        "sha256": "6f6147824938b246d4709ef925f77f44fd99e39434807c3530470fd51bc78eb4"
       }
     ]
   },

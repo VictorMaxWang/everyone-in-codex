@@ -1,13 +1,27 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Everyone in Codex <noreply@everyone-in-codex.invalid>
-Date: Sun, 30 Aug 2026 03:19:28 +0800
+Date: Sun, 30 Aug 2026 03:48:54 +0800
 Subject: [PATCH] feat: isolate Codex Desktop profiles
 
 ---
- crates/launcher/src/main.rs             | 124 +++++++++++++++--
- crates/launcher/src/runtime_instance.rs |  54 +++++++-
- crates/shim/src/lib.rs                  | 177 +++++++++++++++++++++++-
- 3 files changed, 335 insertions(+), 20 deletions(-)
+ crates/launcher/src/main.rs                   | 124 ++++++++++--
+ crates/launcher/src/runtime_instance.rs       |  54 +++++-
+ crates/shim/src/lib.rs                        | 177 +++++++++++++++++-
+ packages/adapters/grok/src/acp-transport.ts   |  16 +-
+ packages/adapters/grok/src/command.ts         |   3 +-
+ packages/adapters/grok/src/index.ts           |   1 +
+ .../grok/test/grok-environment.test.ts        |  23 +++
+ packages/adapters/omp/src/omp-adapter.ts      |   7 +-
+ packages/adapters/omp/src/omp-rpc-session.ts  |  10 +-
+ .../adapters/omp/test/omp-adapter.test.ts     |  14 ++
+ .../adapters/omp/test/omp-rpc-session.test.ts |  48 +++++
+ packages/adapters/pi/src/pi-rpc-session.ts    |   3 +-
+ .../adapters/pi/test/pi-rpc-session.test.ts   |  33 ++++
+ .../host-runtime/src/adapter-composition.ts   |  87 ++++++++-
+ packages/host-runtime/src/index.ts            |   7 +
+ .../test/adapter-composition.test.ts          |  56 ++++++
+ 16 files changed, 627 insertions(+), 36 deletions(-)
+ create mode 100644 packages/adapters/grok/test/grok-environment.test.ts
 
 diff --git a/crates/launcher/src/main.rs b/crates/launcher/src/main.rs
 index 9fc2c11..eff9392 100644
@@ -647,3 +661,559 @@ index 3c98a1c..b493ac1 100644
      #[test]
      fn starts_host_runtime_for_servers_but_not_app_server_management_commands() {
          assert!(should_start_host_runtime(&arguments(&[
+diff --git a/packages/adapters/grok/src/acp-transport.ts b/packages/adapters/grok/src/acp-transport.ts
+index 6c896c6..479e062 100644
+--- a/packages/adapters/grok/src/acp-transport.ts
++++ b/packages/adapters/grok/src/acp-transport.ts
+@@ -333,8 +333,15 @@ function transportEvent(
+   }
+ }
+ 
++/** 显式 Adapter 环境是完整安全边界；只有未提供时才继承 Host。 */
++export function grokProcessEnvironment(
++  environment: NodeJS.ProcessEnv | undefined,
++): NodeJS.ProcessEnv {
++  return { ...(environment ?? process.env) };
++}
++
+ function grokHomeDir(options: Pick<GrokAcpTransportOptions, "environment">): string {
+-  const environment = { ...process.env, ...options.environment };
++  const environment = grokProcessEnvironment(options.environment);
+   const home = environment.HOME ?? environment.USERPROFILE ?? os.homedir();
+   return environment.GROK_HOME ?? path.join(home, ".grok");
+ }
+@@ -714,14 +721,15 @@ export class GrokAcpTransport {
+   async #ensureInitialized(): Promise<InitializeResponse> {
+     if (this.#initialize) return this.#initialize;
+     if (this.#child || this.#closed) throw new Error("Grok ACP Transport cannot be started twice");
++    const environment = grokProcessEnvironment(this.#options.environment);
+     const executable = resolveGrokExecutable({
+       ...(this.#options.command ? { command: this.#options.command } : {}),
+-      environment: this.#options.environment ?? process.env,
++      environment,
+     });
+-    const invocation = grokInvocation(executable);
++    const invocation = grokInvocation(executable, process.platform, environment);
+     const child = spawn(invocation.command, invocation.arguments, {
+       cwd: this.#options.cwd,
+-      env: { ...process.env, ...this.#options.environment },
++      env: environment,
+       detached: process.platform !== "win32",
+       stdio: ["pipe", "pipe", "pipe"],
+       windowsHide: true,
+diff --git a/packages/adapters/grok/src/command.ts b/packages/adapters/grok/src/command.ts
+index 8f573a9..48b2696 100644
+--- a/packages/adapters/grok/src/command.ts
++++ b/packages/adapters/grok/src/command.ts
+@@ -52,10 +52,11 @@ export function resolveGrokExecutable(
+ export function grokInvocation(
+   command: string,
+   platform = process.platform,
++  environment: NodeJS.ProcessEnv = process.env,
+ ): {
+   command: string;
+   arguments: string[];
+   windowsVerbatimArguments: boolean;
+ } {
+-  return commandInvocation(command, ["agent", "--no-leader", "stdio"], process.env, platform);
++  return commandInvocation(command, ["agent", "--no-leader", "stdio"], environment, platform);
+ }
+diff --git a/packages/adapters/grok/src/index.ts b/packages/adapters/grok/src/index.ts
+index 9395f68..655667b 100644
+--- a/packages/adapters/grok/src/index.ts
++++ b/packages/adapters/grok/src/index.ts
+@@ -11,6 +11,7 @@ export type { GrokCreditsSnapshot, GrokProductUsage } from "./grok-credits.js";
+ export {
+   GrokAcpTransport,
+   GrokTransportError,
++  grokProcessEnvironment,
+   locateGrokNativeSession,
+   readGrokNativeHistory,
+ } from "./acp-transport.js";
+diff --git a/packages/adapters/grok/test/grok-environment.test.ts b/packages/adapters/grok/test/grok-environment.test.ts
+new file mode 100644
+index 0000000..b5e3a93
+--- /dev/null
++++ b/packages/adapters/grok/test/grok-environment.test.ts
+@@ -0,0 +1,23 @@
++import { describe, expect, it } from "vitest";
++
++import { grokProcessEnvironment } from "../src/index.js";
++
++describe("Grok process environment", () => {
++  it("does not merge process.env into an explicit Adapter environment", () => {
++    const inheritedName = "CODEXHOST_TEST_INHERITED_CAPABILITY";
++    const previous = process.env[inheritedName];
++    process.env[inheritedName] = "must-not-reach-grok";
++
++    try {
++      const explicit = { PATH: "/synthetic/bin", GROK_HOME: "/fusion/grok" };
++      const environment = grokProcessEnvironment(explicit);
++
++      expect(environment).toEqual(explicit);
++      expect(environment).not.toHaveProperty(inheritedName);
++      expect(environment).not.toBe(explicit);
++    } finally {
++      if (previous === undefined) Reflect.deleteProperty(process.env, inheritedName);
++      else process.env[inheritedName] = previous;
++    }
++  });
++});
+diff --git a/packages/adapters/omp/src/omp-adapter.ts b/packages/adapters/omp/src/omp-adapter.ts
+index 2a30e97..20e806d 100644
+--- a/packages/adapters/omp/src/omp-adapter.ts
++++ b/packages/adapters/omp/src/omp-adapter.ts
+@@ -93,6 +93,7 @@ import { OmpSubagentLifecycle } from "./omp-subagent-lifecycle.js";
+ export interface OmpAdapterOptions {
+   command?: string;
+   environment?: NodeJS.ProcessEnv;
++  readOnly?: boolean;
+   commandTimeoutMs?: number;
+   compactionTimeoutMs?: number;
+   cancelTimeoutMs?: number;
+@@ -1677,7 +1678,11 @@ export class OmpAdapter implements HarnessAdapter {
+       createTransport: (sessionOptions) => new OmpRpcSession({ ...options, ...sessionOptions }),
+     },
+   ) {
+-    this.#createTransport = dependencies.createTransport;
++    this.#createTransport = (sessionOptions) =>
++      dependencies.createTransport({
++        ...sessionOptions,
++        ...(options.readOnly !== undefined ? { readOnly: options.readOnly } : {}),
++      });
+     this.#closeTimeoutMs = options.closeTimeoutMs ?? 2_000;
+     this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT;
+   }
+diff --git a/packages/adapters/omp/src/omp-rpc-session.ts b/packages/adapters/omp/src/omp-rpc-session.ts
+index ddcba8f..45ca612 100644
+--- a/packages/adapters/omp/src/omp-rpc-session.ts
++++ b/packages/adapters/omp/src/omp-rpc-session.ts
+@@ -130,6 +130,7 @@ export interface OmpRpcSessionOptions {
+   cwd: string;
+   command?: string;
+   environment?: NodeJS.ProcessEnv;
++  readOnly?: boolean;
+   sessionFile?: string;
+   forkSessionFile?: string;
+   model?: OmpNativeModelRef;
+@@ -145,6 +146,7 @@ export interface OmpRpcProcessOptions {
+   cwd: string;
+   command?: string;
+   environment: NodeJS.ProcessEnv;
++  readOnly?: boolean;
+   sessionFile?: string;
+   forkSessionFile?: string;
+   model?: OmpNativeModelRef;
+@@ -413,7 +415,9 @@ export function ompRpcProcessCommand(
+   const modelArguments = options.model
+     ? ["--provider", options.model.provider, "--model", options.model.id]
+     : [];
+-  const arguments_ = ["--mode", "rpc", ...modelArguments, ...sessionArguments];
++  // Fusion 的 OMP 首版只允许读取；单一原生开关可避免 Host 投影遗漏写工具。
++  const toolArguments = options.readOnly ? ["--tools=read"] : [];
++  const arguments_ = ["--mode", "rpc", ...toolArguments, ...modelArguments, ...sessionArguments];
+   const extension = path.win32.extname(command).toLowerCase();
+   if (platform !== "win32" || ![".cmd", ".bat"].includes(extension)) {
+     return { command, arguments: arguments_, windowsVerbatimArguments: false };
+@@ -504,11 +508,11 @@ export class OmpRpcSession {
+       cwd: this.#options.cwd,
+       ...(this.#options.command ? { command: this.#options.command } : {}),
+       environment: withNodeRuntimeOnPath({
+-        ...process.env,
+-        ...this.#options.environment,
++        ...(this.#options.environment ?? process.env),
+         OMP_SKIP_VERSION_CHECK: "1",
+         OMP_TELEMETRY: "0",
+       }),
++      ...(this.#options.readOnly !== undefined ? { readOnly: this.#options.readOnly } : {}),
+       ...(this.#options.sessionFile ? { sessionFile: this.#options.sessionFile } : {}),
+       ...(this.#options.forkSessionFile ? { forkSessionFile: this.#options.forkSessionFile } : {}),
+       ...(this.#options.model ? { model: this.#options.model } : {}),
+diff --git a/packages/adapters/omp/test/omp-adapter.test.ts b/packages/adapters/omp/test/omp-adapter.test.ts
+index f75baac..a0b315f 100644
+--- a/packages/adapters/omp/test/omp-adapter.test.ts
++++ b/packages/adapters/omp/test/omp-adapter.test.ts
+@@ -291,6 +291,20 @@ function outputs(session: { outputs: AsyncIterable<HarnessOutput> }): HarnessOut
+ }
+ 
+ describe("OMP Adapter Subagents", () => {
++  it("forwards the InferenceOnly readOnly policy to every OMP transport", async () => {
++    const transport = new FakeOmpTransport();
++    const createTransport = vi.fn(() => transport);
++    const adapter = new OmpAdapter({ readOnly: true }, { createTransport });
++
++    await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
++      status: "ready",
++    });
++    expect(createTransport).toHaveBeenCalledWith(
++      expect.objectContaining({ cwd: "/synthetic", readOnly: true }),
++    );
++    await adapter.close();
++  });
++
+   it("projects native Subagent lifecycle into a Host delegation Item", async () => {
+     const transport = new FakeOmpTransport();
+     const dependencies: OmpAdapterDependencies = {
+diff --git a/packages/adapters/omp/test/omp-rpc-session.test.ts b/packages/adapters/omp/test/omp-rpc-session.test.ts
+index 329297b..98f7ee0 100644
+--- a/packages/adapters/omp/test/omp-rpc-session.test.ts
++++ b/packages/adapters/omp/test/omp-rpc-session.test.ts
+@@ -10,6 +10,7 @@ import {
+   OmpRpcSession,
+   ompRpcProcessCommand,
+   type OmpRpcProcessAdapter,
++  type OmpRpcProcessOptions,
+   type OmpTurnEvent,
+ } from "../src/omp-rpc-session.js";
+ 
+@@ -205,6 +206,53 @@ describe("OMP RPC session", () => {
+     ).toMatchObject({ arguments: ["--mode", "rpc", "--fork", "/tmp/omp.jsonl"] });
+   });
+ 
++  it("restricts an InferenceOnly OMP RPC process to the read tool", () => {
++    const invocation = ompRpcProcessCommand(
++      { cwd: "/synthetic", environment: {}, readOnly: true },
++      {
++        platform: "darwin",
++        homeDirectory: "/Users/test",
++        isExecutable: () => true,
++      },
++    );
++
++    expect(invocation.arguments).toEqual(["--mode", "rpc", "--tools=read"]);
++    expect(invocation.arguments.join(" ")).not.toMatch(/(?:bash|edit|write)/u);
++  });
++
++  it("does not merge the Host process environment into an explicit OMP environment", async () => {
++    const inheritedName = "CODEXHOST_TEST_INHERITED_CAPABILITY";
++    const previous = process.env[inheritedName];
++    process.env[inheritedName] = "must-not-reach-omp";
++    const fakeProcess = new FakeOmpProcess();
++    const spawnProcess = vi.fn((options: OmpRpcProcessOptions) => {
++      void options;
++      return fakeProcess as never;
++    });
++    const session = new OmpRpcSession(
++      {
++        cwd: "/synthetic",
++        environment: { PATH: process.env.PATH, PI_CODING_AGENT_DIR: "/fusion/omp" },
++        commandTimeoutMs: 2_000,
++      },
++      { spawn: spawnProcess },
++    );
++
++    try {
++      await session.start();
++      expect(spawnProcess.mock.calls[0]?.[0].environment).toMatchObject({
++        PI_CODING_AGENT_DIR: "/fusion/omp",
++        OMP_SKIP_VERSION_CHECK: "1",
++        OMP_TELEMETRY: "0",
++      });
++      expect(spawnProcess.mock.calls[0]?.[0].environment).not.toHaveProperty(inheritedName);
++    } finally {
++      await session.close();
++      if (previous === undefined) Reflect.deleteProperty(process.env, inheritedName);
++      else process.env[inheritedName] = previous;
++    }
++  });
++
+   it("starts through ready/negotiation and settles a streamed text turn on agent_end", async () => {
+     const process = new FakeOmpProcess();
+     const adapter: OmpRpcProcessAdapter = { spawn: () => process as never };
+diff --git a/packages/adapters/pi/src/pi-rpc-session.ts b/packages/adapters/pi/src/pi-rpc-session.ts
+index 19092c1..c89f146 100644
+--- a/packages/adapters/pi/src/pi-rpc-session.ts
++++ b/packages/adapters/pi/src/pi-rpc-session.ts
+@@ -492,8 +492,7 @@ export class PiRpcSession {
+       cwd: this.#options.cwd,
+       ...(this.#options.command ? { command: this.#options.command } : {}),
+       environment: withNodeRuntimeOnPath({
+-        ...process.env,
+-        ...this.#options.environment,
++        ...(this.#options.environment ?? process.env),
+         PI_SKIP_VERSION_CHECK: "1",
+         PI_TELEMETRY: "0",
+       }),
+diff --git a/packages/adapters/pi/test/pi-rpc-session.test.ts b/packages/adapters/pi/test/pi-rpc-session.test.ts
+index 4575cc8..dda1047 100644
+--- a/packages/adapters/pi/test/pi-rpc-session.test.ts
++++ b/packages/adapters/pi/test/pi-rpc-session.test.ts
+@@ -685,6 +685,39 @@ describe("Pi RPC Turn aggregation", () => {
+     await rpc.close();
+   });
+ 
++  it("does not merge the Host process environment into an explicit Pi environment", async () => {
++    const inheritedName = "CODEXHOST_TEST_INHERITED_CAPABILITY";
++    const previous = process.env[inheritedName];
++    process.env[inheritedName] = "must-not-reach-pi";
++    const spawnProcess = vi.fn((options: PiRpcProcessOptions) => {
++      void options;
++      return new FakePiRpcProcess("final-only") as unknown as ChildProcessWithoutNullStreams;
++    });
++    const rpc = new PiRpcSession(
++      {
++        cwd: process.cwd(),
++        environment: { PATH: process.env.PATH, PI_CODING_AGENT_DIR: "/fusion/pi" },
++        commandTimeoutMs: 2_000,
++        closeTimeoutMs: 500,
++      },
++      { spawn: spawnProcess },
++    );
++
++    try {
++      await rpc.start();
++      expect(spawnProcess.mock.calls[0]?.[0].environment).toMatchObject({
++        PI_CODING_AGENT_DIR: "/fusion/pi",
++        PI_SKIP_VERSION_CHECK: "1",
++        PI_TELEMETRY: "0",
++      });
++      expect(spawnProcess.mock.calls[0]?.[0].environment).not.toHaveProperty(inheritedName);
++    } finally {
++      await rpc.close();
++      if (previous === undefined) Reflect.deleteProperty(process.env, inheritedName);
++      else process.env[inheritedName] = previous;
++    }
++  });
++
+   it("rejects native state without stable Session identity", async () => {
+     const rpc = session("missing-session-id");
+ 
+diff --git a/packages/host-runtime/src/adapter-composition.ts b/packages/host-runtime/src/adapter-composition.ts
+index 69558ca..8a291bb 100644
+--- a/packages/host-runtime/src/adapter-composition.ts
++++ b/packages/host-runtime/src/adapter-composition.ts
+@@ -12,9 +12,80 @@ export const DEEPSEEK_HARNESS_ENDPOINT_ENV = "CODEXHOST_DEEPSEEK_HARNESS_ENDPOIN
+ export const PI_COMMAND_ENV = "CODEXHOST_PI_COMMAND";
+ export const GROK_COMMAND_ENV = "CODEXHOST_GROK_COMMAND";
+ export const OMP_COMMAND_ENV = "CODEXHOST_OMP_COMMAND";
++export const CODEXHOST_PI_DATA_DIR_ENV = "CODEXHOST_PI_DATA_DIR";
++export const CODEXHOST_OMP_DATA_DIR_ENV = "CODEXHOST_OMP_DATA_DIR";
++export const CODEXHOST_DSH_HOME_ENV = "CODEXHOST_DSH_HOME";
++export const CODEXHOST_GROK_HOME_ENV = "CODEXHOST_GROK_HOME";
++export const EVERYONE_CODEX_LEASE_CAPABILITY_ENV = "EVERYONE_CODEX_LEASE_CAPABILITY";
++export const EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV =
++  "EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY";
++
++const harnessDataDirectoryEnvironment = [
++  CODEXHOST_PI_DATA_DIR_ENV,
++  CODEXHOST_OMP_DATA_DIR_ENV,
++  CODEXHOST_DSH_HOME_ENV,
++  CODEXHOST_GROK_HOME_ENV,
++] as const;
+ 
+ type InspectableHarnessAdapter = Pick<HarnessAdapter, "inspect">;
+ 
++function environmentValue(environment: NodeJS.ProcessEnv, name: string): string | undefined {
++  return Object.entries(environment).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
++}
++
++function deleteEnvironmentValue(environment: NodeJS.ProcessEnv, name: string): void {
++  for (const key of Object.keys(environment)) {
++    if (key.toLowerCase() === name.toLowerCase()) Reflect.deleteProperty(environment, key);
++  }
++}
++
++/**
++ * 为单个 Harness 创建独立环境。Codex 专用 lease 永不下沉；外部 lease 也不会进入
++ * Claude Code，避免其原生 OAuth 会话意外获得 Fusion Gateway 权限。
++ */
++export function externalHarnessEnvironment(
++  source: NodeJS.ProcessEnv,
++  harnessId: ExternalHarnessId,
++): NodeJS.ProcessEnv {
++  const environment = { ...source };
++  const configuredDirectories = Object.fromEntries(
++    harnessDataDirectoryEnvironment.map((name) => [name, environmentValue(source, name)]),
++  );
++
++  deleteEnvironmentValue(environment, EVERYONE_CODEX_LEASE_CAPABILITY_ENV);
++  for (const name of harnessDataDirectoryEnvironment) deleteEnvironmentValue(environment, name);
++
++  if (harnessId === "claude-code") {
++    deleteEnvironmentValue(environment, EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV);
++    return environment;
++  }
++
++  const mapDirectory = (
++    sourceName: (typeof harnessDataDirectoryEnvironment)[number],
++    target: string,
++  ) => {
++    const directory = configuredDirectories[sourceName];
++    if (!directory) return;
++    deleteEnvironmentValue(environment, target);
++    environment[target] = directory;
++  };
++  switch (harnessId) {
++    case "pi":
++      mapDirectory(CODEXHOST_PI_DATA_DIR_ENV, "PI_CODING_AGENT_DIR");
++      break;
++    case "omp":
++      mapDirectory(CODEXHOST_OMP_DATA_DIR_ENV, "PI_CODING_AGENT_DIR");
++      break;
++    case "deepseek-harness":
++      mapDirectory(CODEXHOST_DSH_HOME_ENV, "DSH_HOME");
++      break;
++    case "grok":
++      mapDirectory(CODEXHOST_GROK_HOME_ENV, "GROK_HOME");
++      break;
++  }
++  return environment;
++}
++
+ export async function prefetchClaudeCodeModelCatalog(
+   adapters: ReadonlyMap<ExternalHarnessId, InspectableHarnessAdapter>,
+ ): Promise<void> {
+@@ -28,12 +99,17 @@ export async function prefetchClaudeCodeModelCatalog(
+ export function createExternalHarnessAdapters(
+   environment: NodeJS.ProcessEnv,
+ ): ReadonlyMap<ExternalHarnessId, HarnessAdapter> {
++  const piEnvironment = externalHarnessEnvironment(environment, "pi");
++  const claudeEnvironment = externalHarnessEnvironment(environment, "claude-code");
++  const deepSeekEnvironment = externalHarnessEnvironment(environment, "deepseek-harness");
++  const grokEnvironment = externalHarnessEnvironment(environment, "grok");
++  const ompEnvironment = externalHarnessEnvironment(environment, "omp");
+   return new Map<ExternalHarnessId, HarnessAdapter>([
+     [
+       "pi",
+       new PiAdapter({
+         ...(environment[PI_COMMAND_ENV] ? { command: environment[PI_COMMAND_ENV] } : {}),
+-        environment,
++        environment: piEnvironment,
+       }),
+     ],
+     [
+@@ -42,7 +118,7 @@ export function createExternalHarnessAdapters(
+         ...(environment[CLAUDE_CODE_COMMAND_ENV]
+           ? { command: environment[CLAUDE_CODE_COMMAND_ENV] }
+           : {}),
+-        environment,
++        environment: claudeEnvironment,
+       }),
+     ],
+     [
+@@ -54,21 +130,22 @@ export function createExternalHarnessAdapters(
+         ...(environment[DEEPSEEK_HARNESS_ENDPOINT_ENV]
+           ? { endpoint: environment[DEEPSEEK_HARNESS_ENDPOINT_ENV] }
+           : {}),
+-        environment,
++        environment: deepSeekEnvironment,
+       }),
+     ],
+     [
+       "grok",
+       new GrokAdapter({
+         ...(environment[GROK_COMMAND_ENV] ? { command: environment[GROK_COMMAND_ENV] } : {}),
+-        environment,
++        environment: grokEnvironment,
+       }),
+     ],
+     [
+       "omp",
+       new OmpAdapter({
+         ...(environment[OMP_COMMAND_ENV] ? { command: environment[OMP_COMMAND_ENV] } : {}),
+-        environment,
++        environment: ompEnvironment,
++        readOnly: true,
+       }),
+     ],
+   ]);
+diff --git a/packages/host-runtime/src/index.ts b/packages/host-runtime/src/index.ts
+index da208c8..1a12add 100644
+--- a/packages/host-runtime/src/index.ts
++++ b/packages/host-runtime/src/index.ts
+@@ -12,12 +12,19 @@ import { packageMetadata as updateManager } from "@codexhost/update-manager";
+ 
+ export {
+   CLAUDE_CODE_COMMAND_ENV,
++  CODEXHOST_DSH_HOME_ENV,
++  CODEXHOST_GROK_HOME_ENV,
++  CODEXHOST_OMP_DATA_DIR_ENV,
++  CODEXHOST_PI_DATA_DIR_ENV,
+   DEEPSEEK_HARNESS_COMMAND_ENV,
+   DEEPSEEK_HARNESS_ENDPOINT_ENV,
++  EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV,
++  EVERYONE_CODEX_LEASE_CAPABILITY_ENV,
+   GROK_COMMAND_ENV,
+   OMP_COMMAND_ENV,
+   PI_COMMAND_ENV,
+   createExternalHarnessAdapters,
++  externalHarnessEnvironment,
+   prefetchClaudeCodeModelCatalog,
+ } from "./adapter-composition.js";
+ export { AppServerHost, classifyCreateRequestRoute } from "./app-server-host.js";
+diff --git a/packages/host-runtime/test/adapter-composition.test.ts b/packages/host-runtime/test/adapter-composition.test.ts
+index d93032c..25ca10f 100644
+--- a/packages/host-runtime/test/adapter-composition.test.ts
++++ b/packages/host-runtime/test/adapter-composition.test.ts
+@@ -3,8 +3,15 @@ import { describe, expect, it, vi } from "vitest";
+ import type { HarnessInspection } from "@codexhost/harness-adapter";
+ import {
+   CLAUDE_CODE_COMMAND_ENV,
++  CODEXHOST_DSH_HOME_ENV,
++  CODEXHOST_GROK_HOME_ENV,
++  CODEXHOST_OMP_DATA_DIR_ENV,
++  CODEXHOST_PI_DATA_DIR_ENV,
++  EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV,
++  EVERYONE_CODEX_LEASE_CAPABILITY_ENV,
+   GROK_COMMAND_ENV,
+   createExternalHarnessAdapters,
++  externalHarnessEnvironment,
+   prefetchClaudeCodeModelCatalog,
+ } from "../src/index.js";
+ 
+@@ -46,6 +53,55 @@ describe("Host external Harness composition", () => {
+     await Promise.all([...adapters.values()].map((adapter) => adapter.close()));
+   });
+ 
++  it("isolates Fusion lease capabilities and Harness data directories", () => {
++    const source = {
++      PATH: "/synthetic/bin",
++      [EVERYONE_CODEX_LEASE_CAPABILITY_ENV]: "codex-only-capability",
++      [EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV]: "external-only-capability",
++      [CODEXHOST_PI_DATA_DIR_ENV]: "/fusion/pi",
++      [CODEXHOST_OMP_DATA_DIR_ENV]: "/fusion/omp",
++      [CODEXHOST_DSH_HOME_ENV]: "/fusion/dsh",
++      [CODEXHOST_GROK_HOME_ENV]: "/fusion/grok",
++    };
++
++    const pi = externalHarnessEnvironment(source, "pi");
++    const omp = externalHarnessEnvironment(source, "omp");
++    const deepSeek = externalHarnessEnvironment(source, "deepseek-harness");
++    const grok = externalHarnessEnvironment(source, "grok");
++    const claude = externalHarnessEnvironment(source, "claude-code");
++
++    expect(pi).toMatchObject({
++      PATH: "/synthetic/bin",
++      [EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV]: "external-only-capability",
++      PI_CODING_AGENT_DIR: "/fusion/pi",
++    });
++    expect(omp).toMatchObject({
++      [EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV]: "external-only-capability",
++      PI_CODING_AGENT_DIR: "/fusion/omp",
++    });
++    expect(pi.PI_CODING_AGENT_DIR).not.toBe(omp.PI_CODING_AGENT_DIR);
++    expect(deepSeek).toMatchObject({
++      [EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV]: "external-only-capability",
++      DSH_HOME: "/fusion/dsh",
++    });
++    expect(grok).toMatchObject({
++      [EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV]: "external-only-capability",
++      GROK_HOME: "/fusion/grok",
++    });
++
++    for (const environment of [pi, omp, deepSeek, grok]) {
++      expect(environment).not.toHaveProperty(EVERYONE_CODEX_LEASE_CAPABILITY_ENV);
++    }
++    expect(claude).not.toHaveProperty(EVERYONE_CODEX_LEASE_CAPABILITY_ENV);
++    expect(claude).not.toHaveProperty(EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV);
++    for (const environment of [pi, omp, deepSeek, grok, claude]) {
++      expect(environment).not.toHaveProperty(CODEXHOST_PI_DATA_DIR_ENV);
++      expect(environment).not.toHaveProperty(CODEXHOST_OMP_DATA_DIR_ENV);
++      expect(environment).not.toHaveProperty(CODEXHOST_DSH_HOME_ENV);
++      expect(environment).not.toHaveProperty(CODEXHOST_GROK_HOME_ENV);
++    }
++  });
++
+   it("preserves an explicit user-installed Grok command", async () => {
+     const adapters = createExternalHarnessAdapters({
+       PATH: "",
