@@ -1,6 +1,6 @@
 {
   "name": "everyone-in-codex",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Run compatible agent harnesses and routed models inside Codex Desktop.",
   "type": "module",

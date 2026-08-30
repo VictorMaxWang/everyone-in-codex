@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { FusionGateway } from "./fusion-gateway.mjs";
 import { parseCodex2AuthJson } from "./codex2-native-catalog.mjs";
 import { HarnessRegistry } from "./harness-registry.mjs";
 import { createLocalConnectionControl } from "./local-connection-control.mjs";
+import { readCurrentProductManifest } from "./product-manifest.mjs";
+import { ProductUpdateCoordinator } from "./product-update-coordinator.mjs";
 import {
   LocalFusionRuntime,
   readFusionConfig,
@@ -16,6 +18,7 @@ import { readFile, lstat } from "node:fs/promises";
 import path from "node:path";
 
 const LEASE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function parseArguments(argv) {
   const result = {};
@@ -79,6 +82,7 @@ export async function startGatewayDaemonService({
   send = (value) => process.send?.(value),
   gatewayFactory = (options) => new FusionGateway(options),
   connectionControlFactory = createLocalConnectionControl,
+  productUpdateControlFactory = (options) => new ProductUpdateCoordinator(options),
   nativeFetch = globalThis.fetch,
 } = {}) {
   if (!LEASE_ID_PATTERN.test(leaseId ?? "") || typeof send !== "function") {
@@ -104,11 +108,21 @@ export async function startGatewayDaemonService({
     runtime: localRuntime,
     registry,
   });
+  const productIdentity = await readCurrentProductManifest({ packageRoot: PACKAGE_ROOT });
+  const productUpdateControl = productUpdateControlFactory({
+    productRoot: path.join(stateRoot, "product"),
+    packageRoot: PACKAGE_ROOT,
+    configPath,
+    currentManifest: productIdentity.manifest,
+    // 源码工作树没有可验证的 source commit，只负责屏蔽 stock updater。
+    autoDownload: !productIdentity.development,
+  });
   const gateway = gatewayFactory({
     routerBaseUrl,
     nativeOpenAiBaseUrl: config.nativeOpenAi?.apiBaseUrl ?? null,
     nativeFetch,
     connectionControl,
+    productUpdateControl,
     nativeOpenAiSessionProvider: async () => {
       try {
         return await readCodex2NativeSession(config);

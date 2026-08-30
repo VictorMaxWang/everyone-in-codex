@@ -10,11 +10,13 @@ permissions:
 jobs:
   windows-x64:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 90
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Use locked Node
         uses: actions/setup-node@v4
@@ -28,27 +30,12 @@ jobs:
       - name: Check source and script syntax
         run: npm run check
 
-      - name: Patch materialization dry-run placeholder
+      - name: Materialize all locked upstream sources
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $materializer = Join-Path $PWD 'scripts/materialize-upstreams.ps1'
-          if (Test-Path -LiteralPath $materializer -PathType Leaf) {
-            $command = Get-Command $materializer -ErrorAction Stop
-            if ($command.Parameters.ContainsKey('DryRun')) {
-              & $materializer -DryRun
-              if (-not $?) { throw 'Patch materialization dry-run failed.' }
-            } else {
-              $patches = @(Get-ChildItem -LiteralPath ./patches -Filter *.patch -File -Recurse)
-              if ($patches.Count -eq 0) { throw 'No upstream patches were found for the dry-run placeholder.' }
-              foreach ($patch in $patches) {
-                & git apply --numstat -- $patch.FullName | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw "Patch parse failed: $($patch.Name)" }
-              }
-            }
-          } else {
-            Write-Host 'No upstream materializer is checked in yet; placeholder passed without network access.'
-          }
+          & ./scripts/materialize-upstreams.ps1 -Component all
+          if (-not $?) { throw 'Locked upstream materialization failed.' }
 
       - name: Adopt setup-node into repo-local runtime
         shell: pwsh
@@ -58,15 +45,28 @@ jobs:
           & ./scripts/bootstrap.ps1 -RepoRoot $PWD -NodeRoot $nodeRoot
           if (-not $?) { throw 'Repo-local toolchain bootstrap failed.' }
 
+      - name: Install locked repo-local Rust toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/setup-local-toolchains.ps1
+          if (-not $?) { throw 'Repo-local Rust bootstrap failed.' }
+
+      - name: Build patched CodexHost payload
+        run: npm run build:codexhost
+
       - name: Build and audit portable ZIP
         run: npm run package:win
 
-      - name: Upload portable smoke artifact
+      - name: Upload reproducible release cohort
         uses: actions/upload-artifact@v4
         with:
           name: everyone-codex-windows-x64
           path: |
             artifacts/everyone-codex-*-windows-x64.zip
+            artifacts/everyone-codex-*-source.zip
+            artifacts/everyone-codex-*-materialized-source.zip
+            artifacts/MANIFEST.sha256
             artifacts/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 7

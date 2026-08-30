@@ -24,6 +24,7 @@ const CONNECTION_ROUTES = Object.freeze(new Map([
   ["remove", "remove"],
   ["apply", "apply"],
 ]));
+const PRODUCT_UPDATE_ROUTES = Object.freeze(new Set(["check", "start", "status"]));
 
 function writeJson(response, statusCode, value, headers = {}) {
   const body = JSON.stringify(value);
@@ -488,6 +489,7 @@ export class FusionGateway {
   #nativeOpenAiBaseUrl;
   #activeRequestCount = 0;
   #connectionControl;
+  #productUpdateControl;
 
   constructor({
     routerBaseUrl,
@@ -500,6 +502,7 @@ export class FusionGateway {
     nativeOpenAiBaseUrl = null,
     nativeFetch = globalThis.fetch,
     connectionControl = null,
+    productUpdateControl = null,
   }) {
     if (!routerBaseUrl) throw new TypeError("routerBaseUrl is required");
     if (typeof fetchImpl !== "function") throw new TypeError("fetchImpl must be a function");
@@ -527,6 +530,12 @@ export class FusionGateway {
       throw new TypeError("connection_control_dependency_invalid");
     }
     this.#connectionControl = connectionControl;
+    if (productUpdateControl !== null && [...PRODUCT_UPDATE_ROUTES].some(
+      (method) => typeof productUpdateControl?.[method] !== "function",
+    )) {
+      throw new TypeError("product_update_control_dependency_invalid");
+    }
+    this.#productUpdateControl = productUpdateControl;
     if (typeof nativeOpenAiSessionProvider !== "function" || typeof nativeFetch !== "function") {
       throw new TypeError("native_openai_dependency_invalid");
     }
@@ -603,6 +612,34 @@ export class FusionGateway {
             response,
             tooLarge ? 413 : 400,
             tooLarge ? "request_too_large" : "connection_operation_failed",
+          );
+        }
+        return;
+      }
+
+      const productUpdateMatch = request.method === "POST"
+        ? /^\/v1\/product-update\/(check|start|status)$/u.exec(requestUrl.pathname)
+        : null;
+      if (productUpdateMatch) {
+        if (!token || !safeEqual(token, this.#hostCapability)) {
+          requestError(response, 401, "invalid_host", "Unauthorized");
+          return;
+        }
+        const method = productUpdateMatch[1];
+        if (!PRODUCT_UPDATE_ROUTES.has(method) || !this.#productUpdateControl) {
+          requestError(response, 404, "product_update_endpoint_unavailable", "Not found");
+          return;
+        }
+        try {
+          const params = JSON.parse(await readBody(request, this.maxBodyBytes));
+          const result = await this.#productUpdateControl[method](params);
+          writeJson(response, 200, result);
+        } catch (error) {
+          const tooLarge = error?.code === "request_too_large";
+          requestError(
+            response,
+            tooLarge ? 413 : 400,
+            tooLarge ? "request_too_large" : "product_update_operation_failed",
           );
         }
         return;

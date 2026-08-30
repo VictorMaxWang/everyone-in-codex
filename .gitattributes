@@ -1,2 +1,13 @@
+* text=auto eol=lf
 AGENTS.md export-ignore
-*.patch whitespace=-blank-at-eol
+*.patch -text whitespace=-blank-at-eol
+*.sha256 -text
+*.dll binary
+*.exe binary
+*.gif binary
+*.ico binary
+*.node binary
+*.pak binary
+*.png binary
+*.wasm binary
+*.zip binary

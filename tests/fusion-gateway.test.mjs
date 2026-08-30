@@ -241,6 +241,38 @@ test("Gateway Connections 控制面只接受 host capability 并严格路由六�
   ]);
 });
 
+test("Gateway 产品更新控制面只接受 host capability，且不复用上游组件更新入口", async (t) => {
+  const calls = [];
+  const productUpdateControl = Object.fromEntries([
+    ["check", { currentVersion: "0.3.1", latestVersion: "0.3.1", updateAvailable: false }],
+    ["start", { status: { version: "0.3.2", phase: "waiting-for-exit" } }],
+    ["status", { status: null }],
+  ].map(([method, result]) => [method, async (params) => { calls.push([method, params]); return result; }]));
+  const gateway = new FusionGateway({
+    routerBaseUrl: "http://127.0.0.1:9/_codex-router/private/v1/",
+    productUpdateControl,
+  });
+  const lease = await startLease(gateway);
+  t.after(() => lease.close());
+
+  const unauthorized = await fetch(`${lease.baseUrl}/v1/product-update/check`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(unauthorized.status, 401);
+
+  for (const method of ["check", "start", "status"]) {
+    const response = await fetch(`${lease.baseUrl}/v1/product-update/${method}`, {
+      method: "POST",
+      headers: { ...lease.controlAuthorizationHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ launcherPid: 1234, leaseId: "lease-one" }),
+    });
+    assert.equal(response.status, 200, method);
+  }
+  assert.deepEqual(calls.map(([method]) => method), ["check", "start", "status"]);
+});
+
 test("Gateway 为 Grok 补全严格 Responses SSE 文本字段并重排 sequence_number", async (t) => {
   const router = createServer((_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });

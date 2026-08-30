@@ -13,17 +13,24 @@ const REQUIRED_PORTABLE_FILES = [
   "config/fusion.example.json",
   "config/validation-policy.example.json",
   "locks/router-v030.lock.json",
-  "patches/router/0001-custom-connections.patch",
+  "locks/router-managed-files.sha256",
+  "patches/router/0001-production-integration.patch",
+  "product-distribution.json",
+  "MANIFEST.sha256",
+  "scripts/install-product.ps1",
+  "scripts/product-launcher.cmd",
+  "scripts/product-launcher.ps1",
   "runtime/node/node.exe",
   "runtime/node/LICENSE",
 ];
 
 const ALLOWED_PORTABLE_PATHS = [
-  /^(?:README\.md|LICENSE|THIRD_PARTY_NOTICES\.md|package\.json|release-manifest\.json)$/,
+  /^(?:README\.md|LICENSE|THIRD_PARTY_NOTICES\.md|package\.json|release-manifest\.json|product-distribution\.json|MANIFEST\.sha256)$/,
   /^bin\/everyone-codex\.cmd$/,
+  /^scripts\/(?:install-product\.ps1|product-launcher\.(?:cmd|ps1))$/,
   /^src\/[A-Za-z0-9._/-]+\.(?:mjs|json|md|ps1)$/,
   /^config\/[A-Za-z0-9._/-]+\.json$/,
-  /^locks\/[A-Za-z0-9._/-]+\.json$/,
+  /^locks\/[A-Za-z0-9._/-]+\.(?:json|sha256)$/,
   /^patches\/[A-Za-z0-9._/-]+\.patch$/,
   /^runtime\/node\/(?:node\.exe|LICENSE)$/,
   /^runtime\/codexhost\/[A-Za-z0-9._/-]+\.(?:exe|dll|node|js|mjs|cjs|json|wasm|pak|bin|dat|txt|md|html|css|png|ico)$/,
@@ -93,7 +100,7 @@ function parseArguments(argv) {
   if (!options.root) {
     throw new Error("--root is required");
   }
-  if (options.kind !== "portable") {
+  if (!new Set(["portable", "materialized"]).has(options.kind)) {
     throw new Error(`Unsupported audit kind: ${options.kind}`);
   }
   return options;
@@ -172,10 +179,81 @@ function auditPortable(root) {
   };
 }
 
+function fixtureContextAllows(file, forbidden, content) {
+  if (!new Set([
+    "OpenAI-style API key",
+    "NVIDIA API key",
+    "bearer token",
+    "assigned key or token",
+  ]).has(forbidden.name)) return false;
+  if (/(?:^|\/)tests?(?:\/|$)/iu.test(file.relativePath)) return true;
+  const expression = new RegExp(
+    forbidden.pattern.source,
+    `${forbidden.pattern.flags.replace("g", "")}g`,
+  );
+  for (const match of content.matchAll(expression)) {
+    if (
+      forbidden.name === "assigned key or token"
+      && /os\.environ\/[A-Z][A-Z0-9_]*["']$/u.test(match[0])
+    ) {
+      continue;
+    }
+    const start = Math.max(0, match.index - 100);
+    const context = content.slice(start, Math.min(content.length, match.index + match[0].length + 100));
+    if (!/(?:fixture|test|dummy|fake)/iu.test(context)) return false;
+  }
+  return true;
+}
+
+function auditMaterialized(root) {
+  const absoluteRoot = resolve(root);
+  const metadata = lstatSync(absoluteRoot);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error("Materialized source root must be a real directory");
+  }
+  const files = walkFiles(absoluteRoot);
+  const names = new Set(files.map(({ relativePath }) => relativePath));
+  const required = [
+    "SOURCE-MANIFEST.json",
+    "product/package.json",
+    "upstreams/codexhost/package.json",
+    "upstreams/router/package.json",
+    "upstreams/webgpt/package.json",
+  ];
+  const missing = required.filter((file) => !names.has(file));
+  if (missing.length > 0) throw new Error(`Materialized source is missing: ${missing.join(", ")}`);
+  const forbiddenPath = /(?:^|\/)(?:\.git|node_modules|\.runtime|\.state|logs?|coverage)(?:\/|$)|(?:^|\/)(?:auth\.json|\.env(?:\..*)?|.*\.secret|.*\.log)$/iu;
+  for (const file of files) {
+    if (forbiddenPath.test(file.relativePath)) {
+      throw new Error(`Materialized source contains a forbidden path: ${file.relativePath}`);
+    }
+    if (!TEXT_EXTENSIONS.has(extensionOf(file.relativePath)) || file.size > 10 * 1024 * 1024) continue;
+    const content = readFileSync(file.absolutePath, "utf8");
+    const sourceForbidden = FORBIDDEN_CONTENT.filter(
+      ({ name }) => !new Set(["local drive path", "Windows user profile", "Codex 2 profile"]).has(name),
+    );
+    for (const forbidden of sourceForbidden) {
+      if (!forbidden.pattern.test(content)) continue;
+      if (fixtureContextAllows(file, forbidden, content)) continue;
+      throw new Error(
+        `Materialized source contains forbidden content (${forbidden.name}) in ${file.relativePath}`,
+      );
+    }
+  }
+  return {
+    ok: true,
+    kind: "materialized",
+    files: files.length,
+    bytes: files.reduce((sum, file) => sum + file.size, 0),
+  };
+}
+
 function main() {
   try {
     const options = parseArguments(process.argv.slice(2));
-    const report = auditPortable(options.root);
+    const report = options.kind === "portable"
+      ? auditPortable(options.root)
+      : auditMaterialized(options.root);
     process.stdout.write(`${JSON.stringify(report)}\n`);
   } catch (error) {
     process.stderr.write(`Release audit failed: ${error instanceof Error ? error.message : String(error)}\n`);

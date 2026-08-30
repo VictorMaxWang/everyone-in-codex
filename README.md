@@ -63,7 +63,9 @@ everyone-codex launch
 everyone-codex restore
 ```
 
-The implementation is under active development. Until a portable release is produced, run commands only from a trusted source checkout.
+Stable Windows x64 releases are portable and self-contained. After the one-time v0.3.1 migration,
+Codex 2 runs from `%LOCALAPPDATA%\EveryoneCodex\product\versions`; it no longer depends on a local
+source checkout.
 
 For a local or portable setup, copy the two templates in `config/` to
 `fusion.local.json` and `validation-policy.local.json`, then replace every
@@ -72,5 +74,32 @@ paths must be explicitly allowlisted; any symlink or Windows reparse ancestor is
 rejected before a process starts.
 
 The bundled Router patch is never applied to an unknown checkout. `connections prepare-router`
-accepts only the exact locked pre-v0.3 cohort, copies its managed source files to the explicitly
-provided backup directory, runs `git apply --check`, applies once, and verifies every patched file.
+accepts only the exact public v0.4.0-beta.4 commit and tree, copies managed source files to the
+explicit backup directory, applies the complete production integration patch once, and verifies all
+58 managed files. The running Router and WebGPT are not restarted during ordinary product updates.
+
+## Product updates
+
+- The blue update badge checks only stable Releases from
+  `VictorMaxWang/everyone-in-codex`; CodexHost, Router and WebGPT upstream releases are advisory.
+- A new package is downloaded, SHA-256 verified, safely expanded and staged in the product version
+  store. Background updates activate after Codex 2 exits; **Install now** requests an exact managed
+  Codex 2 shutdown and relaunch.
+- The stable launcher keeps the previous version. If the new CLI/Host chain fails its first startup
+  gate, the launcher atomically restores the previous pointer and starts that version.
+- Old versions, backups and historical CodexHost update failures are deliberately retained.
+
+## Runtime language map and source parity
+
+GitHub's language bar describes this small overlay repository, not the complete runtime. Every
+Release therefore contains both the lightweight source archive and a fully materialized source
+archive:
+
+- **Rust** — CodexHost launcher, process ownership, profile isolation and atomic runtime handoff.
+- **TypeScript** — Harness adapters, approvals, Diff projection, Settings and WebGPT integration.
+- **JavaScript** — Fusion Gateway, Router integration, update verification and control plane.
+- **PowerShell** — Windows bootstrap, deterministic packaging, installation and maintenance.
+
+`everyone-codex-<version>-materialized-source.zip` contains the product source plus fully patched
+CodexHost, Router and WebGPT trees. `SOURCE-MANIFEST.json`, `product-distribution.json`,
+`MANIFEST.sha256` and `SHA256SUMS.txt` bind the source commit, upstream trees and every runtime file.

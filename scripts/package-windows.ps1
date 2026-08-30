@@ -4,11 +4,13 @@ param(
     [string]$OutputDirectory,
     [string]$NodeRoot,
     [string]$CodexHostPayload,
-    [switch]$KeepStaging
+    [switch]$KeepStaging,
+    [switch]$SkipMaterializedSource
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'release-archive.ps1')
 
 function Resolve-RequiredDirectory {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Label)
@@ -61,15 +63,26 @@ function Assert-ExternalCommandSucceeded {
 $resolvedRepoRoot = Resolve-RequiredDirectory -Path $RepoRoot -Label 'Repository root'
 $packagePath = Join-Path $resolvedRepoRoot 'package.json'
 $toolchainLockPath = Join-Path $resolvedRepoRoot 'locks\toolchains.lock.json'
+$upstreamLockPath = Join-Path $resolvedRepoRoot 'locks\upstream.lock.json'
+$routerLockPath = Join-Path $resolvedRepoRoot 'locks\router-v030.lock.json'
 
 $package = Get-Content -LiteralPath $packagePath -Raw -Encoding UTF8 | ConvertFrom-Json
 $toolchainLock = Get-Content -LiteralPath $toolchainLockPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$upstreamLock = Get-Content -LiteralPath $upstreamLockPath -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 100
+$routerLock = Get-Content -LiteralPath $routerLockPath -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 100
 if (-not $package.version -or $package.version -notmatch '^[0-9A-Za-z][0-9A-Za-z.+-]*$') {
     throw 'package.json contains an invalid release version'
 }
 if (-not $toolchainLock.node) {
     throw 'locks/toolchains.lock.json does not define node'
 }
+& git -C $resolvedRepoRoot diff --quiet --
+Assert-ExternalCommandSucceeded -ExitCode $LASTEXITCODE -Operation 'Source tree cleanliness check'
+& git -C $resolvedRepoRoot diff --cached --quiet --
+Assert-ExternalCommandSucceeded -ExitCode $LASTEXITCODE -Operation 'Source index cleanliness check'
+$sourceCommit = (& git -C $resolvedRepoRoot rev-parse HEAD).Trim()
+Assert-ExternalCommandSucceeded -ExitCode $LASTEXITCODE -Operation 'Source commit resolution'
+if ($sourceCommit -notmatch '^[a-f0-9]{40}$') { throw 'Source commit is invalid' }
 
 $releaseName = "everyone-codex-$($package.version)-windows-x64"
 $packageBuildRoot = [IO.Path]::GetFullPath((Join-Path $resolvedRepoRoot '.build\package'))
@@ -109,6 +122,11 @@ try {
     Copy-DirectoryContents `
         -Source (Join-Path $resolvedRepoRoot 'patches\router') `
         -Destination (Join-Path $stagingRoot 'patches\router')
+    foreach ($fileName in @('install-product.ps1', 'product-launcher.cmd', 'product-launcher.ps1')) {
+        Copy-RequiredFile `
+            -Source (Join-Path $resolvedRepoRoot "scripts\$fileName") `
+            -Destination (Join-Path $stagingRoot "scripts\$fileName")
+    }
 
     if (-not $NodeRoot) {
         if ($env:EVERYONE_CODEX_NODE_ROOT) {
@@ -140,7 +158,7 @@ try {
     Copy-RequiredFile -Source $nodeLicense -Destination (Join-Path $nodeDestination 'LICENSE')
 
     if (-not $CodexHostPayload) {
-        $defaultPayload = Join-Path $resolvedRepoRoot '.build\codexhost\payload'
+        $defaultPayload = Join-Path $resolvedRepoRoot ".build\codexhost\payload-v$($package.version)"
         if (Test-Path -LiteralPath $defaultPayload -PathType Container) {
             $CodexHostPayload = $defaultPayload
         }
@@ -166,17 +184,52 @@ exit /b %ERRORLEVEL%
     Set-Content -LiteralPath (Join-Path $binRoot 'everyone-codex.cmd') -Value $launcher -Encoding ascii -NoNewline
 
     $manifest = [ordered]@{
-        schemaVersion = 1
-        product = 'Everyone in Codex'
+        schemaVersion = 2
+        product = 'everyone-in-codex'
         version = [string]$package.version
-        platform = 'windows'
-        arch = 'x64'
+        target = 'windows-x64'
+        sourceCommit = $sourceCommit
         bundledNode = [string]$toolchainLock.node
         codexHostPayload = $hasCodexHostPayload
     }
     $manifest | ConvertTo-Json -Depth 4 | Set-Content `
         -LiteralPath (Join-Path $stagingRoot 'release-manifest.json') `
         -Encoding utf8
+
+    $runtimeManifestPath = Join-Path $stagingRoot 'MANIFEST.sha256'
+    New-Sha256FileManifest `
+        -SourceRoot $stagingRoot `
+        -Destination $runtimeManifestPath `
+        -Exclude @('MANIFEST.sha256', 'product-distribution.json')
+    $runtimeManifestSha256 = (Get-FileHash -LiteralPath $runtimeManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $productDistribution = [ordered]@{
+        schemaVersion = 2
+        product = 'everyone-in-codex'
+        version = [string]$package.version
+        channel = 'stable'
+        target = 'windows-x64'
+        sourceCommit = $sourceCommit
+        runtimeManifestSha256 = $runtimeManifestSha256
+        upstreams = [ordered]@{
+            codexhost = [ordered]@{
+                commit = [string]$upstreamLock.codexhost.commit
+                tree = [string]$upstreamLock.codexhost.patchedTree
+            }
+            router = [ordered]@{
+                commit = [string]$routerLock.upstreamCommit
+                tree = [string]$routerLock.patchedTree
+            }
+            webgpt = [ordered]@{
+                commit = [string]$upstreamLock.webgpt.integrationCommit
+                tree = [string]$upstreamLock.webgpt.integrationTree
+            }
+        }
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $stagingRoot 'product-distribution.json'),
+        (($productDistribution | ConvertTo-Json -Depth 8) + "`n"),
+        [Text.UTF8Encoding]::new($false)
+    )
 
     # Smoke 只做语法检查，不触发 Gateway、Router、WebGPT 或任何 Harness。
     & (Join-Path $nodeDestination 'node.exe') --check (Join-Path $stagingRoot 'src\cli.mjs') | Out-Null
@@ -196,16 +249,9 @@ exit /b %ERRORLEVEL%
 
     $zipName = "$releaseName.zip"
     $zipPath = Join-Path $resolvedOutputDirectory $zipName
-    if (Test-Path -LiteralPath $zipPath) {
-        Remove-Item -LiteralPath $zipPath -Force
-    }
-    Compress-Archive -LiteralPath $stagingRoot -DestinationPath $zipPath -CompressionLevel Optimal
+    New-DeterministicZip -SourceRoot $stagingRoot -RootName $releaseName -Destination $zipPath
 
     # 源码包只来自已提交 Git tree；这既排除本机配置，也保证 patch/lock 可重放。
-    & git -C $resolvedRepoRoot diff --quiet --
-    Assert-ExternalCommandSucceeded -ExitCode $LASTEXITCODE -Operation 'Source tree cleanliness check'
-    & git -C $resolvedRepoRoot diff --cached --quiet --
-    Assert-ExternalCommandSucceeded -ExitCode $LASTEXITCODE -Operation 'Source index cleanliness check'
     $sourceName = "everyone-codex-$($package.version)-source"
     $sourceZipName = "$sourceName.zip"
     $sourceZipPath = Join-Path $resolvedOutputDirectory $sourceZipName
@@ -219,11 +265,37 @@ exit /b %ERRORLEVEL%
         HEAD
     Assert-ExternalCommandSucceeded -ExitCode $LASTEXITCODE -Operation 'Source archive build'
 
+    $materializedZipPath = $null
+    if (-not $SkipMaterializedSource) {
+        $materializedReport = & (Join-Path $PSScriptRoot 'build-materialized-source.ps1') `
+            -RepoRoot $resolvedRepoRoot `
+            -OutputDirectory $resolvedOutputDirectory
+        Assert-ExternalCommandSucceeded -ExitCode $LASTEXITCODE -Operation 'Materialized source build'
+        $materialized = $materializedReport | ConvertFrom-Json
+        $materializedZipPath = [string]$materialized.artifact
+        if (-not (Test-Path -LiteralPath $materializedZipPath -PathType Leaf)) {
+            throw 'Materialized source build returned no artifact'
+        }
+    }
+
+    $externalManifestPath = Join-Path $resolvedOutputDirectory 'MANIFEST.sha256'
+    Copy-Item -LiteralPath $runtimeManifestPath -Destination $externalManifestPath -Force
+
     $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $sourceHash = (Get-FileHash -LiteralPath $sourceZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $manifestHash = (Get-FileHash -LiteralPath $externalManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $checksumLines = @(
+        "$hash  $zipName"
+        "$sourceHash  $sourceZipName"
+    )
+    if ($materializedZipPath) {
+        $materializedHash = (Get-FileHash -LiteralPath $materializedZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $checksumLines += "$materializedHash  $([IO.Path]::GetFileName($materializedZipPath))"
+    }
+    $checksumLines += "$manifestHash  MANIFEST.sha256"
     $checksumPath = Join-Path $resolvedOutputDirectory 'SHA256SUMS.txt'
     Set-Content -LiteralPath $checksumPath `
-        -Value "$hash  $zipName`n$sourceHash  $sourceZipName`n" `
+        -Value (($checksumLines -join "`n") + "`n") `
         -Encoding utf8 `
         -NoNewline
 
@@ -231,8 +303,11 @@ exit /b %ERRORLEVEL%
         ok = $true
         artifact = $zipPath
         sourceArtifact = $sourceZipPath
+        materializedSourceArtifact = $materializedZipPath
+        runtimeManifest = $externalManifestPath
         checksums = $checksumPath
         version = [string]$package.version
+        sourceCommit = $sourceCommit
     } | ConvertTo-Json -Compress | Write-Output
 } finally {
     if ($cleanupStaging -and (Test-Path -LiteralPath $stagingRoot)) {

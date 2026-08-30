@@ -124,7 +124,9 @@ function resolveCodexHostExecutable(document, configDirectory) {
   if (configured !== undefined) {
     return requireAbsolutePath(configured, "runtime.codexHostExecutable");
   }
-  const portable = path.join(configDirectory, "runtime", "codexhost", "bin", "codexhost.exe");
+  // 生产配置位于稳定 product root，而实现与 Host payload 位于活动版本目录。
+  // 因此默认 runtime 必须绑定当前模块版本，不能相对外置配置文件解析。
+  const portable = path.join(MODULE_ROOT, "runtime", "codexhost", "bin", "codexhost.exe");
   const checkout = path.join(MODULE_ROOT, ".build", "codexhost", "payload", "bin", "codexhost.exe");
   return configDirectory === MODULE_ROOT ? checkout : portable;
 }
@@ -1116,6 +1118,7 @@ export class LocalFusionRuntime {
         EVERYONE_CODEX_CLAUDE_BASE_URL: gatewayReady.harnesses["claude-code"].baseUrl,
         EVERYONE_CODEX_HOST_CONTROL_URL: gatewayReady.control.baseUrl,
         EVERYONE_CODEX_HOST_CONTROL_CAPABILITY: gatewayReady.control.capability,
+        EVERYONE_CODEX_LEASE_ID: leaseId,
         CODEXHOST_FUSION_MODELS_JSON: JSON.stringify(
           codexHostFusionModels(externalSnapshot.models),
         ),

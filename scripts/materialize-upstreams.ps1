@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'codexhost', 'webgpt')]
-    [string]$Component = 'all'
+    [ValidateSet('all', 'codexhost', 'router', 'webgpt')]
+    [string]$Component = 'all',
+    [string]$OutputRoot
 )
 
 Set-StrictMode -Version Latest
@@ -9,8 +10,22 @@ $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $lockPath = Join-Path $repositoryRoot 'locks\upstream.lock.json'
-$buildRoot = Join-Path $repositoryRoot '.build\upstreams'
+$routerLockPath = Join-Path $repositoryRoot 'locks\router-v030.lock.json'
+$buildRoot = if ($OutputRoot) {
+    [System.IO.Path]::GetFullPath($OutputRoot)
+} else {
+    Join-Path $repositoryRoot '.build\upstreams'
+}
+$allowedBuildRoot = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot '.build')) +
+    [System.IO.Path]::DirectorySeparatorChar
+if (-not ([System.IO.Path]::GetFullPath($buildRoot) + [System.IO.Path]::DirectorySeparatorChar).StartsWith(
+    $allowedBuildRoot,
+    [System.StringComparison]::OrdinalIgnoreCase
+)) {
+    throw 'Materialized upstream output must stay under the repository .build directory'
+}
 $lock = Get-Content -LiteralPath $lockPath -Raw -Encoding utf8 | ConvertFrom-Json -Depth 100
+$routerLock = Get-Content -LiteralPath $routerLockPath -Raw -Encoding utf8 | ConvertFrom-Json -Depth 100
 
 function Invoke-Git {
     param(
@@ -198,6 +213,18 @@ if ($Component -in @('all', 'webgpt')) {
         -BaseTree ([string]$lock.webgpt.baseTree) `
         -ExpectedTree ([string]$lock.webgpt.integrationTree) `
         -PatchSeries @($lock.webgpt.patchSeries)
+}
+if ($Component -in @('all', 'router')) {
+    if ($routerLock.schemaVersion -ne 2) {
+        throw 'Router materialization requires locks/router-v030.lock.json schemaVersion 2'
+    }
+    $results += Materialize-Component `
+        -Name 'router' `
+        -Repository ([string]$routerLock.repository) `
+        -BaseCommit ([string]$routerLock.upstreamCommit) `
+        -BaseTree ([string]$routerLock.baselineTree) `
+        -ExpectedTree ([string]$routerLock.patchedTree) `
+        -PatchSeries @($routerLock.patchSeries)
 }
 
 $results | ConvertTo-Json -Depth 5

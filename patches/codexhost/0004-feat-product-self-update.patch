@@ -1,0 +1,635 @@
+diff --git a/packages/host-runtime/src/gateway-product-update-coordinator.ts b/packages/host-runtime/src/gateway-product-update-coordinator.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..df93b3ccc9b2a8a4cc31263068c5f33fb08c5479
+--- /dev/null
++++ b/packages/host-runtime/src/gateway-product-update-coordinator.ts
+@@ -0,0 +1,177 @@
++import path from "node:path";
++
++import {
++  updateCheckResultSchema,
++  updateStartResultSchema,
++  updateStatusResultSchema,
++  type UpdateCheckResult,
++  type UpdateStartResult,
++  type UpdateStatusResult,
++} from "@codexhost/shared-contracts";
++
++import {
++  EVERYONE_CODEX_HOST_CONTROL_CAPABILITY_ENV,
++  EVERYONE_CODEX_HOST_CONTROL_URL_ENV,
++} from "./connection-coordinator.js";
++import type { HostUpdateCoordinator } from "./update-coordinator.js";
++
++const PRODUCT_LEASE_ID_ENV = "EVERYONE_CODEX_LEASE_ID";
++const LAUNCHER_PID_ENV = "CODEXHOST_LAUNCHER_PID";
++const LAUNCHER_EXECUTABLE_ENV = "CODEXHOST_LAUNCHER_EXECUTABLE";
++const RUNTIME_DESCRIPTOR_ENV = "CODEXHOST_RUNTIME_DESCRIPTOR_PATH";
++const RESPONSE_MAX_BYTES = 2 * 1024 * 1024;
++const REQUEST_TIMEOUT_MS = 30 * 60 * 1_000;
++
++type GatewayFetch = (input: string, init: RequestInit) => Promise<Response>;
++
++function controlOrigin(value: string): string {
++  let url: URL;
++  try {
++    url = new URL(value);
++  } catch {
++    throw new Error("Product update control URL must be an HTTP 127.0.0.1 origin");
++  }
++  if (
++    url.protocol !== "http:" ||
++    url.hostname !== "127.0.0.1" ||
++    url.username ||
++    url.password ||
++    url.search ||
++    url.hash ||
++    url.pathname !== "/"
++  ) {
++    throw new Error("Product update control URL must be an HTTP 127.0.0.1 origin");
++  }
++  return url.origin;
++}
++
++export interface GatewayProductUpdateCoordinatorOptions {
++  controlUrl: string;
++  capability: string;
++  launcherPid: number;
++  leaseId: string;
++  launcherExecutable: string;
++  runtimeDescriptorPath: string;
++  fetch?: GatewayFetch;
++  timeoutMs?: number;
++}
++
++/** Fusion 模式只代理产品更新；它没有访问任何上游组件 updater 的代码路径。 */
++export class GatewayProductUpdateCoordinator implements HostUpdateCoordinator {
++  readonly #origin: string;
++  readonly #capability: string;
++  readonly #launcherPid: number;
++  readonly #leaseId: string;
++  readonly #launcherExecutable: string;
++  readonly #runtimeDescriptorPath: string;
++  readonly #fetch: GatewayFetch;
++  readonly #timeoutMs: number;
++
++  constructor(options: GatewayProductUpdateCoordinatorOptions) {
++    this.#origin = controlOrigin(options.controlUrl);
++    if (!options.capability || options.capability.length > 16_384) {
++      throw new Error("Product update control capability is invalid");
++    }
++    if (!Number.isSafeInteger(options.launcherPid) || options.launcherPid < 1) {
++      throw new Error("Product update launcher pid is invalid");
++    }
++    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(options.leaseId)) {
++      throw new Error("Product update lease id is invalid");
++    }
++    if (
++      !path.isAbsolute(options.launcherExecutable) ||
++      !path.isAbsolute(options.runtimeDescriptorPath)
++    ) {
++      throw new Error("Product update launcher paths are invalid");
++    }
++    this.#capability = options.capability;
++    this.#launcherPid = options.launcherPid;
++    this.#leaseId = options.leaseId;
++    this.#launcherExecutable = path.resolve(options.launcherExecutable);
++    this.#runtimeDescriptorPath = path.resolve(options.runtimeDescriptorPath);
++    this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
++    this.#timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
++  }
++
++  async check(signal?: AbortSignal): Promise<UpdateCheckResult> {
++    return updateCheckResultSchema.parse(await this.#post("check", signal));
++  }
++
++  async start(): Promise<UpdateStartResult> {
++    return updateStartResultSchema.parse(await this.#post("start"));
++  }
++
++  async status(): Promise<UpdateStatusResult> {
++    return updateStatusResultSchema.parse(await this.#post("status"));
++  }
++
++  async #post(method: "check" | "start" | "status", outerSignal?: AbortSignal): Promise<unknown> {
++    const timeoutSignal = AbortSignal.timeout(this.#timeoutMs);
++    const signal = outerSignal ? AbortSignal.any([outerSignal, timeoutSignal]) : timeoutSignal;
++    let response: Response;
++    try {
++      response = await this.#fetch(`${this.#origin}/v1/product-update/${method}`, {
++        method: "POST",
++        redirect: "error",
++        signal,
++        headers: {
++          authorization: `Bearer ${this.#capability}`,
++          "content-type": "application/json",
++        },
++        body: JSON.stringify({
++          launcherPid: this.#launcherPid,
++          leaseId: this.#leaseId,
++          launcherExecutable: this.#launcherExecutable,
++          runtimeDescriptorPath: this.#runtimeDescriptorPath,
++        }),
++      });
++    } catch {
++      throw new Error("Product update Gateway request failed");
++    }
++    if (!response.ok) {
++      throw new Error(`Product update Gateway request failed (HTTP ${response.status})`);
++    }
++    const contentLength = Number(response.headers.get("content-length"));
++    if (Number.isFinite(contentLength) && contentLength > RESPONSE_MAX_BYTES) {
++      throw new Error("Product update Gateway returned an invalid response");
++    }
++    try {
++      const body = await response.text();
++      if (Buffer.byteLength(body, "utf8") > RESPONSE_MAX_BYTES) throw new Error("too large");
++      return JSON.parse(body) as unknown;
++    } catch {
++      throw new Error("Product update Gateway returned an invalid response");
++    }
++  }
++}
++
++export function createGatewayProductUpdateCoordinatorFromEnvironment(
++  environment: NodeJS.ProcessEnv,
++): GatewayProductUpdateCoordinator | null {
++  const controlUrl = environment[EVERYONE_CODEX_HOST_CONTROL_URL_ENV];
++  const capability = environment[EVERYONE_CODEX_HOST_CONTROL_CAPABILITY_ENV];
++  if (!controlUrl && !capability) return null;
++  const launcherPid = Number(environment[LAUNCHER_PID_ENV]);
++  const leaseId = environment[PRODUCT_LEASE_ID_ENV];
++  const launcherExecutable = environment[LAUNCHER_EXECUTABLE_ENV];
++  const runtimeDescriptorPath = environment[RUNTIME_DESCRIPTOR_ENV];
++  if (
++    !controlUrl ||
++    !capability ||
++    !Number.isSafeInteger(launcherPid) ||
++    launcherPid < 1 ||
++    !leaseId ||
++    !launcherExecutable ||
++    !runtimeDescriptorPath
++  ) {
++    throw new Error("Product update control environment is incomplete");
++  }
++  return new GatewayProductUpdateCoordinator({
++    controlUrl,
++    capability,
++    launcherPid,
++    leaseId,
++    launcherExecutable,
++    runtimeDescriptorPath,
++  });
++}
+diff --git a/packages/host-runtime/src/index.ts b/packages/host-runtime/src/index.ts
+index 65ffc6ee4d658814b5944d90196edc3cdc8dc965..ece007ac3f5daa1a48f5c3b15a640fefeb9d7108 100644
+--- a/packages/host-runtime/src/index.ts
++++ b/packages/host-runtime/src/index.ts
+@@ -51,6 +51,11 @@ export type {
+   ConnectionCoordinator,
+   GatewayConnectionCoordinatorOptions,
+ } from "./connection-coordinator.js";
++export {
++  GatewayProductUpdateCoordinator,
++  createGatewayProductUpdateCoordinatorFromEnvironment,
++} from "./gateway-product-update-coordinator.js";
++export type { GatewayProductUpdateCoordinatorOptions } from "./gateway-product-update-coordinator.js";
+ export {
+   createRemoteAppServerWebSocketListener,
+   isRemoteUnixListenerInvocation,
+diff --git a/packages/host-runtime/src/run-host-runtime.ts b/packages/host-runtime/src/run-host-runtime.ts
+index 69fc32d7fc3344b5f3521801606e80d98306b00a..e34f9985a59a7dc99c2fe5a92407639e71ff8aff 100644
+--- a/packages/host-runtime/src/run-host-runtime.ts
++++ b/packages/host-runtime/src/run-host-runtime.ts
+@@ -9,6 +9,7 @@ import {
+ } from "./adapter-composition.js";
+ import { AppServerHost, officialEnvironment } from "./app-server-host.js";
+ import { createGatewayConnectionCoordinatorFromEnvironment } from "./connection-coordinator.js";
++import { createGatewayProductUpdateCoordinatorFromEnvironment } from "./gateway-product-update-coordinator.js";
+ import { createProductionExternalThreadStore } from "./external-thread-repository.js";
+ import {
+   createRemoteControlAppServerPlan,
+@@ -89,13 +90,14 @@ export async function runHostRuntime(input: {
+ }): Promise<number> {
+   const { stockCodexPath, defaultAgent } = requiredRuntimeConfiguration(input.environment);
+   const hostRuntimePath = input.hostRuntimeUrl ? fileURLToPath(input.hostRuntimeUrl) : undefined;
++  const productUpdateCoordinator = createGatewayProductUpdateCoordinatorFromEnvironment(
++    input.environment,
++  );
+   const updateCoordinator =
+     input.updateCoordinator ??
++    productUpdateCoordinator ??
+     (hostRuntimePath && hasLauncherManagedUpdateRuntime(input.environment, hostRuntimePath)
+-      ? createHostUpdateCoordinator({
+-          hostRuntimePath,
+-          environment: input.environment,
+-        })
++      ? createHostUpdateCoordinator({ hostRuntimePath, environment: input.environment })
+       : undefined);
+   // 一个 Host 进程共享同一个只含内存 capability 的控制代理；远程 Session 不复制凭据。
+   const connectionCoordinator = createGatewayConnectionCoordinatorFromEnvironment(
+diff --git a/packages/host-runtime/test/gateway-product-update-coordinator.test.ts b/packages/host-runtime/test/gateway-product-update-coordinator.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..39735a5163e3dccf76bd261942843b83fff9619e
+--- /dev/null
++++ b/packages/host-runtime/test/gateway-product-update-coordinator.test.ts
+@@ -0,0 +1,94 @@
++import { describe, expect, it, vi } from "vitest";
++
++import {
++  GatewayProductUpdateCoordinator,
++  createGatewayProductUpdateCoordinatorFromEnvironment,
++} from "../src/gateway-product-update-coordinator.js";
++
++describe("GatewayProductUpdateCoordinator", () => {
++  it("proxies the compatible update RPCs to the Fusion product endpoints", async () => {
++    const fetch = vi.fn(async (input: string, _init: RequestInit) => {
++      const method = input.split("/").at(-1);
++      const payload =
++        method === "check"
++          ? {
++              currentVersion: "0.3.1",
++              installation: "windows-installer",
++              latestVersion: "0.3.1",
++              updateAvailable: false,
++              installationAvailable: false,
++              releaseNotes: null,
++              releaseNotesUrl: null,
++              status: null,
++              error: null,
++            }
++          : method === "start"
++            ? {
++                status: {
++                  version: "0.3.2",
++                  installation: "windows-installer",
++                  phase: "waiting-for-exit",
++                  updatedAt: 1,
++                  error: null,
++                },
++              }
++            : { status: null };
++      return new Response(JSON.stringify(payload), { status: 200 });
++    });
++    const coordinator = new GatewayProductUpdateCoordinator({
++      controlUrl: "http://127.0.0.1:7441/",
++      capability: "fixture-capability",
++      launcherPid: 1234,
++      leaseId: "lease-one",
++      launcherExecutable: "C:\\EveryoneCodex\\codexhost.exe",
++      runtimeDescriptorPath: "C:\\EveryoneCodex\\desktop-runtime-v1.json",
++      fetch,
++    });
++
++    await coordinator.check();
++    await coordinator.start();
++    await coordinator.status();
++    expect(fetch.mock.calls.map(([url]) => url)).toEqual([
++      "http://127.0.0.1:7441/v1/product-update/check",
++      "http://127.0.0.1:7441/v1/product-update/start",
++      "http://127.0.0.1:7441/v1/product-update/status",
++    ]);
++    for (const [, init] of fetch.mock.calls) {
++      expect(JSON.parse(String(init?.body))).toEqual({
++        launcherPid: 1234,
++        leaseId: "lease-one",
++        launcherExecutable: "C:\\EveryoneCodex\\codexhost.exe",
++        runtimeDescriptorPath: "C:\\EveryoneCodex\\desktop-runtime-v1.json",
++      });
++      expect(init?.headers).toMatchObject({ authorization: "Bearer fixture-capability" });
++    }
++  });
++
++  it("requires the Fusion control pair, launcher pid and exact lease id together", () => {
++    expect(createGatewayProductUpdateCoordinatorFromEnvironment({})).toBeNull();
++    expect(() =>
++      createGatewayProductUpdateCoordinatorFromEnvironment({
++        EVERYONE_CODEX_HOST_CONTROL_URL: "http://127.0.0.1:7441",
++        EVERYONE_CODEX_HOST_CONTROL_CAPABILITY: "fixture-capability",
++        CODEXHOST_LAUNCHER_PID: "1234",
++      }),
++    ).toThrow("Product update control environment is incomplete");
++  });
++
++  it("never exposes a Gateway body or host capability in errors", async () => {
++    const coordinator = new GatewayProductUpdateCoordinator({
++      controlUrl: "http://127.0.0.1:7441/",
++      capability: "fixture-capability",
++      launcherPid: 1234,
++      leaseId: "lease-one",
++      launcherExecutable: "C:\\EveryoneCodex\\codexhost.exe",
++      runtimeDescriptorPath: "C:\\EveryoneCodex\\desktop-runtime-v1.json",
++      fetch: vi.fn(async () => new Response("private-body", { status: 500 })),
++    });
++    await expect(coordinator.check()).rejects.toThrow(
++      "Product update Gateway request failed (HTTP 500)",
++    );
++    await expect(coordinator.check()).rejects.not.toThrow("private-body");
++    await expect(coordinator.check()).rejects.not.toThrow("fixture-capability");
++  });
++});
+diff --git a/packages/renderer-extension/src/renderer-settings-lifecycle.ts b/packages/renderer-extension/src/renderer-settings-lifecycle.ts
+index 2592a8ef86877f0d7aec1a7692129b07b976446c..ab32258f62592f623967a5beb34b9baab2f05862 100644
+--- a/packages/renderer-extension/src/renderer-settings-lifecycle.ts
++++ b/packages/renderer-extension/src/renderer-settings-lifecycle.ts
+@@ -17,6 +17,7 @@ import {
+ } from "./settings/trigger.js";
+ 
+ const UPDATE_CHECK_TIMEOUT_MS = 5_000;
++const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1_000;
+ const UPDATE_RETRY_DELAYS_MS = [1_000, 3_000, 10_000, 30_000] as const;
+ 
+ export interface RendererSettingsLifecycleOptions {
+@@ -43,6 +44,7 @@ export function installRendererSettingsLifecycle(
+   let checkedUpdateClient: RendererUpdateClient | null = null;
+   let retryUpdateClient: RendererUpdateClient | null = null;
+   let updateRetryTimer: number | null = null;
++  let periodicUpdateTimer: number | null = null;
+   let updateRetryAttempt = 0;
+   let updateCheckGeneration = 0;
+   let updateAvailable = false;
+@@ -130,6 +132,16 @@ export function installRendererSettingsLifecycle(
+     updateRetryTimer = null;
+   };
+ 
++  const schedulePeriodicUpdateCheck = (client: RendererUpdateClient): void => {
++    if (periodicUpdateTimer !== null) ownerWindow.clearTimeout(periodicUpdateTimer);
++    periodicUpdateTimer = ownerWindow.setTimeout(() => {
++      periodicUpdateTimer = null;
++      if (disposed || options.getUpdateClient?.() !== client) return;
++      checkedUpdateClient = null;
++      refreshUpdateIndicator();
++    }, UPDATE_CHECK_INTERVAL_MS);
++  };
++
+   const scheduleUpdateRetry = (client: RendererUpdateClient): void => {
+     if (disposed || updateRetryTimer !== null) return;
+     const delay = UPDATE_RETRY_DELAYS_MS[updateRetryAttempt];
+@@ -180,6 +192,7 @@ export function installRendererSettingsLifecycle(
+         if (result.error === null) {
+           updateRetryAttempt = 0;
+           clearUpdateRetry();
++          schedulePeriodicUpdateCheck(client);
+           return;
+         }
+         checkedUpdateClient = null;
+@@ -214,6 +227,7 @@ export function installRendererSettingsLifecycle(
+       updateCheckGeneration += 1;
+       lifecycleController.abort();
+       clearUpdateRetry();
++      if (periodicUpdateTimer !== null) ownerWindow.clearTimeout(periodicUpdateTimer);
+       trigger?.dispose();
+       shell?.dispose();
+       trigger = null;
+diff --git a/packages/renderer-extension/src/settings/localization.ts b/packages/renderer-extension/src/settings/localization.ts
+index baa2082c6ad662041914837555954ae460d973cb..3bd441662328f6b1b0ee73de60db0424a9ec3763 100644
+--- a/packages/renderer-extension/src/settings/localization.ts
++++ b/packages/renderer-extension/src/settings/localization.ts
+@@ -124,6 +124,7 @@ export interface RendererSettingsMessages {
+   readonly updateRetry: string;
+   readonly updateManualNpmDescription: string;
+   readonly updateDownloadFromReleases: string;
++  readonly updateIntegratedComponents: string;
+   readonly pageLabels: Readonly<Record<DefaultRendererSettingsPageId, string>>;
+ }
+ 
+@@ -214,17 +215,17 @@ const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
+   updateCurrentVersion: "Current version",
+   updateInstallation: "Installation method",
+   updateInstallationNpm: "npm",
+-  updateInstallationWindowsInstaller: "Windows installer",
++  updateInstallationWindowsInstaller: "Everyone in Codex release package",
+   updateInstallationMacOsDmg: "macOS DMG",
+   updateInstallationUnknown: "Unknown",
+   updateLatestVersion: "Latest version",
+   updateUpToDate: "You are up to date.",
+   updateAvailable: "A new version is available.",
+-  updateAndRestart: "Update and restart",
++  updateAndRestart: "Install now and restart Codex 2",
+   updateChecking: "Checking for updates...",
+   updateDownloading: "Downloading update...",
+   updatePreparing: "Preparing update...",
+-  updateWaitingForExit: "Waiting for the application to close...",
++  updateWaitingForExit: "Verified. It will install automatically after Codex 2 exits.",
+   updateInstalling: "Installing update...",
+   updateInstallingNpm: "Installing update through npm...",
+   updateRequestTimeout: "The update service did not respond. Try again.",
+@@ -233,13 +234,15 @@ const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
+   updateFailed: "Update failed.",
+   updateRetry: "Retry",
+   updateManualNpmDescription: "To update manually, quit codexhost and run this command:",
+-  updateDownloadFromReleases: "Download from GitHub Releases",
++  updateDownloadFromReleases: "Open Everyone in Codex Releases",
++  updateIntegratedComponents:
++    "Integrated upstreams: CodexHost 0.3.5 (0.4.0 pending), Router 0.4.0-beta.4 (0.5.1 pending), WebGPT 4.0.5.",
+   pageLabels: Object.freeze({
+     connections: "Connections",
+     "model-pool": "Model Pool",
+     routes: "Routes",
+     gateway: "Gateway",
+-    updates: "Updates",
++    updates: "Everyone in Codex Updates",
+   }),
+ });
+ 
+@@ -329,17 +332,17 @@ const CHINESE_MESSAGES: RendererSettingsMessages = Object.freeze({
+   updateCurrentVersion: "当前版本",
+   updateInstallation: "安装方式",
+   updateInstallationNpm: "npm",
+-  updateInstallationWindowsInstaller: "Windows 安装程序",
++  updateInstallationWindowsInstaller: "Everyone in Codex 发布包",
+   updateInstallationMacOsDmg: "macOS DMG",
+   updateInstallationUnknown: "未知",
+   updateLatestVersion: "最新版本",
+   updateUpToDate: "当前已是最新版本。",
+   updateAvailable: "有新版本可用。",
+-  updateAndRestart: "更新并重启",
++  updateAndRestart: "立即安装并重启 Codex 2",
+   updateChecking: "正在检查更新...",
+   updateDownloading: "正在下载更新...",
+   updatePreparing: "正在准备更新...",
+-  updateWaitingForExit: "正在等待应用退出...",
++  updateWaitingForExit: "已验证，退出 Codex 2 后自动安装。",
+   updateInstalling: "正在安装更新...",
+   updateInstallingNpm: "正在通过 npm 安装...",
+   updateRequestTimeout: "更新服务未响应，请重试。",
+@@ -349,13 +352,15 @@ const CHINESE_MESSAGES: RendererSettingsMessages = Object.freeze({
+   updateRetry: "重试",
+   updateManualNpmDescription:
+     "如需手动更新，请在终端运行以下命令。更新完成后，请退出 Codex 并通过 codexhost 重新启动。",
+-  updateDownloadFromReleases: "前往 GitHub Releases 下载",
++  updateDownloadFromReleases: "打开 Everyone in Codex Releases",
++  updateIntegratedComponents:
++    "集成组件：CodexHost 0.3.5（0.4.0 待集成）、Router 0.4.0-beta.4（0.5.1 待集成）、WebGPT 4.0.5。",
+   pageLabels: Object.freeze({
+     connections: "连接",
+     "model-pool": "模型池",
+     routes: "路由",
+     gateway: "网关",
+-    updates: "更新",
++    updates: "Everyone in Codex 更新",
+   }),
+ });
+ 
+diff --git a/packages/renderer-extension/src/settings/pages.ts b/packages/renderer-extension/src/settings/pages.ts
+index 9db8cc0779d78d0e01f0511a65bf41df5646f7e7..425f79795776594e3bb0ec920433d6d3dcfcee01 100644
+--- a/packages/renderer-extension/src/settings/pages.ts
++++ b/packages/renderer-extension/src/settings/pages.ts
+@@ -30,7 +30,7 @@ import {
+ } from "./update-request.js";
+ 
+ export const CODEXHOST_RELEASES_LATEST_URL =
+-  "https://github.com/BytePioneer-AI/codex-host/releases/latest";
++  "https://github.com/VictorMaxWang/everyone-in-codex/releases/latest";
+ export const CODEXHOST_NPM_MANUAL_UPDATE_COMMAND = "npm install -g @codexhost/cli@latest";
+ 
+ export const DEFAULT_RENDERER_SETTINGS_PAGE_IDS = [
+@@ -585,6 +585,9 @@ function updatesPage(
+       const panel = document.createElement("section");
+       panel.className = "settings-update-panel";
+       panel.setAttribute("aria-live", "polite");
++      const integratedComponents = document.createElement("p");
++      integratedComponents.className = "settings-update-summary";
++      integratedComponents.textContent = messages.updateIntegratedComponents;
+       const manualNpm = document.createElement("div");
+       manualNpm.className = "settings-update-manual";
+       manualNpm.hidden = true;
+@@ -605,7 +608,7 @@ function updatesPage(
+         createRendererSettingsIcon("external-link", 14),
+       );
+       actions.append(releaseLink);
+-      context.content.append(heading, metadata, panel, manualNpm, actions);
++      context.content.append(heading, metadata, panel, integratedComponents, manualNpm, actions);
+       let pollTimer: number | undefined;
+       let pollAttempts = 0;
+       let pending = false;
+diff --git a/packages/renderer-extension/test/renderer-settings-lifecycle.test.ts b/packages/renderer-extension/test/renderer-settings-lifecycle.test.ts
+index c712b4fa345d6ae4d35f0cd700d408ca04db52c1..5dcc908d27e68871f89af0679de8637d84bb835e 100644
+--- a/packages/renderer-extension/test/renderer-settings-lifecycle.test.ts
++++ b/packages/renderer-extension/test/renderer-settings-lifecycle.test.ts
+@@ -52,6 +52,10 @@ function failedUpdateCheck(): UpdateCheckResult {
+   };
+ }
+ 
++function currentUpdateCheck(): UpdateCheckResult {
++  return { ...failedUpdateCheck(), latestVersion: "0.3.2", error: null };
++}
++
+ describe("Renderer Settings lifecycle", () => {
+   afterEach(() => {
+     vi.useRealTimers();
+@@ -92,4 +96,27 @@ describe("Renderer Settings lifecycle", () => {
+ 
+     lifecycle.dispose();
+   });
++
++  it("checks the stable product channel again after six hours", async () => {
++    vi.useFakeTimers();
++    const checkUpdate = vi.fn(async () => currentUpdateCheck());
++    const client = { checkUpdate, startUpdate: vi.fn(), readUpdateStatus: vi.fn() };
++    const ownerWindow = {
++      navigator: { languages: ["en"] },
++      document: {},
++      setTimeout,
++      clearTimeout,
++    } as unknown as Window;
++    const lifecycle = installRendererSettingsLifecycle(ownerWindow, {
++      getUpdateClient: () => client,
++    });
++    await Promise.resolve();
++    await Promise.resolve();
++    expect(checkUpdate).toHaveBeenCalledTimes(1);
++    await vi.advanceTimersByTimeAsync(6 * 60 * 60 * 1_000 - 1);
++    expect(checkUpdate).toHaveBeenCalledTimes(1);
++    await vi.advanceTimersByTimeAsync(1);
++    expect(checkUpdate).toHaveBeenCalledTimes(2);
++    lifecycle.dispose();
++  });
+ });
+diff --git a/packages/renderer-extension/test/settings/localization.test.ts b/packages/renderer-extension/test/settings/localization.test.ts
+index 04c938c7de41064eba2c60e3a3d199b57217d494..77a65f7b5f8f7375ad246855d600ced6d4f6b2fd 100644
+--- a/packages/renderer-extension/test/settings/localization.test.ts
++++ b/packages/renderer-extension/test/settings/localization.test.ts
+@@ -35,16 +35,16 @@ describe("Renderer settings localization", () => {
+     expect(chinese.title).toBe("设置");
+     expect(chinese.openSettings).toBe("打开 codexhost 设置");
+     expect(chinese.updateInstallation).toBe("安装方式");
+-    expect(chinese.updateInstallationWindowsInstaller).toBe("Windows 安装程序");
++    expect(chinese.updateInstallationWindowsInstaller).toBe("Everyone in Codex 发布包");
+     expect(english.updateInstallationMacOsDmg).toBe("macOS DMG");
+-    expect(chinese.updateWaitingForExit).toBe("正在等待应用退出...");
++    expect(chinese.updateWaitingForExit).toBe("已验证，退出 Codex 2 后自动安装。");
+     expect(chinese.updateInstallingNpm).toBe("正在通过 npm 安装...");
+     expect(chinese.updateManualNpmDescription).toBe(
+       "如需手动更新，请在终端运行以下命令。更新完成后，请退出 Codex 并通过 codexhost 重新启动。",
+     );
+     expect(english.updateInstalling).toBe("Installing update...");
+-    expect(english.updateDownloadFromReleases).toBe("Download from GitHub Releases");
+-    expect(chinese.updateDownloadFromReleases).toBe("前往 GitHub Releases 下载");
++    expect(english.updateDownloadFromReleases).toBe("Open Everyone in Codex Releases");
++    expect(chinese.updateDownloadFromReleases).toBe("打开 Everyone in Codex Releases");
+     expect(Object.keys(chinese.pageLabels)).toEqual(Object.keys(english.pageLabels));
+     expect(Object.isFrozen(english)).toBe(true);
+     expect(Object.isFrozen(chinese.pageLabels)).toBe(true);
+@@ -55,6 +55,6 @@ describe("Renderer settings localization", () => {
+       createDefaultRendererSettingsPages(rendererSettingsMessages("zh-CN")).map(
+         ({ label }) => label,
+       ),
+-    ).toEqual(["连接", "模型池", "路由", "网关", "更新"]);
++    ).toEqual(["连接", "模型池", "路由", "网关", "Everyone in Codex 更新"]);
+   });
+ });
+diff --git a/packages/renderer-extension/test/settings/pages.test.ts b/packages/renderer-extension/test/settings/pages.test.ts
+index e611bb106b0e5f4923e25c269758ce47668c3554..92403d4e078c3c3ffd44c6fa95fe426705897609 100644
+--- a/packages/renderer-extension/test/settings/pages.test.ts
++++ b/packages/renderer-extension/test/settings/pages.test.ts
+@@ -580,7 +580,7 @@ describe("Renderer Connections page", () => {
+ describe("Renderer Updates page", () => {
+   it.each([
+     [updateStatus("prepared"), "正在准备更新..."],
+-    [updateStatus("waiting-for-exit"), "正在等待应用退出..."],
++    [updateStatus("waiting-for-exit"), "已验证，退出 Codex 2 后自动安装。"],
+     [updateStatus("installing"), "正在通过 npm 安装..."],
+     [updateStatus("installing", "windows-installer"), "正在安装更新..."],
+     [updateStatus("restarting"), "正在重启以完成更新..."],
+diff --git a/packages/renderer-extension/test/settings/shell.test.ts b/packages/renderer-extension/test/settings/shell.test.ts
+index 58f18874d314164d210c289c607676d02a31c9d5..5ea0e77abb999df2bc0382599da5973bfe464f1b 100644
+--- a/packages/renderer-extension/test/settings/shell.test.ts
++++ b/packages/renderer-extension/test/settings/shell.test.ts
+@@ -18,7 +18,7 @@ describe("Renderer settings foundation", () => {
+       "Model Pool",
+       "Routes",
+       "Gateway",
+-      "Updates",
++      "Everyone in Codex Updates",
+     ]);
+     expect(pages.map(({ icon }) => icon)).toEqual([
+       "connections",
+diff --git a/packages/renderer-extension/test/settings/trigger.test.ts b/packages/renderer-extension/test/settings/trigger.test.ts
+index 13ae36febd108c8d5b802485e024b590de7a5a35..2b66774414f74bf0d239552c9fd01da969be19a6 100644
+--- a/packages/renderer-extension/test/settings/trigger.test.ts
++++ b/packages/renderer-extension/test/settings/trigger.test.ts
+@@ -113,7 +113,7 @@ describe("Renderer settings header trigger", () => {
+     expect(control.updateButton.style.color).toBe("#ffffff");
+     expect(
+       (control.updateButton.children[1] as unknown as { textContent: string }).textContent,
+-    ).toBe("Updates");
++    ).toBe("Everyone in Codex Updates");
+     expect(control.root.hasAttribute("data-update-available")).toBe(true);
+     (control.updateButton as unknown as FakeElement).dispatch("click");
+     expect(opened).toHaveBeenCalledWith(control.updateButton, "updates");
+diff --git a/packages/shared-contracts/src/updates.ts b/packages/shared-contracts/src/updates.ts
+index cc4359bcccbd7198a591c512b4fb3d3f53ad5599..9bc73aff0c35e92f52c0836a6aa1e464c82fd58a 100644
+--- a/packages/shared-contracts/src/updates.ts
++++ b/packages/shared-contracts/src/updates.ts
+@@ -46,8 +46,8 @@ const githubReleaseNotesUrlSchema = z
+   .string()
+   .max(300)
+   .regex(
+-    /^https:\/\/github\.com\/BytePioneer-AI\/codex-host\/releases\/tag\/v[0-9A-Za-z.+-]+$/u,
+-    "release notes URL must identify a codexhost GitHub Release",
++    /^https:\/\/github\.com\/(?:BytePioneer-AI\/codex-host|VictorMaxWang\/everyone-in-codex)\/releases\/tag\/v[0-9A-Za-z.+-]+$/u,
++    "release notes URL must identify a supported product GitHub Release",
+   );
+ 
+ export const updateCheckResultSchema = z.strictObject({

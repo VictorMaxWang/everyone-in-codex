@@ -1,0 +1,73 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag matches product version
+        shell: pwsh
+        run: |
+          $version = [string](Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match package version $version"
+          }
+
+      - name: Use locked Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+          architecture: x64
+
+      - name: Test and audit source
+        run: |
+          npm test
+          npm run check
+
+      - name: Materialize locked upstreams
+        shell: pwsh
+        run: ./scripts/materialize-upstreams.ps1 -Component all
+
+      - name: Install repo-local toolchains
+        shell: pwsh
+        run: |
+          $nodeRoot = Split-Path -Parent (Get-Command node.exe -ErrorAction Stop).Source
+          ./scripts/bootstrap.ps1 -RepoRoot $PWD -NodeRoot $nodeRoot
+          ./scripts/setup-local-toolchains.ps1
+
+      - name: Build patched Host and all release assets
+        run: |
+          npm run build:codexhost
+          npm run package:win
+
+      - name: Publish stable GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = [string](Get-Content package.json -Raw | ConvertFrom-Json).version
+          $assets = @(
+            "artifacts/everyone-codex-$version-windows-x64.zip",
+            "artifacts/everyone-codex-$version-source.zip",
+            "artifacts/everyone-codex-$version-materialized-source.zip",
+            "artifacts/MANIFEST.sha256",
+            "artifacts/SHA256SUMS.txt"
+          )
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing release asset: $asset" }
+          }
+          gh release create "v$version" @assets --verify-tag --title "Everyone in Codex v$version" --generate-notes

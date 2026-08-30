@@ -37,18 +37,44 @@ function createPortableFixture(root) {
   write(root, "src/cli.mjs", 'if (process.argv.includes("--help")) console.log("help");\n');
   write(root, "config/fusion.example.json", '{"schemaVersion":1}\n');
   write(root, "config/validation-policy.example.json", '{"schemaVersion":1}\n');
-  write(root, "locks/router-v030.lock.json", '{"schemaVersion":1}\n');
-  write(root, "patches/router/0001-custom-connections.patch", "patch fixture\n");
+  write(root, "locks/router-v030.lock.json", '{"schemaVersion":2}\n');
+  write(root, "locks/router-managed-files.sha256", `${"a".repeat(64)}  src/cli.mjs\n`);
+  write(root, "patches/router/0001-production-integration.patch", "patch fixture\n");
+  write(root, "product-distribution.json", '{"schemaVersion":2,"product":"everyone-in-codex"}\n');
+  write(root, "MANIFEST.sha256", `${"b".repeat(64)}  src/cli.mjs\n`);
+  write(root, "scripts/install-product.ps1", "# fixture\n");
+  write(root, "scripts/product-launcher.cmd", "@echo off\r\n");
+  write(root, "scripts/product-launcher.ps1", "# fixture\n");
   write(root, "runtime/node/node.exe", "fixture-binary");
   write(root, "runtime/node/LICENSE", "Node.js license fixture\n");
 }
 
-function runAudit(root) {
-  return spawnSync(process.execPath, [auditScript, "--root", root, "--kind", "portable"], {
+function runAudit(root, kind = "portable") {
+  return spawnSync(process.execPath, [auditScript, "--root", root, "--kind", kind], {
     encoding: "utf8",
     windowsHide: true,
   });
 }
+
+test("materialized source permits environment references but rejects embedded credentials", () => {
+  const root = mkdtempSync(join(tmpdir(), "everyone-audit-materialized-"));
+  try {
+    write(root, "SOURCE-MANIFEST.json", '{"schemaVersion":1}\n');
+    write(root, "product/package.json", '{}\n');
+    write(root, "upstreams/codexhost/package.json", '{}\n');
+    write(root, "upstreams/router/package.json", '{}\n');
+    write(root, "upstreams/webgpt/package.json", '{}\n');
+    write(root, "upstreams/router/src/config.mjs", 'const line = \'api_key: "os.environ/OPENAI_API_KEY"\';\n');
+    assert.equal(runAudit(root, "materialized").status, 0);
+    // fake credential fixture: the audit target receives only the next string, not this marker.
+    write(root, "upstreams/router/src/config.mjs", `const line = 'api_key: "${"z".repeat(40)}"';\n`);
+    const rejected = runAudit(root, "materialized");
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /forbidden content/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("portable release audit accepts only the documented public payload", () => {
   const root = mkdtempSync(join(tmpdir(), "everyone-audit-valid-"));
@@ -154,11 +180,9 @@ test(
         })}\n`,
       );
       write(nodeRoot, "LICENSE", "Node.js license fixture\n");
-      try {
-        linkSync(process.execPath, join(nodeRoot, "node.exe"));
-      } catch {
-        copyFileSync(process.execPath, join(nodeRoot, "node.exe"));
-      }
+      // bootstrap 会原子移动整个 Node 目录；必须使用独立副本，避免 CI 正在执行的
+      // setup-node 二进制通过硬链接把 Windows 文件锁带进 fixture。
+      copyFileSync(process.execPath, join(nodeRoot, "node.exe"));
 
       const result = spawnSync(
         "pwsh.exe",
@@ -219,10 +243,22 @@ test(
         "locks/toolchains.lock.json",
         `${JSON.stringify({ schemaVersion: 1, node: process.versions.node })}\n`,
       );
-      write(fixtureRoot, "locks/upstream.lock.json", '{"schemaVersion":1}\n');
-      write(fixtureRoot, "locks/router-v030.lock.json", '{"schemaVersion":1}\n');
+      write(fixtureRoot, "locks/upstream.lock.json", `${JSON.stringify({
+        schemaVersion: 1,
+        codexhost: { commit: "1".repeat(40), patchedTree: "2".repeat(40) },
+        webgpt: { integrationCommit: "3".repeat(40), integrationTree: "4".repeat(40) },
+      })}\n`);
+      write(fixtureRoot, "locks/router-v030.lock.json", `${JSON.stringify({
+        schemaVersion: 2,
+        upstreamCommit: "5".repeat(40),
+        patchedTree: "6".repeat(40),
+      })}\n`);
+      write(fixtureRoot, "locks/router-managed-files.sha256", `${"7".repeat(64)}  src/cli.mjs\n`);
       write(fixtureRoot, "patches/codexhost/0001.patch", "patch fixture\n");
-      write(fixtureRoot, "patches/router/0001-custom-connections.patch", "patch fixture\n");
+      write(fixtureRoot, "patches/router/0001-production-integration.patch", "patch fixture\n");
+      write(fixtureRoot, "scripts/install-product.ps1", "# fixture\n");
+      write(fixtureRoot, "scripts/product-launcher.cmd", "@echo off\r\n");
+      write(fixtureRoot, "scripts/product-launcher.ps1", "# fixture\n");
       write(nodeRoot, "LICENSE", "Node.js license fixture\n");
       try {
         linkSync(process.execPath, join(nodeRoot, "node.exe"));
@@ -261,6 +297,7 @@ test(
           outputRoot,
           "-NodeRoot",
           nodeRoot,
+          "-SkipMaterializedSource",
         ],
         { encoding: "utf8", windowsHide: true },
       );
@@ -275,9 +312,12 @@ test(
       const expectedSourceHash = createHash("sha256")
         .update(readFileSync(sourceZipPath))
         .digest("hex");
+      const manifestHash = createHash("sha256")
+        .update(readFileSync(join(outputRoot, "MANIFEST.sha256")))
+        .digest("hex");
       assert.equal(
         readFileSync(join(outputRoot, "SHA256SUMS.txt"), "utf8"),
-        `${expectedHash}  ${zipName}\n${expectedSourceHash}  ${sourceZipName}\n`,
+        `${expectedHash}  ${zipName}\n${expectedSourceHash}  ${sourceZipName}\n${manifestHash}  MANIFEST.sha256\n`,
       );
 
       execFileSync("tar.exe", ["-xf", zipPath, "-C", expandedRoot], { windowsHide: true });
@@ -293,7 +333,7 @@ test(
         true,
       );
       assert.equal(
-        existsSync(join(releaseRoot, "patches", "router", "0001-custom-connections.patch")),
+        existsSync(join(releaseRoot, "patches", "router", "0001-production-integration.patch")),
         true,
       );
     } finally {

@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { startGatewayDaemonService } from "../src/gateway-daemon.mjs";
 import {
@@ -25,6 +26,19 @@ import {
 } from "../src/local-runtime.mjs";
 
 const ROUTER_SECRET = "router-caller-capability-value-1234567890";
+
+test("外置 product 配置未固定 runtime 时解析到当前活动版本目录", async () => {
+  const fx = await fixture();
+  const document = JSON.parse(await readFile(fx.configPath, "utf8"));
+  delete document.runtime;
+  await writeFile(fx.configPath, JSON.stringify(document), "utf8");
+  const config = await readFusionConfig(fx.configPath);
+  const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  assert.equal(
+    config.runtime.codexHostExecutable,
+    path.join(repositoryRoot, "runtime", "codexhost", "bin", "codexhost.exe"),
+  );
+});
 
 function nativeCatalogFixture() {
   return {
@@ -339,6 +353,8 @@ test("Gateway daemon 在单进程中隔离 Codex 与五个 Harness lease", async
     starts[0].options.routerBaseUrl,
     `http://127.0.0.1:43123/_codex-router/${ROUTER_SECRET}/v1/`,
   );
+  assert.equal(typeof starts[0].options.productUpdateControl.check, "function");
+  assert.equal(typeof starts[0].options.productUpdateControl.start, "function");
   assert.deepEqual(starts.slice(1).map((entry) => entry.consumerId), [
     "codex", ...ROUTED_HARNESS_IDS,
   ]);
