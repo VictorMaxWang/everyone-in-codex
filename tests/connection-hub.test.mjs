@@ -177,3 +177,45 @@ test("密钥入口默认走 owner 安全提示，高级模式只暴露一次性�
     ["submit", { operationId: "masked-1", ciphertext: "ciphertext" }],
   ]);
 });
+
+test("Router 已提交而 Fusion 发布失败时保留可重试标记", async () => {
+  let pending = false;
+  let failBoundary = true;
+  const publication = {
+    isPending: async () => pending,
+    markPending: async () => { pending = true; },
+    clear: async () => { pending = false; },
+  };
+  const router = {
+    inspect: async () => [{
+      id: "custom-lab",
+      label: "Lab",
+      scope: "shared-model-source",
+      owner: "router",
+      state: "connected",
+      catalog: { state: "ready", modelCount: 1, consumers: ["codex"] },
+      actionIds: ["apply", "remove"],
+    }],
+    createCustom: async () => ({}),
+    apply: async () => ({ revision: "r3", restartRequired: false }),
+  };
+  const hub = new ConnectionHub({
+    router,
+    publication,
+    applyBoundary: async () => {
+      if (failBoundary) throw new Error("fixture_publish_failed");
+      return { catalogRevision: "c3", consumers: 6 };
+    },
+  });
+
+  await assert.rejects(hub.apply(), /fixture_publish_failed/);
+  assert.equal(pending, true);
+  assert.deepEqual((await hub.inspect())[0].catalog, {
+    state: "unpublished",
+    modelCount: 1,
+    consumers: [],
+  });
+  failBoundary = false;
+  await hub.apply();
+  assert.equal(pending, false);
+});

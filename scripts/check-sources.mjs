@@ -135,6 +135,9 @@ function main() {
     || !/^[a-f0-9]{40}$/u.test(router.baselineTree)
     || !/^[a-f0-9]{40}$/u.test(router.patchedTree)
     || !/^[a-f0-9]{64}$/u.test(router.patchSha256)
+    || !Array.isArray(router.managedFiles)
+    || Object.keys(router.managedFileSha256 ?? {}).length !== router.managedFiles.length
+    || router.managedFiles.some((file) => !/^[a-f0-9]{64}$/u.test(router.managedFileSha256[file] ?? ""))
   ) {
     throw new Error("Router v0.3 overlay lock is invalid");
   }

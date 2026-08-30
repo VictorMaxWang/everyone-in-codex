@@ -162,10 +162,10 @@ index 944814f..4b073eb 100644
  } else if (args[0] === "signed-routing") {
 diff --git a/src/custom-connections.mjs b/src/custom-connections.mjs
 new file mode 100644
-index 0000000..13356bd
+index 0000000..68f7d1f
 --- /dev/null
 +++ b/src/custom-connections.mjs
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,544 @@
 +import {
 +  existsSync,
 +  readFileSync,
@@ -291,6 +291,7 @@ index 0000000..13356bd
 +}
 +
 +export function planCustomConnection(input) {
++  // 元数据管理面禁止接收任何凭据字段；Key 只能走隐藏输入并经 stdin 进入独立文件。
 +  for (const field of ["apiKey", "key", "secret", "token"]) {
 +    if (input?.[field] !== undefined) {
 +      throw new Error("API keys are accepted only by connections secret-set over stdin.");

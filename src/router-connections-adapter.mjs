@@ -104,7 +104,7 @@ export function createRouterServiceRestarter({
 
 /** Router 是连接与凭据 owner；本 Adapter 只传递非敏感 metadata 与 stdin。 */
 export class RouterConnectionAdapter {
-  constructor({ run, restart = null, loginPlan = null } = {}) {
+  constructor({ run, restart = null, loginPlan = null, secretPrompt = null } = {}) {
     if (typeof run !== "function") throw new Error("router_connection_dependency_invalid");
     if (restart !== null && typeof restart !== "function") {
       throw new Error("router_connection_restart_dependency_invalid");
@@ -112,9 +112,13 @@ export class RouterConnectionAdapter {
     if (loginPlan !== null && typeof loginPlan !== "function") {
       throw new Error("router_connection_login_dependency_invalid");
     }
+    if (secretPrompt !== null && typeof secretPrompt !== "function") {
+      throw new Error("router_connection_secret_prompt_dependency_invalid");
+    }
     this.run = run;
     this.restartBoundary = restart;
     this.loginPlan = loginPlan;
+    this.secretPrompt = secretPrompt;
     this.customIds = new Set();
   }
 
@@ -207,6 +211,11 @@ export class RouterConnectionAdapter {
     const id = safeId(ownerId);
     if (!Buffer.isBuffer(secret) || secret.length < 1) throw new Error("connection_secret_invalid");
     return this.run(["connections", "secret-set", id], { stdin: secret });
+  }
+
+  async startSecretPrompt(ownerId) {
+    if (!this.secretPrompt) throw new Error("router_connection_secret_prompt_unavailable");
+    return this.secretPrompt(safeId(ownerId));
   }
 
   async remove(id) {

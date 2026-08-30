@@ -978,10 +978,10 @@ index 854306b..b812cbe 100644
    }
  }
 diff --git a/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts b/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts
-index 08e7051..574218a 100644
+index 08e7051..824a358 100644
 --- a/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts
 +++ b/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts
-@@ -8,6 +8,7 @@ import type {
+@@ -8,10 +8,12 @@ import type {
    MuxFrame,
    RpcId,
    RpcResponse,
@@ -989,7 +989,12 @@ index 08e7051..574218a 100644
  } from "@deepseek-ai/dsh-host-apiproxy/api";
  import type { SessionId } from "@deepseek-ai/dsh-session/types";
  
-@@ -35,7 +36,6 @@ import {
+ import {
++  estimatePathActionPreview,
+   HarnessOutputChannel,
+   registerHarnessSession,
+   validateHostApprovalResponse,
+@@ -35,7 +37,6 @@ import {
    type HostQuestionInteraction,
    type HostReasoningItem,
    type HostThreadSnapshot,
@@ -997,7 +1002,15 @@ index 08e7051..574218a 100644
    type HostTurnSnapshot,
    type HostUsage,
    type InteractionRespondAccepted,
-@@ -90,9 +90,12 @@ import {
+@@ -43,6 +44,7 @@ import {
+   type ModelSelectCommand,
+   type ModelSelectCompleted,
+   type OpenSessionInput,
++  type PathActionPreviewLease,
+   type PermissionModeSelectCommand,
+   type PermissionModeSelectCompleted,
+   type ThinkingSelectCommand,
+@@ -90,9 +92,13 @@ import {
    parseDeepSeekContextWindow,
    parseDeepSeekOutputTokensPerSecond,
    parseDeepSeekUsage,
@@ -1006,20 +1019,38 @@ index 08e7051..574218a 100644
    projectToolResult,
    projectTurnReason,
    structuredDiffs,
++  structuredDiffsFromToolResult,
 +  type DeepSeekPresentedToolItem,
  } from "./projection.js";
  
  export interface DeepSeekHarnessAdapterOptions extends DeepSeekHostConnectionOptions {
-@@ -132,7 +135,7 @@ async function reserveSessionEndpoint(): Promise<string> {
+@@ -132,7 +138,8 @@ async function reserveSessionEndpoint(): Promise<string> {
  }
  
  interface ActiveTool {
 -  item: HostToolExecutionItem;
 +  item: DeepSeekPresentedToolItem;
++  pathPreview: PathActionPreviewLease | null;
    startedAtMs: number;
    toolName: string;
  }
-@@ -248,6 +251,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+@@ -143,6 +150,7 @@ type ActiveInteraction =
+       interaction: HostApprovalInteraction;
+       rpcId: RpcId;
+       approvalId: string;
++      callId?: string;
+     }
+   | {
+       type: "question";
+@@ -161,6 +169,7 @@ interface ActiveTurn {
+   tools: Map<string, ActiveTool>;
+   interactions: Map<HostInteractionId, ActiveInteraction>;
+   snapshots: HostItemSnapshot[];
++  projectionQueue: Promise<void>;
+ }
+ 
+ const deepSeekHarnessId = harnessIdSchema.parse("deepseek-harness");
+@@ -248,6 +257,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
    readonly outputs: AsyncIterable<HarnessOutput>;
    readonly #channel = new HarnessOutputChannel<HarnessOutput>();
    readonly #client: DeepSeekHostClient;
@@ -1027,7 +1058,7 @@ index 08e7051..574218a 100644
    readonly #nativeRef: NativeSessionRef;
    readonly #onClosed: () => void;
    readonly #toolOutputLimit: number;
-@@ -270,6 +274,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+@@ -270,6 +280,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
  
    constructor(input: {
      client: DeepSeekHostClient;
@@ -1035,7 +1066,7 @@ index 08e7051..574218a 100644
      model: HarnessModelRef;
      nativeSessionId: string;
      lastSeq: number;
-@@ -281,6 +286,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+@@ -281,6 +292,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
      unsubscribe(): void;
    }) {
      this.#client = input.client;
@@ -1043,7 +1074,7 @@ index 08e7051..574218a 100644
      this.#model = input.model;
      this.#onClosed = input.onClosed;
      this.#toolOutputLimit = input.toolOutputLimit;
-@@ -323,6 +329,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+@@ -323,6 +335,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
        const projection = projectDeepSeekHistory({
          harnessId: this.harnessId,
          sessionId: this.#nativeRef.nativeSessionId,
@@ -1051,30 +1082,93 @@ index 08e7051..574218a 100644
          entries,
          fallbackModel: this.#model,
          toolOutputLimit: this.#toolOutputLimit,
-@@ -456,7 +463,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+@@ -415,6 +428,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+       tools: new Map(),
+       interactions: new Map(),
+       snapshots: [],
++      projectionQueue: Promise.resolve(),
+     };
+     this.#active = active;
+     try {
+@@ -455,15 +469,23 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+         );
          return;
        }
-       try {
+-      try {
 -        this.#event(frame.event.type, frame.event.data);
-+        this.#event(frame.event.type, frame.event.data, frame.view);
-       } catch (error) {
-         this.#fault(normalizedError(error, "protocolError"));
+-      } catch (error) {
+-        this.#fault(normalizedError(error, "protocolError"));
++      const eventData = frame.event.data;
++      const active = this.#active;
++      if (active) {
++        active.projectionQueue = active.projectionQueue
++          .then(() => this.#event(frame.event.type, eventData, frame.view))
++          .catch((error: unknown) => this.#fault(normalizedError(error, "protocolError")));
++      } else {
++        void this.#event(frame.event.type, eventData, frame.view).catch((error: unknown) =>
++          this.#fault(normalizedError(error, "protocolError")),
++        );
        }
-@@ -663,7 +670,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+       return;
+     }
+     if (frame.type === "approval/requested") {
+-      this.#approval(envelope.rpcId, frame);
++      void this.#approval(envelope.rpcId, frame).catch((error: unknown) =>
++        this.#fault(normalizedError(error, "protocolError")),
++      );
+     } else if (frame.type === "approval/resolved") {
+       this.#closeNativeInteraction("approval", frame.approvalId);
+     } else if (frame.type === "question/requested") {
+@@ -602,6 +624,12 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+       }
+       const validationError = validateHostApprovalResponse(pending.interaction, command.response);
+       if (validationError) return { ok: false, error: validationError };
++      const allowing = command.response.actionId === "allow-once";
++      const revalidationError = allowing
++        ? await (pending.callId
++            ? active.tools.get(pending.callId)?.pathPreview?.revalidate()
++            : null)
++        : null;
+       message = {
+         type: "client-response",
+         rpcId: pending.rpcId,
+@@ -610,10 +638,20 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+           value: {
+             sessionId: this.#nativeRef.nativeSessionId,
+             approvalId: pending.approvalId,
+-            outcome: command.response.actionId === "allow-once" ? "allowed-once" : "rejected",
++            outcome: allowing && !revalidationError ? "allowed-once" : "rejected",
+           },
+         },
+       };
++      if (revalidationError) {
++        try {
++          const receipt = await this.#client.respond(message);
++          if (receipt.accepted)
++            this.#closeHostInteraction(active, command.interactionId, "responded");
++        } catch (error) {
++          return { ok: false, error: normalizedError(error, "nativeFailure") };
++        }
++        return { ok: false, error: revalidationError };
++      }
+     } else {
+       if (command.response.type !== "question") {
+         return { ok: false, error: invalidState("DeepSeek Harness question response is invalid") };
+@@ -663,7 +701,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
      }
    }
  
 -  #event(type: string, data: Record<string, unknown>): void {
-+  #event(type: string, data: Record<string, unknown>, view?: ToolEventView): void {
++  async #event(type: string, data: Record<string, unknown>, view?: ToolEventView): Promise<void> {
      const active = this.#active;
      switch (type) {
        case "turn/start": {
-@@ -740,11 +747,11 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+@@ -740,11 +778,11 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
          return;
        case "tool/call":
          if (!active?.started) return;
 -        this.#startTool(active, data);
-+        this.#startTool(active, data, view);
++        await this.#startTool(active, data, view);
          return;
        case "tool/result":
          if (!active?.started) return;
@@ -1083,30 +1177,54 @@ index 08e7051..574218a 100644
          return;
        case "turn/end":
          if (!active?.started || data.turn !== active.nativeTurn) {
-@@ -805,7 +812,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+@@ -805,7 +843,11 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
      this.#completeItem(active, item, outcome);
    }
  
 -  #startTool(active: ActiveTurn, data: Record<string, unknown>): void {
-+  #startTool(active: ActiveTurn, data: Record<string, unknown>, view?: ToolEventView): void {
++  async #startTool(
++    active: ActiveTurn,
++    data: Record<string, unknown>,
++    view?: ToolEventView,
++  ): Promise<void> {
      if (
        !nonBlankString(data.callId) ||
        !nonBlankString(data.name) ||
-@@ -813,27 +820,65 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+@@ -813,43 +855,116 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
      ) {
        throw new Error("DeepSeek Harness emitted an invalid tool/call");
      }
 -    const item: HostToolExecutionItem = {
 -      type: "toolExecution",
-+    const item = projectDeepSeekToolCall({
++    const arguments_ = parseArguments(data.arguments);
++    let item = projectDeepSeekToolCall({
        itemId: this.#newItemId(),
        toolName: data.name,
-       arguments: parseArguments(data.arguments),
+-      arguments: parseArguments(data.arguments),
 -    };
+-    active.tools.set(data.callId, { item, toolName: data.name, startedAtMs: Date.now() });
++      arguments: arguments_,
 +      cwd: this.#cwd,
 +      ...(view ? { view } : {}),
 +    });
-     active.tools.set(data.callId, { item, toolName: data.name, startedAtMs: Date.now() });
++    const pathPreview =
++      item.type === "toolExecution"
++        ? await estimatePathActionPreview({
++            toolName: data.name,
++            arguments: arguments_,
++            cwd: this.#cwd,
++            workspaceRoots: [this.#cwd],
++          })
++        : null;
++    if (pathPreview) {
++      item = { type: "fileChange", itemId: item.itemId, changes: [...pathPreview.changes] };
++    }
++    active.tools.set(data.callId, {
++      item,
++      pathPreview,
++      toolName: data.name,
++      startedAtMs: Date.now(),
++    });
      this.#emit({ type: "item.started", turnId: active.command.turnId, item });
    }
  
@@ -1123,12 +1241,16 @@ index 08e7051..574218a 100644
 -      durationMs: Math.max(0, Date.now() - tool.startedAtMs),
 -    };
 +    const previousItem = tool.item;
++    const actualChanges = structuredDiffsFromToolResult(view, data.meta);
 +    tool.item = projectDeepSeekToolCompletion({
 +      item: tool.item,
 +      ...(view ? { view } : {}),
 +      ...(result.output ? { fallbackOutput: result.output } : {}),
 +      outputLimit: this.#toolOutputLimit,
 +    });
++    if (tool.pathPreview && actualChanges && tool.item.type === "fileChange") {
++      tool.item = { ...tool.item, changes: actualChanges };
++    }
 +    if (tool.item.type !== "fileChange") {
 +      tool.item = { ...tool.item, durationMs: Math.max(0, Date.now() - tool.startedAtMs) };
 +    }
@@ -1165,22 +1287,89 @@ index 08e7051..574218a 100644
 +      });
 +    }
      const failed = data.error !== undefined || result.failed;
-     this.#completeItem(
-       active,
-@@ -849,7 +894,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
-         : { status: "succeeded" },
-     );
+-    this.#completeItem(
+-      active,
+-      tool.item,
+-      failed
+-        ? {
+-            status: "failed",
+-            error: normalizedError(
+-              `DeepSeek Harness Tool '${tool.toolName}' failed`,
+-              "nativeFailure",
+-            ),
+-          }
+-        : { status: "succeeded" },
+-    );
++    const previewError =
++      !failed && tool.pathPreview
++        ? actualChanges
++          ? tool.pathPreview.verifyActual(actualChanges)
++          : {
++              code: "protocolError" as const,
++              message: "DeepSeek Harness File Change has no terminal structured Diff",
++              retryable: true,
++            }
++        : null;
++    const outcome: HostItemOutcome = failed
++      ? {
++          status: "failed",
++          error: normalizedError(
++            `DeepSeek Harness Tool '${tool.toolName}' failed`,
++            "nativeFailure",
++          ),
++        }
++      : previewError
++        ? { status: "failed", error: previewError }
++        : { status: "succeeded" };
++    this.#completeItem(active, tool.item, outcome);
++    if (previewError) {
++      this.#fault(previewError);
++      return;
++    }
      if (!failed) {
 -      const changes = structuredDiffs(data.meta);
 +      const changes = tool.item.type === "fileChange" ? null : structuredDiffs(data.meta);
        if (changes) {
          const fileItem: HostFileChangeItem = {
            type: "fileChange",
-@@ -881,12 +926,20 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+@@ -862,7 +977,10 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
      }
+   }
+ 
+-  #approval(rpcId: RpcId, frame: Extract<MuxFrame, { type: "approval/requested" }>): void {
++  async #approval(
++    rpcId: RpcId,
++    frame: Extract<MuxFrame, { type: "approval/requested" }>,
++  ): Promise<void> {
+     const active = this.#active;
+     if (!active) {
+       void this.#client.respond({
+@@ -879,14 +997,41 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+       });
+       return;
+     }
++    await active.projectionQueue;
++    if (this.#active !== active) return;
      if ([...active.interactions.values()].some((pending) => pending.rpcId === rpcId)) return;
      const interactionId = hostInteractionIdSchema.parse(this.#newItemId());
 +    const linkedTool = frame.callId ? active.tools.get(frame.callId) : undefined;
++    const previewError = await linkedTool?.pathPreview?.revalidate();
++    if (previewError) {
++      await this.#client.respond({
++        type: "client-response",
++        rpcId,
++        result: {
++          ok: true,
++          value: {
++            sessionId: this.#nativeRef.nativeSessionId,
++            approvalId: frame.approvalId,
++            outcome: "rejected",
++          },
++        },
++      });
++      this.#fault(previewError);
++      return;
++    }
 +    const linkedLabel =
 +      linkedTool?.item.type === "commandExecution"
 +        ? linkedTool.item.command
@@ -1199,7 +1388,15 @@ index 08e7051..574218a 100644
        subject: { type: "nativeAction" },
        actions: [
          { id: "allow-once", label: "Allow once", effect: "allowOnce" },
-@@ -1353,12 +1406,14 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+@@ -898,6 +1043,7 @@ class DeepSeekHarnessSession implements HarnessSession, DeepSeekHostSubscriber {
+       interaction,
+       rpcId,
+       approvalId: frame.approvalId,
++      ...(frame.callId ? { callId: frame.callId } : {}),
+     });
+     this.#channel.emit({ kind: "interaction", interaction });
+   }
+@@ -1353,12 +1499,14 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
          const projection = projectDeepSeekHistory({
            harnessId: this.harnessId,
            sessionId,
@@ -1294,7 +1491,7 @@ index a531704..d004189 100644
            const fileItem: HostFileChangeItem = {
              type: "fileChange",
 diff --git a/packages/adapters/deepseek-harness/src/projection.ts b/packages/adapters/deepseek-harness/src/projection.ts
-index 2426a6f..19d374e 100644
+index 2426a6f..8ede3ea 100644
 --- a/packages/adapters/deepseek-harness/src/projection.ts
 +++ b/packages/adapters/deepseek-harness/src/projection.ts
 @@ -1,15 +1,22 @@
@@ -1321,10 +1518,19 @@ index 2426a6f..19d374e 100644
  
  export function isRecord(value: unknown): value is Record<string, unknown> {
    return typeof value === "object" && value !== null && !Array.isArray(value);
-@@ -116,6 +123,169 @@ export function structuredDiffs(meta: unknown): HostFileChange[] | null {
+@@ -116,6 +123,178 @@ export function structuredDiffs(meta: unknown): HostFileChange[] | null {
    return changes;
  }
  
++/** DSH 的最终 Diff 可能位于 result view，也可能位于事件 meta；只接受结构化来源。 */
++export function structuredDiffsFromToolResult(
++  view: ToolEventView | undefined,
++  meta: unknown,
++): HostFileChange[] | null {
++  const result = viewRecord(view, "result");
++  return result?.card === "diff" ? structuredDiffs(result) : structuredDiffs(meta);
++}
++
 +type DisplayableDeepSeekToolItem = HostToolExecutionItem & { displayName?: string };
 +
 +export type DeepSeekPresentedToolItem =
@@ -1492,10 +1698,17 @@ index 2426a6f..19d374e 100644
    return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
  }
 diff --git a/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts b/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts
-index 2b9f24f..0b956a7 100644
+index 2b9f24f..1312549 100644
 --- a/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts
 +++ b/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts
-@@ -59,8 +59,10 @@ it("shortens the Everyone in Codex group label without changing the Model Ref",
+@@ -1,4 +1,6 @@
+ import path from "node:path";
++import { mkdtemp, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
+ 
+ import { describe, expect, it, vi } from "vitest";
+ 
+@@ -59,8 +61,10 @@ it("shortens the Everyone in Codex group label without changing the Model Ref",
      { provider: "everyone-in-codex", model: "gpt-5.6-sol" },
    );
  
@@ -1508,7 +1721,7 @@ index 2b9f24f..0b956a7 100644
      provider: "everyone-in-codex",
      model: "gpt-5.6-sol",
    });
-@@ -70,9 +72,15 @@ function success<T>(value: T) {
+@@ -70,9 +74,15 @@ function success<T>(value: T) {
    return { rpcId: RpcId("response"), result: { ok: true as const, value } };
  }
  
@@ -1525,7 +1738,7 @@ index 2b9f24f..0b956a7 100644
    };
  }
  
-@@ -172,11 +180,18 @@ class FakeConnection implements DeepSeekHostConnectionLike {
+@@ -172,11 +182,18 @@ class FakeConnection implements DeepSeekHostConnectionLike {
      } as DeepSeekMuxEnvelope);
    }
  
@@ -1545,7 +1758,178 @@ index 2b9f24f..0b956a7 100644
      });
    }
  }
-@@ -359,6 +374,442 @@ describe("DeepSeekHarnessAdapter local Host", () => {
+@@ -202,13 +219,168 @@ async function collectUntilTurn(session: Awaited<ReturnType<typeof openCreated>>
+   throw new Error("Output stream ended before Turn completion");
+ }
+ 
+-async function openCreated(adapter: DeepSeekHarnessAdapter) {
+-  const opened = await adapter.open({ kind: "create", cwd: "/workspace" });
++async function openCreated(adapter: DeepSeekHarnessAdapter, cwd = "/workspace") {
++  const opened = await adapter.open({ kind: "create", cwd });
+   if (!opened.ok) throw new Error(opened.error.message);
+   return opened.value;
+ }
+ 
+ describe("DeepSeekHarnessAdapter local Host", () => {
++  it("revalidates an estimated DSH path preview before allowing approval", async () => {
++    const cwd = await mkdtemp(path.join(tmpdir(), "codexhost-dsh-preview-"));
++    try {
++      await writeFile(path.join(cwd, "sample.txt"), "before\n", "utf8");
++      const { adapter, connection } = fixture();
++      const session = await openCreated(adapter, cwd);
++      const iterator = session.outputs[Symbol.asyncIterator]();
++      await session.execute({
++        type: "turn.start",
++        turnId: hostTurnIdSchema.parse("dsh-path-drift"),
++        input: [{ type: "text", text: "edit" }],
++      });
++      connection.sessionEvent(SESSION_ID, 1, "turn/start", { turn: 1 });
++      await iterator.next();
++      connection.sessionEvent(SESSION_ID, 2, "tool/call", {
++        turn: 1,
++        callId: "edit-1",
++        name: "replace",
++        arguments: JSON.stringify({
++          file_path: "sample.txt",
++          old_string: "before\n",
++          new_string: "after\n",
++        }),
++      });
++      await expect(iterator.next()).resolves.toMatchObject({
++        done: false,
++        value: { kind: "event", event: { type: "item.started", item: { type: "fileChange" } } },
++      });
++      connection.mux(
++        SESSION_ID,
++        {
++          type: "approval/requested",
++          sessionId: SESSION_ID,
++          approvalId: "approval-drift" as never,
++          toolName: "replace",
++          callId: "edit-1" as never,
++        },
++        "approval-drift-rpc",
++      );
++      const approval = await iterator.next();
++      if (
++        approval.done ||
++        approval.value.kind !== "interaction" ||
++        approval.value.interaction.type !== "approval"
++      ) {
++        throw new Error("Expected DSH approval");
++      }
++      await writeFile(path.join(cwd, "sample.txt"), "changed elsewhere\n", "utf8");
++      await expect(
++        session.execute({
++          type: "interaction.respond",
++          interactionId: approval.value.interaction.interactionId,
++          response: { type: "approval", actionId: "allow-once" },
++        }),
++      ).resolves.toMatchObject({ ok: false, error: { code: "protocolError" } });
++      expect(connection.calls.respond).toHaveBeenLastCalledWith(
++        expect.objectContaining({
++          result: expect.objectContaining({
++            value: expect.objectContaining({ outcome: "rejected" }),
++          }),
++        }),
++      );
++      await adapter.close();
++    } finally {
++      await rm(cwd, { recursive: true, force: true });
++    }
++  });
++
++  it("fails the DSH Turn when the actual structured Diff mismatches its preview", async () => {
++    const cwd = await mkdtemp(path.join(tmpdir(), "codexhost-dsh-actual-"));
++    try {
++      await writeFile(path.join(cwd, "sample.txt"), "before\n", "utf8");
++      const { adapter, connection } = fixture();
++      const session = await openCreated(adapter, cwd);
++      const iterator = session.outputs[Symbol.asyncIterator]();
++      await session.execute({
++        type: "turn.start",
++        turnId: hostTurnIdSchema.parse("dsh-path-mismatch"),
++        input: [{ type: "text", text: "edit" }],
++      });
++      connection.sessionEvent(SESSION_ID, 1, "turn/start", { turn: 1 });
++      await iterator.next();
++      connection.sessionEvent(SESSION_ID, 2, "tool/call", {
++        turn: 1,
++        callId: "edit-actual",
++        name: "replace",
++        arguments: JSON.stringify({
++          file_path: "sample.txt",
++          old_string: "before\n",
++          new_string: "after\n",
++        }),
++      });
++      await iterator.next();
++      connection.sessionEvent(
++        SESSION_ID,
++        3,
++        "tool/result",
++        {
++          turn: 1,
++          message: {
++            source: { kind: "tool", callId: "edit-actual" },
++            content: [
++              {
++                type: "tool-result",
++                toolCallId: "edit-actual",
++                content: [{ type: "text", text: "done" }],
++                isError: false,
++              },
++            ],
++          },
++        },
++        {
++          for: "result",
++          view: {
++            card: "diff",
++            title: "Edit sample.txt",
++            diffs: [
++              { path: path.join(cwd, "sample.txt"), oldText: "before\n", newText: "wrong\n" },
++            ],
++          },
++        },
++      );
++      await expect(iterator.next()).resolves.toMatchObject({
++        done: false,
++        value: {
++          kind: "event",
++          event: {
++            type: "item.updated",
++            update: { type: "fileChanges.replace" },
++          },
++        },
++      });
++      await expect(iterator.next()).resolves.toMatchObject({
++        done: false,
++        value: {
++          kind: "event",
++          event: {
++            type: "item.completed",
++            snapshot: { outcome: { status: "failed", error: { code: "protocolError" } } },
++          },
++        },
++      });
++      await expect(iterator.next()).resolves.toMatchObject({
++        done: false,
++        value: {
++          kind: "event",
++          event: { type: "turn.completed", outcome: { status: "failed" } },
++        },
++      });
++      await adapter.close();
++    } finally {
++      await rm(cwd, { recursive: true, force: true });
++    }
++  });
++
+   it("inspects the local Host model catalog", async () => {
+     const { adapter, connection } = fixture();
+ 
+@@ -359,6 +531,442 @@ describe("DeepSeekHarnessAdapter local Host", () => {
      expect(connection.closed).toBe(true);
    });
  
@@ -2001,15 +2385,16 @@ index e063c80..3337b53 100644
    }
  }
 diff --git a/packages/adapters/grok/src/grok-adapter.ts b/packages/adapters/grok/src/grok-adapter.ts
-index dcec0f6..ffcdd1c 100644
+index dcec0f6..9bec87a 100644
 --- a/packages/adapters/grok/src/grok-adapter.ts
 +++ b/packages/adapters/grok/src/grok-adapter.ts
-@@ -7,10 +7,12 @@ import type {
+@@ -7,10 +7,13 @@ import type {
    RequestPermissionResponse,
  } from "@agentclientprotocol/sdk";
  import {
 +  ActionPreviewModule,
    HarnessOutputChannel,
++  estimatePathActionPreview,
    registerHarnessSession,
    validateHostApprovalResponse,
    type HarnessAdapter,
@@ -2017,8 +2402,19 @@ index dcec0f6..ffcdd1c 100644
    type HarnessCommandAccepted,
    type HarnessCommandCapability,
    type HarnessCommandInvocation,
-@@ -91,9 +93,12 @@ import {
+@@ -34,6 +37,7 @@ import {
+   type HostReasoningItem,
+   type HostThreadSnapshot,
+   type HostUsage,
++  type PathActionPreviewLease,
+   type InspectHarnessInput,
+   type InteractionRespondAccepted,
+   type InteractionRespondCommand,
+@@ -89,11 +93,15 @@ import {
+ import {
+   applyGrokToolProjection,
    DEFAULT_GROK_TOOL_OUTPUT_LIMIT,
++  grokToolArguments,
    grokToolLabel,
    hasGrokToolProjection,
 +  mergeGrokToolPresentation,
@@ -2030,7 +2426,7 @@ index dcec0f6..ffcdd1c 100644
  } from "./grok-tool-output.js";
  import {
    configuredGrokModelState,
-@@ -153,7 +158,9 @@ export interface GrokAcpTransportLike {
+@@ -153,13 +161,17 @@ export interface GrokAcpTransportLike {
  }
  
  interface ActiveTool {
@@ -2038,10 +2434,26 @@ index dcec0f6..ffcdd1c 100644
 +  item: GrokProjectedToolItem | HostFileChangeItem;
 +  presentation: GrokToolPresentation;
 +  preview: ActionPreviewLease;
++  pathPreview: PathActionPreviewLease | null;
    status?: string;
  }
  
-@@ -267,6 +274,7 @@ class GrokHarnessSession implements HarnessSession {
+ interface ActiveApproval {
+   interaction: HostApprovalInteraction;
+   options: Map<string, PermissionOption>;
++  toolCallId: string;
+   resolve(response: RequestPermissionResponse): void;
+ }
+ 
+@@ -179,6 +191,7 @@ interface ActiveTurn {
+   beforeNativeTurnKeys: Set<string>;
+   completion: Promise<void>;
+   resolveCompletion(): void;
++  projectionQueue: Promise<void>;
+ }
+ 
+ type SessionPhase = "open" | "closing" | "closed" | "faulted";
+@@ -267,6 +280,7 @@ class GrokHarnessSession implements HarnessSession {
    readonly initialUsage: HostUsage | null;
    readonly outputs: AsyncIterable<HarnessOutput>;
    readonly #channel = new HarnessOutputChannel<HarnessOutput>();
@@ -2049,11 +2461,115 @@ index dcec0f6..ffcdd1c 100644
    readonly #closeTimeoutMs: number;
    readonly #cwd: string;
    readonly #modelState: GrokModelState;
-@@ -822,17 +830,20 @@ class GrokHarnessSession implements HarnessSession {
+@@ -453,13 +467,14 @@ class GrokHarnessSession implements HarnessSession {
+       ),
+       completion,
+       resolveCompletion,
++      projectionQueue: Promise.resolve(),
+     };
+     this.#active = active;
+     this.#event({ type: "turn.started", turnId: command.turnId });
+     void this.#transport
+       .runTurn(
+         text,
+-        (event) => this.#handleEvent(active, event),
++        (event) => this.#queueEvent(active, event),
+         (request) => this.#requestPermission(active, request),
+       )
+       .then(
+@@ -544,11 +559,12 @@ class GrokHarnessSession implements HarnessSession {
+       beforeNativeTurnKeys: new Set(),
+       completion,
+       resolveCompletion,
++      projectionQueue: Promise.resolve(),
+     };
+     this.#active = active;
+     this.#event({ type: "turn.started", turnId: command.turnId });
+     void this.#transport
+-      .compact(userContext, (event) => this.#handleEvent(active, event))
++      .compact(userContext, (event) => this.#queueEvent(active, event))
+       .then(
+         (result) => this.#settleManualCompact(active, result),
+         (error) =>
+@@ -797,6 +813,30 @@ class GrokHarnessSession implements HarnessSession {
+           retryable: false,
+         },
+       };
++    if (option.kind === "allow_once" || option.kind === "allow_always") {
++      const pathPreview = active.tools.get(pending.toolCallId)?.pathPreview;
++      const revalidationError = await pathPreview?.revalidate();
++      if (revalidationError) {
++        // 对话框打开后文件仍可能被外部进程修改；真正放行 native permission 前再读一次，
++        // 失败时选择原生拒绝项，绝不把已经过期的 Diff 当作批准依据。
++        const deny = [...pending.options.values()].find(
++          ({ kind }) => kind === "reject_once" || kind === "reject_always",
++        );
++        active.approvals.delete(command.interactionId);
++        pending.resolve(
++          deny
++            ? { outcome: { outcome: "selected", optionId: deny.optionId } }
++            : { outcome: { outcome: "cancelled" } },
++        );
++        this.#event({
++          type: "interaction.closed",
++          interactionId: command.interactionId,
++          turnId: active.command.turnId,
++          reason: "responded",
++        });
++        return { ok: false, error: revalidationError };
++      }
++    }
+     active.approvals.delete(command.interactionId);
+     pending.resolve({ outcome: { outcome: "selected", optionId: option.optionId } });
+     this.#event({
+@@ -808,12 +848,31 @@ class GrokHarnessSession implements HarnessSession {
+     return { ok: true, value: { accepted: true } };
+   }
+ 
+-  #requestPermission(
++  async #requestPermission(
+     active: ActiveTurn,
+     request: GrokPermissionRequest,
+   ): Promise<RequestPermissionResponse> {
+     if (this.#active !== active || active.cancellationRequested) {
+-      return Promise.resolve({ outcome: { outcome: "cancelled" } });
++      return { outcome: { outcome: "cancelled" } };
++    }
++    await active.projectionQueue;
++    if (this.#active !== active || active.cancellationRequested) {
++      return { outcome: { outcome: "cancelled" } };
++    }
++    const callId = request.request.toolCall.toolCallId;
++    if (!active.tools.has(callId)) {
++      const toolCall = request.request.toolCall;
++      await this.#startTool(active, {
++        type: "tool.call",
++        callId,
++        title: toolCall.title ?? "Grok Tool",
++        ...(toolCall.name ? { name: toolCall.name } : {}),
++        ...(toolCall.kind ? { kind: toolCall.kind } : {}),
++        ...(toolCall.status ? { status: toolCall.status } : {}),
++        ...(toolCall.rawInput !== undefined ? { rawInput: toolCall.rawInput } : {}),
++        ...(toolCall.rawOutput !== undefined ? { rawOutput: toolCall.rawOutput } : {}),
++        ...(toolCall.content ? { content: toolCall.content } : {}),
++      });
+     }
+     const interactionId = hostInteractionIdSchema.parse(this.#randomUUID());
+     const options = new Map<string, PermissionOption>();
+@@ -822,21 +881,48 @@ class GrokHarnessSession implements HarnessSession {
        options.set(id, option);
        return { id, label: option.name, effect: effectForOption(option) };
      });
-+    const permissionTool = active.tools.get(request.request.toolCall.toolCallId);
++    const permissionTool = active.tools.get(callId);
++    const previewError = await permissionTool?.pathPreview?.revalidate();
++    if (previewError) {
++      if (permissionTool) {
++        active.tools.delete(callId);
++        permissionTool.preview.complete({ outcome: { status: "failed", error: previewError } });
++      }
++      this.#fault(new GrokTransportError("protocolError", previewError.message));
++      return { outcome: { outcome: "cancelled" } };
++    }
      const interaction: HostApprovalInteraction = {
        type: "approval",
        interactionId,
@@ -2064,17 +2580,52 @@ index dcec0f6..ffcdd1c 100644
        actions,
      };
      return new Promise<RequestPermissionResponse>((resolve) => {
-       active.approvals.set(interactionId, { interaction, options, resolve });
+-      active.approvals.set(interactionId, { interaction, options, resolve });
 -      this.#channel.emit({ kind: "interaction", interaction });
++      active.approvals.set(interactionId, { interaction, options, toolCallId: callId, resolve });
 +      if (permissionTool) permissionTool.preview.linkApproval(interaction);
 +      else this.#channel.emit({ kind: "interaction", interaction });
      });
    }
  
-@@ -965,9 +976,13 @@ class GrokHarnessSession implements HarnessSession {
+-  #handleEvent(active: ActiveTurn, event: GrokTransportEvent): void {
++  #queueEvent(active: ActiveTurn, event: GrokTransportEvent): void {
++    active.projectionQueue = active.projectionQueue
++      .then(() => this.#handleEvent(active, event))
++      .catch((error: unknown) => {
++        this.#fault(
++          error instanceof GrokTransportError
++            ? error
++            : new GrokTransportError(
++                "protocolError",
++                error instanceof Error ? error.message : String(error),
++              ),
++        );
++      });
++  }
++
++  async #handleEvent(active: ActiveTurn, event: GrokTransportEvent): Promise<void> {
+     if (this.#active !== active || this.#phase !== "open") return;
+     const contextUsage = usageFromUpdate(
+       event.type === "usage" ? event.update : undefined,
+@@ -849,7 +935,7 @@ class GrokHarnessSession implements HarnessSession {
+     if (event.type === "agent.text") this.#appendAgent(active, event.text, event.messageId);
+     else if (event.type === "agent.thought")
+       this.#appendReasoning(active, event.text, event.messageId);
+-    else if (event.type === "tool.call") this.#startTool(active, event);
++    else if (event.type === "tool.call") await this.#startTool(active, event);
+     else if (event.type === "tool.update") this.#updateTool(active, event);
+     else if (event.type === "compaction.started") this.#startCompaction(active, event);
+     else if (event.type === "compaction.completed") {
+@@ -964,10 +1050,17 @@ class GrokHarnessSession implements HarnessSession {
+     });
    }
  
-   #startTool(active: ActiveTurn, event: Extract<GrokTransportEvent, { type: "tool.call" }>): void {
+-  #startTool(active: ActiveTurn, event: Extract<GrokTransportEvent, { type: "tool.call" }>): void {
++  async #startTool(
++    active: ActiveTurn,
++    event: Extract<GrokTransportEvent, { type: "tool.call" }>,
++  ): Promise<void> {
 +    if (active.tools.has(event.callId)) {
 +      this.#updateTool(active, { ...event, type: "tool.update" });
 +      return;
@@ -2086,13 +2637,23 @@ index dcec0f6..ffcdd1c 100644
        itemId: hostItemIdSchema.parse(this.#randomUUID()),
        name: event.name,
        title: event.title,
-@@ -975,10 +990,30 @@ class GrokHarnessSession implements HarnessSession {
+@@ -975,10 +1068,41 @@ class GrokHarnessSession implements HarnessSession {
        rawInput: event.rawInput,
        cwd: this.#cwd,
      });
 +    const changes = projectGrokFileChanges(event.content, this.#cwd);
++    const pathPreview = changes
++      ? null
++      : await estimatePathActionPreview({
++          toolName: event.name ?? event.kind ?? event.title,
++          arguments: grokToolArguments(event.rawInput),
++          cwd: this.#cwd,
++          workspaceRoots: [this.#cwd],
++        });
 +    if (changes) {
 +      item = { type: "fileChange", itemId: item.itemId, changes };
++    } else if (pathPreview) {
++      item = { type: "fileChange", itemId: item.itemId, changes: [...pathPreview.changes] };
 +    }
      const projection = projectGrokToolOutput(event.content, event.rawOutput, this.#toolOutputLimit);
 -    if (hasGrokToolProjection(projection)) item = applyGrokToolProjection(item, projection);
@@ -2109,6 +2670,7 @@ index dcec0f6..ffcdd1c 100644
 +    active.tools.set(event.callId, {
 +      item,
 +      preview,
++      pathPreview,
 +      presentation: {
 +        ...(event.name ? { name: event.name } : {}),
 +        ...(event.title ? { title: event.title } : {}),
@@ -2120,7 +2682,7 @@ index dcec0f6..ffcdd1c 100644
      if (event.status === "completed" || event.status === "failed") {
        this.#completeTool(active, event.callId, event.status, event.content, event.rawOutput);
      }
-@@ -990,8 +1025,22 @@ class GrokHarnessSession implements HarnessSession {
+@@ -990,8 +1114,22 @@ class GrokHarnessSession implements HarnessSession {
    ): void {
      const tool = active.tools.get(event.callId);
      if (!tool) return;
@@ -2144,7 +2706,7 @@ index dcec0f6..ffcdd1c 100644
        const previous = tool.item.type === "commandExecution" ? (tool.item.output ?? "") : undefined;
        tool.item = applyGrokToolProjection(tool.item, projection);
        if (tool.item.type === "commandExecution" && projection.output) {
-@@ -999,12 +1048,7 @@ class GrokHarnessSession implements HarnessSession {
+@@ -999,12 +1137,7 @@ class GrokHarnessSession implements HarnessSession {
          if (previous !== undefined && next.startsWith(previous)) {
            const delta = next.slice(previous.length);
            if (delta.length > 0) {
@@ -2158,7 +2720,7 @@ index dcec0f6..ffcdd1c 100644
            }
          }
        } else if (tool.item.type === "toolExecution" && projection.output) {
-@@ -1033,7 +1077,10 @@ class GrokHarnessSession implements HarnessSession {
+@@ -1033,24 +1166,44 @@ class GrokHarnessSession implements HarnessSession {
      if (!tool) return;
      active.tools.delete(callId);
      const projection = projectGrokToolOutput(content, rawOutput, this.#toolOutputLimit);
@@ -2169,8 +2731,10 @@ index dcec0f6..ffcdd1c 100644
 +    } else if (tool.item.type !== "fileChange" && hasGrokToolProjection(projection)) {
        tool.item = applyGrokToolProjection(tool.item, projection);
      }
-     const outcome: HostItemOutcome =
-@@ -1042,15 +1089,14 @@ class GrokHarnessSession implements HarnessSession {
+-    const outcome: HostItemOutcome =
++    let outcome: HostItemOutcome =
+       status === "failed"
+         ? {
              status: "failed",
              error: {
                code: "nativeFailure",
@@ -2184,13 +2748,40 @@ index dcec0f6..ffcdd1c 100644
 -    if (status !== "completed") return;
 -    const changes = projectGrokFileChanges(content, this.#cwd);
 -    if (!changes) return;
++    let previewError: HarnessError | null = null;
++    if (tool.pathPreview && outcome.status === "succeeded") {
++      previewError = changes
++        ? tool.pathPreview.verifyActual(changes)
++        : {
++            code: "protocolError",
++            message: "Grok File Change has no terminal structured Diff",
++            retryable: true,
++          };
++      if (previewError) {
++        if (changes && tool.item.type === "fileChange") tool.item = { ...tool.item, changes };
++        outcome = { status: "failed", error: previewError };
++      }
++    }
 +    active.completedItems.push({ item: tool.item, outcome });
 +    tool.preview.complete({ item: tool.item, outcome });
++    if (previewError) {
++      this.#fault(new GrokTransportError("protocolError", previewError.message));
++      return;
++    }
 +    if (status !== "completed" || !changes || tool.item.type === "fileChange") return;
      const fileItem: HostFileChangeItem = {
        type: "fileChange",
        itemId: hostItemIdSchema.parse(this.#randomUUID()),
-@@ -1132,7 +1178,10 @@ class GrokHarnessSession implements HarnessSession {
+@@ -1089,6 +1242,8 @@ class GrokHarnessSession implements HarnessSession {
+     outcome: TurnOutcome,
+     response?: PromptResponse,
+   ): Promise<void> {
++    await active.projectionQueue;
++    if (this.#active !== active) return;
+     let history: GrokTransportEvent[] = [];
+     let nativeTurnRef: NativeTurnRef | undefined;
+     let checkpoint: NativeCheckpointRef | undefined;
+@@ -1132,7 +1287,10 @@ class GrokHarnessSession implements HarnessSession {
        this.#completeItem(active, active.compactionItem, itemOutcome);
        active.compactionItem = null;
      }
@@ -2404,10 +2995,192 @@ index a65e91e..33b941a 100644
    if (!Array.isArray(content)) return "";
    return content
 diff --git a/packages/adapters/grok/test/grok-adapter.test.ts b/packages/adapters/grok/test/grok-adapter.test.ts
-index 187fc39..d5743fd 100644
+index 187fc39..5e4f210 100644
 --- a/packages/adapters/grok/test/grok-adapter.test.ts
 +++ b/packages/adapters/grok/test/grok-adapter.test.ts
-@@ -530,16 +530,27 @@ describe("Grok Adapter ACP projection", () => {
+@@ -4,6 +4,9 @@ import type {
+   RequestPermissionResponse,
+ } from "@agentclientprotocol/sdk";
+ import type { HarnessOutput } from "@codexhost/harness-adapter";
++import { mkdtemp, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
+ import { resolve } from "node:path";
+ import {
+   harnessModelRefSchema,
+@@ -193,12 +196,17 @@ class FakeGrokTransport implements GrokAcpTransportLike {
+     });
+   }
+ 
+-  permission(): Promise<RequestPermissionResponse> {
++  permission(
++    toolCall: GrokPermissionRequest["request"]["toolCall"] = {
++      toolCallId: "tool-1",
++      title: "Run tests",
++    },
++  ): Promise<RequestPermissionResponse> {
+     if (!this.#onPermission) throw new Error("No active Grok Prompt");
+     return this.#onPermission({
+       request: {
+         sessionId: this.sessionId,
+-        toolCall: { toolCallId: "tool-1", title: "Run tests" },
++        toolCall,
+         options: [
+           { optionId: "native-allow", name: "Allow once", kind: "allow_once" },
+           { optionId: "native-deny", name: "Reject", kind: "reject_once" },
+@@ -240,6 +248,7 @@ async function openedSession(
+   transport: FakeGrokTransport,
+   kind: "create" | "resume" = "create",
+   knownTurnRefs?: NativeTurnRef[],
++  cwd = "/synthetic",
+ ) {
+   let uuid = 0;
+   const adapter = new GrokAdapter(
+@@ -252,10 +261,10 @@ async function openedSession(
+   );
+   const opened = await adapter.open(
+     kind === "create"
+-      ? { kind: "create", cwd: "/synthetic" }
++      ? { kind: "create", cwd }
+       : {
+           kind: "resume",
+-          cwd: "/synthetic",
++          cwd,
+           nativeRef: {
+             harnessId: adapter.harnessId,
+             nativeSessionId: transport.sessionId,
+@@ -283,6 +292,130 @@ async function nextEvent(
+ }
+ 
+ describe("Grok Adapter ACP projection", () => {
++  it("revalidates an estimated path preview before ACP permission and rejects drift", async () => {
++    const cwd = await mkdtemp(join(tmpdir(), "codexhost-grok-preview-"));
++    try {
++      await writeFile(join(cwd, "sample.txt"), "before\n", "utf8");
++      const transport = new FakeGrokTransport();
++      const { adapter, session } = await openedSession(transport, "create", undefined, cwd);
++      const iterator = session.outputs[Symbol.asyncIterator]();
++      const turnId = hostTurnIdSchema.parse("turn-path-approval-drift");
++
++      await session.execute({
++        type: "turn.start",
++        turnId,
++        input: [{ type: "text", text: "edit" }],
++      });
++      expect((await nextEvent(iterator)).type).toBe("turn.started");
++      transport.event({
++        type: "tool.call",
++        callId: "edit-1",
++        title: "Edit sample.txt",
++        name: "search_replace",
++        rawInput: {
++          file_path: "sample.txt",
++          old_string: "before\n",
++          new_string: "after\n",
++        },
++        status: "pending",
++      });
++      expect(await nextEvent(iterator)).toMatchObject({
++        type: "item.started",
++        item: { type: "fileChange", changes: [{ path: join(cwd, "sample.txt") }] },
++      });
++
++      const permission = transport.permission({
++        toolCallId: "edit-1",
++        title: "Edit sample.txt",
++        name: "search_replace",
++        rawInput: {
++          file_path: "sample.txt",
++          old_string: "before\n",
++          new_string: "after\n",
++        },
++      });
++      const approvalOutput = await nextOutput(iterator);
++      if (approvalOutput.kind !== "interaction" || approvalOutput.interaction.type !== "approval") {
++        throw new Error("Expected Grok approval");
++      }
++      await writeFile(join(cwd, "sample.txt"), "changed elsewhere\n", "utf8");
++      await expect(
++        session.execute({
++          type: "interaction.respond",
++          interactionId: approvalOutput.interaction.interactionId,
++          response: { type: "approval", actionId: "native-1" },
++        }),
++      ).resolves.toMatchObject({ ok: false, error: { code: "protocolError" } });
++      await expect(permission).resolves.toEqual({
++        outcome: { outcome: "selected", optionId: "native-deny" },
++      });
++      await adapter.close();
++    } finally {
++      await rm(cwd, { recursive: true, force: true });
++    }
++  });
++
++  it("fails closed when the actual ACP Diff differs from the approved preview", async () => {
++    const cwd = await mkdtemp(join(tmpdir(), "codexhost-grok-actual-"));
++    try {
++      await writeFile(join(cwd, "sample.txt"), "before\n", "utf8");
++      const transport = new FakeGrokTransport();
++      const { adapter, session } = await openedSession(transport, "create", undefined, cwd);
++      const iterator = session.outputs[Symbol.asyncIterator]();
++      await session.execute({
++        type: "turn.start",
++        turnId: hostTurnIdSchema.parse("turn-path-actual-mismatch"),
++        input: [{ type: "text", text: "edit" }],
++      });
++      await nextEvent(iterator);
++      transport.event({
++        type: "tool.call",
++        callId: "edit-actual",
++        title: "Edit sample.txt",
++        name: "search_replace",
++        rawInput: {
++          file_path: "sample.txt",
++          old_string: "before\n",
++          new_string: "after\n",
++        },
++        status: "in_progress",
++      });
++      await nextEvent(iterator);
++      transport.event({
++        type: "tool.update",
++        callId: "edit-actual",
++        status: "completed",
++        content: [
++          {
++            type: "diff",
++            path: join(cwd, "sample.txt"),
++            oldText: "before\n",
++            newText: "unexpected\n",
++          },
++        ],
++      });
++      expect(await nextEvent(iterator)).toMatchObject({
++        type: "item.updated",
++        update: { type: "fileChanges.replace" },
++      });
++      expect(await nextEvent(iterator)).toMatchObject({
++        type: "item.completed",
++        snapshot: { outcome: { status: "failed", error: { code: "protocolError" } } },
++      });
++      expect(await nextEvent(iterator)).toMatchObject({
++        type: "turn.completed",
++        outcome: { status: "failed", error: { code: "protocolError" } },
++      });
++      expect(await nextEvent(iterator)).toMatchObject({
++        type: "session.faulted",
++        error: { code: "protocolError" },
++      });
++      await adapter.close();
++    } finally {
++      await rm(cwd, { recursive: true, force: true });
++    }
++  });
++
+   it("reports a single available Grok Model as selectable", async () => {
+     const transport = new FakeGrokTransport();
+     const adapter = new GrokAdapter(
+@@ -530,16 +663,27 @@ describe("Grok Adapter ACP projection", () => {
        status: "in_progress",
      });
      expect((await nextEvent(iterator)).type).toBe("item.completed");
@@ -2436,7 +3209,7 @@ index 187fc39..d5743fd 100644
        title: "Run tests",
        actions: [
          { id: "native-1", effect: "allowOnce" },
-@@ -571,7 +582,12 @@ describe("Grok Adapter ACP projection", () => {
+@@ -571,7 +715,12 @@ describe("Grok Adapter ACP projection", () => {
      expect(await nextEvent(iterator)).toMatchObject({
        type: "item.completed",
        snapshot: {
@@ -2450,7 +3223,7 @@ index 187fc39..d5743fd 100644
          outcome: { status: "succeeded" },
        },
      });
-@@ -638,6 +654,7 @@ describe("Grok Adapter ACP projection", () => {
+@@ -638,6 +787,7 @@ describe("Grok Adapter ACP projection", () => {
        item: {
          type: "toolExecution",
          toolName: "read_file",
@@ -2458,7 +3231,7 @@ index 187fc39..d5743fd 100644
          arguments: { target_file: "/synthetic/a.txt" },
        },
      });
-@@ -710,6 +727,7 @@ describe("Grok Adapter ACP projection", () => {
+@@ -710,6 +860,7 @@ describe("Grok Adapter ACP projection", () => {
                  item: {
                    type: "toolExecution",
                    toolName: "read_file",
@@ -2466,7 +3239,7 @@ index 187fc39..d5743fd 100644
                    output: { content: [{ type: "text", text: "file body" }] },
                  },
                },
-@@ -717,6 +735,7 @@ describe("Grok Adapter ACP projection", () => {
+@@ -717,6 +868,7 @@ describe("Grok Adapter ACP projection", () => {
                  item: {
                    type: "toolExecution",
                    toolName: "list_dir",
@@ -2474,7 +3247,7 @@ index 187fc39..d5743fd 100644
                    output: { content: [{ type: "text", text: "a.ts\nb.ts" }] },
                  },
                },
-@@ -728,6 +747,86 @@ describe("Grok Adapter ACP projection", () => {
+@@ -728,6 +880,86 @@ describe("Grok Adapter ACP projection", () => {
      await adapter.close();
    });
  
@@ -3645,7 +4418,7 @@ index c6e55aa..0bd4343 100644
      await this.#send("set_model", { provider: model.provider, modelId: model.id });
      return this.#refreshState("Model");
 diff --git a/packages/adapters/pi/test/pi-adapter.test.ts b/packages/adapters/pi/test/pi-adapter.test.ts
-index 352e953..821ee2d 100644
+index 352e953..0efdfa5 100644
 --- a/packages/adapters/pi/test/pi-adapter.test.ts
 +++ b/packages/adapters/pi/test/pi-adapter.test.ts
 @@ -1,4 +1,7 @@
@@ -3665,7 +4438,87 @@ index 352e953..821ee2d 100644
    readonly getEntries = vi.fn(async (): Promise<PiSessionHistory> => structuredClone(this.history));
    readonly getSessionUsage = vi.fn(async (): Promise<HostUsage | null> =>
      this.usage === null ? null : structuredClone(this.usage),
-@@ -906,6 +911,58 @@ describe("Pi HarnessAdapter Session", () => {
+@@ -277,8 +282,8 @@ function sourceHistory(turnCount = 2): PiSessionHistory {
+   return { entries, leafId: parentId };
+ }
+ 
+-async function openSession(adapter: PiAdapter): Promise<HarnessSession> {
+-  const result = await adapter.open({ kind: "create", cwd: "/synthetic" });
++async function openSession(adapter: PiAdapter, cwd = "/synthetic"): Promise<HarnessSession> {
++  const result = await adapter.open({ kind: "create", cwd });
+   if (!result.ok) throw new Error(result.error.message);
+   return result.value;
+ }
+@@ -318,6 +323,68 @@ async function nextInteraction(
+ }
+ 
+ describe("Pi HarnessAdapter Session", () => {
++  it("does not fabricate a Tool approval before Pi exposes the path arguments", async () => {
++    const cwd = await mkdtemp(join(tmpdir(), "codexhost-pi-preview-"));
++    try {
++      await writeFile(join(cwd, "sample.txt"), "before\n", "utf8");
++      const { adapter, transports } = fixture();
++      const session = await openSession(adapter, cwd);
++      const iterator = session.outputs[Symbol.asyncIterator]();
++      await session.execute(textTurn("pi-generic-confirm"));
++      expect((await nextEvent(iterator)).type).toBe("session.state.changed");
++      expect((await nextEvent(iterator)).type).toBe("turn.started");
++      expect((await nextEvent(iterator)).type).toBe("item.started");
++      const transport = transports[0];
++      if (!transport) throw new Error("Missing Pi transport");
++
++      // Pi 的 extension_ui_request 没有 callId/tool args；这里必须保持普通问题，
++      // 不能因为文案像授权提示就伪造一个可重验的 Host Approval。
++      transport.event({
++        type: "interaction.requested",
++        request: {
++          requestId: "confirm-1",
++          method: "confirm",
++          title: "Confirm edit",
++          message: "Continue?",
++        },
++      });
++      const question = await nextOutput(iterator);
++      expect(question).toMatchObject({
++        kind: "interaction",
++        interaction: { type: "question", title: "Pi" },
++      });
++      if (question.kind !== "interaction" || question.interaction.type !== "question") {
++        throw new Error("Expected Pi question");
++      }
++      expect(question.interaction.itemId).toBeUndefined();
++      await session.execute({
++        type: "interaction.respond",
++        interactionId: question.interaction.interactionId,
++        response: { type: "question", answers: { answer: ["yes"] } },
++      });
++      expect(await nextEvent(iterator)).toMatchObject({ type: "interaction.closed" });
++
++      transport.event({
++        type: "tool.started",
++        callId: "edit-1",
++        toolName: "replace",
++        arguments: {
++          file_path: "sample.txt",
++          old_string: "before\n",
++          new_string: "after\n",
++        },
++      });
++      expect(await nextEvent(iterator)).toMatchObject({
++        type: "item.started",
++        item: { type: "fileChange", changes: [{ path: join(cwd, "sample.txt") }] },
++      });
++      await session.close();
++      await adapter.close();
++    } finally {
++      await rm(cwd, { recursive: true, force: true });
++    }
++  });
++
+   it("inspects the native catalog through an ephemeral transport and closes it", async () => {
+     const { adapter, dependencies, transports } = fixture();
+ 
+@@ -906,6 +973,58 @@ describe("Pi HarnessAdapter Session", () => {
      await session.close();
    });
  
@@ -3724,7 +4577,7 @@ index 352e953..821ee2d 100644
    it("publishes native context compaction before continuing the Assistant reply", async () => {
      const { adapter, transports } = fixture();
      const session = await openSession(adapter);
-@@ -1755,6 +1812,41 @@ describe("Pi HarnessAdapter Session", () => {
+@@ -1755,6 +1874,41 @@ describe("Pi HarnessAdapter Session", () => {
      await session.close();
    });
  
@@ -4024,10 +4877,10 @@ index b9d1cb6..e26d5fd 100644
    HostEvent,
 diff --git a/packages/harness-adapter/src/path-action-preview.ts b/packages/harness-adapter/src/path-action-preview.ts
 new file mode 100644
-index 0000000..9e858df
+index 0000000..6c32a15
 --- /dev/null
 +++ b/packages/harness-adapter/src/path-action-preview.ts
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,352 @@
 +import { lstat, readFile, realpath } from "node:fs/promises";
 +import { isAbsolute, relative, resolve, sep } from "node:path";
 +
@@ -4151,11 +5004,53 @@ index 0000000..9e858df
 +  return { code: "protocolError", message, retryable: true };
 +}
 +
-+function sameChanges(left: readonly HostFileChange[], right: readonly HostFileChange[]): boolean {
-+  return JSON.stringify(left) === JSON.stringify(right);
++function patchBody(unifiedDiff: string): unknown {
++  try {
++    const parsed = parsePatch(unifiedDiff);
++    if (parsed.length !== 1) return null;
++    // Diff header 的相对/绝对路径只是展示差异；安全边界仍以 estimator 的绝对基线为准。
++    return parsed[0]?.hunks.map(({ oldStart, oldLines, newStart, newLines, lines }) => ({
++      oldStart,
++      oldLines,
++      newStart,
++      newLines,
++      lines,
++    }));
++  } catch {
++    return null;
++  }
 +}
 +
-+function lease(changes: HostFileChange[], baselines: Baseline[]): PathActionPreviewLease {
++function sameChanges(
++  left: readonly HostFileChange[],
++  right: readonly HostFileChange[],
++  cwd: string,
++): boolean {
++  if (left.length !== right.length) return false;
++  return left.every((expected, index) => {
++    const actual = right[index];
++    const expectedBody = patchBody(expected.unifiedDiff);
++    const actualBody = actual ? patchBody(actual.unifiedDiff) : null;
++    return (
++      actual !== undefined &&
++      expected.kind === actual.kind &&
++      resolve(cwd, expected.path) === resolve(cwd, actual.path) &&
++      (expected.movePath === undefined) === (actual.movePath === undefined) &&
++      (expected.movePath === undefined ||
++        (actual.movePath !== undefined &&
++          resolve(cwd, expected.movePath) === resolve(cwd, actual.movePath))) &&
++      expectedBody !== null &&
++      actualBody !== null &&
++      JSON.stringify(expectedBody) === JSON.stringify(actualBody)
++    );
++  });
++}
++
++function lease(
++  changes: HostFileChange[],
++  baselines: Baseline[],
++  cwd: string,
++): PathActionPreviewLease {
 +  return {
 +    changes,
 +    async revalidate() {
@@ -4171,7 +5066,7 @@ index 0000000..9e858df
 +      return null;
 +    },
 +    verifyActual(actual) {
-+      return sameChanges(changes, actual)
++      return sameChanges(changes, actual, cwd)
 +        ? null
 +        : protocolError("Actual File Change differs from the approved preview");
 +    },
@@ -4251,7 +5146,7 @@ index 0000000..9e858df
 +      unifiedDiff: patch(primaryPath, before, after, kind),
 +    });
 +  }
-+  return lease(changes, baselines);
++  return lease(changes, baselines, input.cwd);
 +}
 +
 +/**
@@ -4292,6 +5187,7 @@ index 0000000..9e858df
 +        { path: source, content: sourceBuffer },
 +        { path: target, content: targetBuffer },
 +      ],
++      input.cwd,
 +    );
 +  }
 +
@@ -4335,7 +5231,7 @@ index 0000000..9e858df
 +  if (!withinTextLimit(before, after)) return null;
 +  const changes = [{ path, kind, unifiedDiff: patch(path, before, after, kind) }];
 +  if (changes.length > MAX_FILES) return null;
-+  return lease(changes, [{ path, content: beforeBuffer }]);
++  return lease(changes, [{ path, content: beforeBuffer }], input.cwd);
 +}
 diff --git a/packages/harness-adapter/src/text-session.ts b/packages/harness-adapter/src/text-session.ts
 index 347cbbb..3894b30 100644
@@ -6564,7 +7460,7 @@ index f28e1f1..baccadb 100644
      setExecuting(commandId) {
        executingCommandId = commandId;
 diff --git a/packages/renderer-extension/src/renderer-model-client.ts b/packages/renderer-extension/src/renderer-model-client.ts
-index b78b3f7..9055865 100644
+index b78b3f7..cbceb83 100644
 --- a/packages/renderer-extension/src/renderer-model-client.ts
 +++ b/packages/renderer-extension/src/renderer-model-client.ts
 @@ -1,4 +1,15 @@
@@ -6656,7 +7552,7 @@ index b78b3f7..9055865 100644
    const managers = candidates.filter(
      (
        candidate,
-@@ -213,8 +265,78 @@ export function createRendererModelClient(
+@@ -213,8 +265,84 @@ export function createRendererModelClient(
      const result = await manager.sendRequest(THREAD_PERMISSION_MODE_SELECT_METHOD, params);
      return harnessConfigurationStateSchema.parse(result);
    };
@@ -6683,35 +7579,41 @@ index b78b3f7..9055865 100644
 +    ): Promise<ConnectionReceipt> {
 +      const parsedDraft = customConnectionDraftSchema.parse(draft);
 +      if (parsedDraft.keyless) throw new Error("A keyless Connection cannot accept an API Key");
-+      if (apiKey.trim().length === 0 || apiKey.length > 16_384) {
-+        throw new Error("API Key must contain between 1 and 16384 characters");
++      const encodedKey = new TextEncoder().encode(apiKey);
++      if (apiKey.trim().length === 0 || encodedKey.byteLength > 190) {
++        encodedKey.fill(0);
++        throw new Error("API Key must contain between 1 and 190 UTF-8 bytes");
 +      }
-+      const keySession = connectionKeySessionResultSchema.parse(
-+        await manager.sendRequest(CONNECTIONS_KEY_SESSION_METHOD, {}),
-+      );
-+      if (keySession.expiresAtMs <= Date.now()) throw new Error("Connection key session expired");
-+      if (!globalThis.crypto?.subtle) throw new Error("Web Crypto is unavailable");
-+      const publicKey = await globalThis.crypto.subtle.importKey(
-+        "spki",
-+        bytesFromBase64(keySession.publicKeySpkiBase64),
-+        { name: "RSA-OAEP", hash: "SHA-256" },
-+        false,
-+        ["encrypt"],
-+      );
-+      const ciphertext = await globalThis.crypto.subtle.encrypt(
-+        { name: "RSA-OAEP" },
-+        publicKey,
-+        new TextEncoder().encode(apiKey),
-+      );
-+      return createCustomConnection({
-+        draft: parsedDraft,
-+        secret: {
-+          mode: "encrypted",
-+          keySessionId: keySession.id,
-+          algorithm: "RSA-OAEP-256",
-+          ciphertextBase64: base64FromBytes(ciphertext),
-+        },
-+      });
++      try {
++        const keySession = connectionKeySessionResultSchema.parse(
++          await manager.sendRequest(CONNECTIONS_KEY_SESSION_METHOD, {}),
++        );
++        if (keySession.expiresAtMs <= Date.now()) throw new Error("Connection key session expired");
++        if (!globalThis.crypto?.subtle) throw new Error("Web Crypto is unavailable");
++        const publicKey = await globalThis.crypto.subtle.importKey(
++          "spki",
++          bytesFromBase64(keySession.publicKeySpkiBase64),
++          { name: "RSA-OAEP", hash: "SHA-256" },
++          false,
++          ["encrypt"],
++        );
++        const ciphertext = await globalThis.crypto.subtle.encrypt(
++          { name: "RSA-OAEP" },
++          publicKey,
++          encodedKey,
++        );
++        return createCustomConnection({
++          draft: parsedDraft,
++          secret: {
++            mode: "encrypted",
++            keySessionId: keySession.id,
++            algorithm: "RSA-OAEP-256",
++            ciphertextBase64: base64FromBytes(ciphertext),
++          },
++        });
++      } finally {
++        encodedKey.fill(0);
++      }
 +    },
 +    async startConnectionLogin(
 +      input: ConnectionLoginStartParams,
@@ -7698,7 +8600,7 @@ index c457ae2..0eb8c7e 100644
      grid-column: 1 / -1;
    }
 diff --git a/packages/renderer-extension/test/renderer-model-client.test.ts b/packages/renderer-extension/test/renderer-model-client.test.ts
-index 2b6299d..ccc8398 100644
+index 2b6299d..5db5785 100644
 --- a/packages/renderer-extension/test/renderer-model-client.test.ts
 +++ b/packages/renderer-extension/test/renderer-model-client.test.ts
 @@ -1,4 +1,5 @@
@@ -7745,7 +8647,7 @@ index 2b6299d..ccc8398 100644
        "startUpdate",
        "subscribeThreadUsage",
      ]);
-@@ -385,3 +398,110 @@ describe("Renderer fixed Model request client", () => {
+@@ -385,3 +398,111 @@ describe("Renderer fixed Model request client", () => {
      await expect(client.inspectHarness({ harnessId: piHarnessId })).rejects.toThrow();
    });
  });
@@ -7824,6 +8726,7 @@ index 2b6299d..ccc8398 100644
 +      client.createCustomConnection({ draft, secret: { mode: "secure-prompt" } }),
 +    ).resolves.toMatchObject({ connection: { id: "custom.private" } });
 +    const createWithMaskedKey = client.createCustomConnectionWithMaskedApiKey;
++    await expect(createWithMaskedKey(draft, "x".repeat(191))).rejects.toThrow("190 UTF-8 bytes");
 +    await expect(createWithMaskedKey(draft, "top-secret-key")).resolves.toMatchObject({
 +      applyRequired: true,
 +    });

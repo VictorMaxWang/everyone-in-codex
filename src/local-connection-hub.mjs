@@ -36,6 +36,7 @@ export function createLocalConnectionHub({
   profiles,
   runtime,
   secrets = null,
+  publication = null,
   open = null,
 } = {}) {
   const getActive = requireMethod(profiles, "getActive", "profiles");
@@ -49,6 +50,7 @@ export function createLocalConnectionHub({
     sources,
     activity,
     secrets,
+    publication,
     applyBoundary: async ({ restartRequired }) => {
       const profile = await getActive();
       if (!profile) throw new Error("connection_active_profile_missing");

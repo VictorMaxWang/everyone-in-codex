@@ -11,6 +11,7 @@ import { createConfiguredConnectionHub } from "./configured-connection-hub.mjs";
 import { createConnectionSources } from "./connection-sources.mjs";
 import { verifyCodexAppServerSchema } from "./codex-schema-contract.mjs";
 import { HarnessRegistry } from "./harness-registry.mjs";
+import { createInteractiveLoginAction } from "./local-connection-actions.mjs";
 import { LocalFusionRuntime, createLocalFusionRuntime } from "./local-runtime.mjs";
 
 /** 返回当前用户 LOCALAPPDATA 下由融合层拥有的全部状态路径。 */
@@ -196,10 +197,14 @@ export class FusionController {
     catalogBridge = null,
     launcher = null,
     connections = null,
+    connectionLoginAction = null,
     validationPolicy = createLocalValidationPolicy(),
   } = {}) {
     if (!profiles || !harnesses) {
       throw new Error("FusionController 需要 profiles 与 harnesses 依赖");
+    }
+    if (connectionLoginAction !== null && typeof connectionLoginAction !== "function") {
+      throw new Error("FusionController connectionLoginAction 无效");
     }
     this.profiles = profiles;
     this.harnesses = harnesses;
@@ -207,6 +212,7 @@ export class FusionController {
     this.catalogBridge = catalogBridge;
     this.launcher = launcher;
     this.connections = connections;
+    this.connectionLoginAction = connectionLoginAction;
     this.validationPolicy = validationPolicy;
   }
 
@@ -306,6 +312,11 @@ export class FusionController {
     return requireBoundary(this.connections, "startLogin", "ConnectionHub")(target);
   }
 
+  async executeConnectionLogin(target) {
+    const plan = await this.loginConnection(target);
+    return this.connectionLoginAction ? this.connectionLoginAction(plan) : plan;
+  }
+
   async removeConnection(id) {
     return requireBoundary(this.connections, "remove", "ConnectionHub")(id);
   }
@@ -337,6 +348,7 @@ export function createLocalFusionController({
   catalogBridge,
   launcher,
   connections,
+  connectionLoginAction,
   validationPolicy,
 } = {}) {
   const stores = createDefaultStores({ localAppData });
@@ -369,6 +381,7 @@ export function createLocalFusionController({
     catalogBridge: catalogBridge ?? localRuntime.catalogBridge,
     launcher: launcher ?? localRuntime.launcher,
     connections: localConnections,
+    connectionLoginAction: connectionLoginAction ?? createInteractiveLoginAction(),
     validationPolicy: validationPolicy ?? localRuntime.validationPolicy,
   });
 }

@@ -8,7 +8,9 @@ import {
 } from "node:crypto";
 
 const OWNER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
-const MAX_SECRET_BYTES = 16 * 1024;
+// RSA-2048 + OAEP/SHA-256 的单块明文上限是 190 bytes；更长输入必须拒绝，
+// 不能依赖 WebCrypto/Node 在深层抛出难以分类的加密错误。
+const MAX_SECRET_BYTES = 190;
 const PENDING_OWNER = "pending-custom-connection";
 
 export function encryptSecretForSession(publicKeyJwk, value) {

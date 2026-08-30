@@ -151,16 +151,21 @@ export function parseCli(argv) {
         "--base-url": "baseUrl",
         "--protocol": "protocol",
         "--models": "models",
+        "--keyless": "keyless",
       });
       requireFields(options, ["label", "baseUrl", "protocol", "models"], "connections add");
       const modelIds = [...new Set(options.models.split(",").map((id) => id.trim()).filter(Boolean))];
       if (modelIds.length === 0) usage("connections add 缺少有效 models");
+      if (options.keyless !== undefined && !new Set(["true", "false"]).has(options.keyless)) {
+        usage("connections add --keyless 只接受 true 或 false");
+      }
       return {
         command: "connections.add",
         draft: {
           label: options.label,
           baseUrl: options.baseUrl,
           protocol: options.protocol,
+          keyless: options.keyless === "true",
           models: modelIds.map((id) => ({ id })),
         },
       };
@@ -198,9 +203,20 @@ async function dispatch(parsed, controller) {
     case "connections.list":
       return controller.listConnections();
     case "connections.add":
-      return controller.createConnection(parsed.draft);
+      {
+        const created = await controller.createConnection(parsed.draft);
+        if (!parsed.draft.keyless) {
+          await controller.startConnectionSecretEntry({
+            ownerId: created.id,
+            mode: "secure-prompt",
+          });
+        }
+        return created;
+      }
     case "connections.login":
-      return controller.loginConnection(parsed.target);
+      return typeof controller.executeConnectionLogin === "function"
+        ? controller.executeConnectionLogin(parsed.target)
+        : controller.loginConnection(parsed.target);
     case "connections.remove":
       return controller.removeConnection(parsed.id);
     case "connections.apply":

@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "upstreamCommit": "9a2ae67663b5a1aed6ed3d53b70b5b5967d9e2a1",
   "baselineTree": "6b5a5d7441f07c7a8d3e65c178c0cf7a9a97d45a",
-  "patchedTree": "1ff140d36408bc6462af6852781d5e420a4af984",
-  "patchSha256": "60b0ff22fc0c502a8995f289c492a0f01777c9c13519c1a703eda9c1aeab2e39",
+  "patchedTree": "69c585a54e48624166657888d2b49abb72f19652",
+  "patchSha256": "cfafad4b3e336474686257eb3352c028eb1f1f8ef0575b491a441426cfbf32ea",
   "patches": [
     "patches/router/0001-custom-connections.patch"
   ],
@@ -18,5 +18,17 @@
     "src/support-bundle.mjs",
     "test/custom-connections-control.test.mjs",
     "test/custom-connections.test.mjs"
-  ]
+  ],
+  "managedFileSha256": {
+    "codex-router.ps1": "c30e537b6e2e88cf46659592d0914bb13cc857dff2558ab9fb6e49a86a4db5fd",
+    "bin/connections": "0f01af6024b48a960a39acc32d96abcea00bee4800d2216e5ddc9fb453465317",
+    "src/api-forwarder.mjs": "638ccbe22ab05d1f422eb18c71773fadac5ec986622f0abbc34f6f3091639bd6",
+    "src/control.mjs": "0c2e903b8b8bd0c44612d1879549399ef5d536e75cf3c9fe8bc66b39f4dbc256",
+    "src/custom-connections.mjs": "29168c3a1608f563fd3b224404e8683481784b8652522b82455dd524bde6f60e",
+    "src/model-registry.mjs": "4251dc1e6f10ad391f6fdf1a7fef5b9ad6bacd591f98f091d2a6b8e58af5bbd6",
+    "src/paths.mjs": "fd9d55dc91c62948a013e48a1dac05b5d4d5134128bb73b8dcc07a4737dfcdd6",
+    "src/support-bundle.mjs": "b4bccfb89ea4ce0595d05459dba2e8ce2ca1419d3c38cc98938d4c8555130296",
+    "test/custom-connections-control.test.mjs": "4b4174f49ce7da7b48a1bb9e776ea7d43dba5140a4b1519270891c250a1ce318",
+    "test/custom-connections.test.mjs": "cbea88f20e8f1ca954af54b1f9d3bcd7cb12503694c5efbb54b74a4dcc4797fb"
+  }
 }

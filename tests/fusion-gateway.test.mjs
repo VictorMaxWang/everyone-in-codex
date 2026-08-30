@@ -200,7 +200,7 @@ test("Gateway Connections 控制面只接受 host capability 并严格路由六�
   const calls = [];
   const connectionControl = Object.fromEntries([
     ["inspect", { connections: [], pendingCount: 0, applyRequired: false, activity: { activeTurnCount: 0 }, operation: null }],
-    ["startKeySession", { id: "key-1", publicKeySpkiBase64: "QUJDRA==", expiresAt: 99 }],
+    ["startKeySession", { id: "key-1", publicKeySpkiBase64: "QUJDRA==", expiresAtMs: 99 }],
     ["createCustom", { connection: { id: "lab" }, applyRequired: true }],
     ["startLogin", { id: "login", kind: "login", state: "waiting-user", message: null }],
     ["remove", { id: "lab", pending: true }],

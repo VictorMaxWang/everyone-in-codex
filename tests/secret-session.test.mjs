@@ -22,6 +22,10 @@ test("遮罩输入只提交一次 RSA-OAEP 密文，明文不进入公开 receip
 
   assert.match(session.publicKeySpkiBase64, /^[A-Za-z0-9+/]+={0,2}$/u);
   assert.equal(ciphertext.includes(plaintext), false);
+  assert.throws(
+    () => encryptSecretForSession(session.publicKeyJwk, "界".repeat(64)),
+    /secret_value_invalid/,
+  );
   assert.equal(JSON.stringify(session).includes(plaintext), false);
   assert.deepEqual(await broker.submit({ operationId: session.operationId, ciphertext }), {
     configured: true,

@@ -69,7 +69,14 @@ function normalizeCustomDraft(input) {
  * 聚合连接状态与应用流程；长期凭据始终由具体 owner 保存，绝不进入本 Interface。
  */
 export class ConnectionHub {
-  constructor({ router, sources = [], activity = null, secrets = null, applyBoundary } = {}) {
+  constructor({
+    router,
+    sources = [],
+    activity = null,
+    secrets = null,
+    publication = null,
+    applyBoundary,
+  } = {}) {
     if (
       !router
       || typeof router.inspect !== "function"
@@ -79,6 +86,11 @@ export class ConnectionHub {
       || (activity !== null && typeof activity?.waitUntilIdle !== "function")
       || (secrets !== null && (
         typeof secrets?.start !== "function" || typeof secrets?.submit !== "function"
+      ))
+      || (publication !== null && (
+        typeof publication?.isPending !== "function"
+        || typeof publication?.markPending !== "function"
+        || typeof publication?.clear !== "function"
       ))
       || typeof applyBoundary !== "function"
     ) {
@@ -93,6 +105,7 @@ export class ConnectionHub {
     );
     this.activity = activity;
     this.secrets = secrets;
+    this.publication = publication;
     this.applyBoundary = applyBoundary;
   }
 
@@ -101,7 +114,21 @@ export class ConnectionHub {
       this.router.inspect(),
       ...this.sources.map((source) => source.inspect()),
     ]);
-    return Object.freeze(groups.flat().map((entry) => Object.freeze({ ...entry })));
+    const publicationPending = this.publication ? await this.publication.isPending() : false;
+    return Object.freeze(groups.flat().map((entry) => {
+      if (!publicationPending || entry.actionIds?.includes("remove") !== true) {
+        return Object.freeze({ ...entry });
+      }
+      return Object.freeze({
+        ...entry,
+        publicationPending: true,
+        catalog: Object.freeze({
+          ...(entry.catalog ?? {}),
+          state: "unpublished",
+          consumers: Object.freeze([]),
+        }),
+      });
+    }));
   }
 
   async createCustom(input) {
@@ -149,6 +176,7 @@ export class ConnectionHub {
       ? await this.activity.waitUntilIdle({ signal, timeoutMs })
       : { idle: true };
     if (!idle?.idle) throw new Error("connection_apply_busy");
+    await this.publication?.markPending();
     const routerReceipt = typeof this.router.apply === "function"
       ? await this.router.apply({ signal })
       : { revision: null, restartRequired: false };
@@ -156,6 +184,7 @@ export class ConnectionHub {
       routerRevision: routerReceipt.revision,
       restartRequired: routerReceipt.restartRequired === true,
     });
+    await this.publication?.clear();
     return Object.freeze({
       applied: true,
       routerRevision: routerReceipt.revision,

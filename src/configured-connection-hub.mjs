@@ -1,8 +1,11 @@
 import path from "node:path";
 
 import { ConnectionActivityProbe } from "./connection-activity.mjs";
+import { ConnectionPublicationState } from "./connection-publication-state.mjs";
 import { createLocalConnectionHub } from "./local-connection-hub.mjs";
+import { createSecurePromptAction } from "./local-connection-actions.mjs";
 import { readFusionConfig } from "./local-runtime.mjs";
+import { verifyRouterOverlay } from "./router-overlay-verifier.mjs";
 import {
   RouterConnectionAdapter,
   createRouterCommandRunner,
@@ -32,6 +35,7 @@ export function createConfiguredConnectionHub({
   readConfig = readFusionConfig,
   commandRunnerFactory = createRouterCommandRunner,
   serviceRestarterFactory = createRouterServiceRestarter,
+  overlayVerifier = verifyRouterOverlay,
   fetchImpl = globalThis.fetch,
   open = async () => Object.freeze({
     opened: true,
@@ -45,16 +49,19 @@ export function createConfiguredConnectionHub({
   if (sourceFactory !== null && typeof sourceFactory !== "function") {
     throw new Error("connection_source_factory_invalid");
   }
+  if (typeof overlayVerifier !== "function") throw new Error("router_overlay_verifier_invalid");
   let hubPromise = null;
   const load = () => {
     hubPromise ??= (async () => {
       const config = await readConfig(configPath);
+      await overlayVerifier({ routerRoot: config.router.sourceRoot });
       const resolvedSources = sourceFactory ? await sourceFactory(config) : sources;
       const routerScript = path.join(config.router.sourceRoot, "codex-router.ps1");
       const run = commandRunnerFactory({ routerScript });
       const router = new RouterConnectionAdapter({
         run,
         restart: serviceRestarterFactory({ routerRoot: config.router.sourceRoot }),
+        secretPrompt: createSecurePromptAction({ routerScript }),
         loginPlan: (id) => {
           const oauth = id.endsWith("-oauth")
             || new Set(["devin-cli", "github-copilot"]).has(id);
@@ -84,6 +91,7 @@ export function createConfiguredConnectionHub({
       const secrets = new SecretSessionBroker({
         submitSecret: (input) => router.submitSecret(input),
       });
+      const publication = new ConnectionPublicationState({ stateRoot: runtime.stateRoot });
       return createLocalConnectionHub({
         router,
         sources: resolvedSources,
@@ -91,6 +99,7 @@ export function createConfiguredConnectionHub({
         profiles,
         runtime,
         secrets,
+        publication,
         open,
       });
     })();

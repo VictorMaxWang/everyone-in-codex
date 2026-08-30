@@ -86,6 +86,7 @@ test("CLI 将受支持命令解析为稳定的 Controller 调用参数", () => {
         label: "Lab API",
         baseUrl: "https://models.example.test/v1",
         protocol: "anthropic-messages",
+        keyless: false,
         models: [{ id: "claude-lab" }, { id: "claude-fast" }],
       },
     },
@@ -127,6 +128,14 @@ test("executeCli 只委托 Controller；login 返回计划而不启动进程", a
       calls.push(["applyConnections"]);
       return { applied: true };
     },
+    createConnection: async (draft) => {
+      calls.push(["createConnection", draft]);
+      return { id: "custom-lab" };
+    },
+    startConnectionSecretEntry: async (input) => {
+      calls.push(["startConnectionSecretEntry", input]);
+      return { configured: true };
+    },
   };
   const output = [];
   const stdout = { write: (value) => output.push(value) };
@@ -152,6 +161,16 @@ test("executeCli 只委托 Controller；login 返回计划而不启动进程", a
     [{ id: "codex2", state: "connected" }],
   );
   assert.deepEqual(
+    await executeCli([
+      "connections", "add",
+      "--label", "Lab",
+      "--base-url", "https://lab.example/v1",
+      "--protocol", "openai-responses",
+      "--models", "lab-model",
+    ], { controller, stdout }),
+    { id: "custom-lab" },
+  );
+  assert.deepEqual(
     await executeCli(["connections", "apply"], { controller, stdout }),
     { applied: true },
   );
@@ -159,8 +178,16 @@ test("executeCli 只委托 Controller；login 返回计划而不启动进程", a
     ["loginHarness", "grok"],
     ["syncModels", { target: "external" }],
     ["listConnections"],
+    ["createConnection", {
+      label: "Lab",
+      baseUrl: "https://lab.example/v1",
+      protocol: "openai-responses",
+      keyless: false,
+      models: [{ id: "lab-model" }],
+    }],
+    ["startConnectionSecretEntry", { ownerId: "custom-lab", mode: "secure-prompt" }],
     ["applyConnections"],
   ]);
-  assert.equal(output.length, 4);
+  assert.equal(output.length, 5);
   assert.equal(JSON.parse(output[0]).interactive, true);
 });

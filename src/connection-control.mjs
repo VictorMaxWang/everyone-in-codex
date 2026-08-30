@@ -114,7 +114,7 @@ export class ConnectionControl {
     return Object.freeze({
       id: receipt.operationId,
       publicKeySpkiBase64: receipt.publicKeySpkiBase64,
-      expiresAt: receipt.expiresAt,
+      expiresAtMs: receipt.expiresAt,
     });
   }
 

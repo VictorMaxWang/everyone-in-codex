@@ -74,7 +74,7 @@ test("ConnectionControl 投影统一 wire、完成加密创建并仅异步触发
   });
   assert.deepEqual(await control.startKeySession(), {
     id: "key-1",
-    expiresAt: 99_000,
+    expiresAtMs: 99_000,
     publicKeySpkiBase64: "QUJDRA==",
   });
   const created = await control.createCustom({
