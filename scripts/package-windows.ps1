@@ -5,7 +5,8 @@ param(
     [string]$NodeRoot,
     [string]$CodexHostPayload,
     [switch]$KeepStaging,
-    [switch]$SkipMaterializedSource
+    [switch]$SkipMaterializedSource,
+    [switch]$AllowMissingCodexHostPayload
 )
 
 Set-StrictMode -Version Latest
@@ -170,6 +171,9 @@ try {
             -Source $resolvedCodexHostPayload `
             -Destination (Join-Path $stagingRoot 'runtime\codexhost')
         $hasCodexHostPayload = $true
+    }
+    if (-not $hasCodexHostPayload -and -not $AllowMissingCodexHostPayload) {
+        throw 'CodexHost payload is required for a production Windows release'
     }
 
     $binRoot = Join-Path $stagingRoot 'bin'

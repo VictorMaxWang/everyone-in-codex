@@ -283,22 +283,30 @@ test(
         { windowsHide: true },
       );
 
+      const packageArguments = [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        packageScript,
+        "-RepoRoot",
+        fixtureRoot,
+        "-OutputDirectory",
+        outputRoot,
+        "-NodeRoot",
+        nodeRoot,
+        "-SkipMaterializedSource",
+      ];
+      const missingPayload = spawnSync("pwsh.exe", packageArguments, {
+        encoding: "utf8",
+        windowsHide: true,
+      });
+      assert.notEqual(missingPayload.status, 0);
+      assert.match(`${missingPayload.stdout}\n${missingPayload.stderr}`, /CodexHost payload is required/u);
+
       const result = spawnSync(
         "pwsh.exe",
-        [
-          "-NoLogo",
-          "-NoProfile",
-          "-NonInteractive",
-          "-File",
-          packageScript,
-          "-RepoRoot",
-          fixtureRoot,
-          "-OutputDirectory",
-          outputRoot,
-          "-NodeRoot",
-          nodeRoot,
-          "-SkipMaterializedSource",
-        ],
+        [...packageArguments, "-AllowMissingCodexHostPayload"],
         { encoding: "utf8", windowsHide: true },
       );
 

@@ -45,14 +45,17 @@ jobs:
       - name: Install repo-local toolchains
         shell: pwsh
         run: |
-          $nodeRoot = Split-Path -Parent (Get-Command node.exe -ErrorAction Stop).Source
-          ./scripts/bootstrap.ps1 -RepoRoot $PWD -NodeRoot $nodeRoot
+          $ErrorActionPreference = 'Stop'
           ./scripts/setup-local-toolchains.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Toolchain setup failed: $LASTEXITCODE" }
 
       - name: Build patched Host and all release assets
+        shell: pwsh
         run: |
           npm run build:codexhost
+          if ($LASTEXITCODE -ne 0) { throw "CodexHost build failed: $LASTEXITCODE" }
           npm run package:win
+          if ($LASTEXITCODE -ne 0) { throw "Release packaging failed: $LASTEXITCODE" }
 
       - name: Publish stable GitHub Release
         shell: pwsh

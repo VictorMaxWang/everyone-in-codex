@@ -37,20 +37,12 @@ jobs:
           & ./scripts/materialize-upstreams.ps1 -Component all
           if (-not $?) { throw 'Locked upstream materialization failed.' }
 
-      - name: Adopt setup-node into repo-local runtime
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $nodeRoot = Split-Path -Parent (Get-Command node.exe -ErrorAction Stop).Source
-          & ./scripts/bootstrap.ps1 -RepoRoot $PWD -NodeRoot $nodeRoot
-          if (-not $?) { throw 'Repo-local toolchain bootstrap failed.' }
-
-      - name: Install locked repo-local Rust toolchain
+      - name: Install locked repo-local Node and Rust toolchains
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           & ./scripts/setup-local-toolchains.ps1
-          if (-not $?) { throw 'Repo-local Rust bootstrap failed.' }
+          if (-not $?) { throw 'Repo-local toolchain bootstrap failed.' }
 
       - name: Build patched CodexHost payload
         run: npm run build:codexhost
