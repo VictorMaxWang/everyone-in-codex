@@ -6,6 +6,7 @@ artifacts/
 coverage/
 logs/
 node_modules/
+AGENTS.md
 validation-policy.local.json
 fusion.local.json
 *.secret
