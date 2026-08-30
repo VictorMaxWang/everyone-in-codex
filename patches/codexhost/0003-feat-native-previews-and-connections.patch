@@ -148,23 +148,24 @@ index 61e75d3..9ec7ba6 100644
    }
  }
 diff --git a/packages/adapters/claude-code/src/claude-code-adapter.ts b/packages/adapters/claude-code/src/claude-code-adapter.ts
-index 6602113..23b6e67 100644
+index 6602113..5c1f966 100644
 --- a/packages/adapters/claude-code/src/claude-code-adapter.ts
 +++ b/packages/adapters/claude-code/src/claude-code-adapter.ts
-@@ -8,10 +8,12 @@ import {
+@@ -8,10 +8,13 @@ import {
    getSubagentMessages,
  } from "@anthropic-ai/claude-agent-sdk";
  import {
 +  ActionPreviewModule,
    HarnessOutputChannel,
    parseHostUsage,
++  sanitizeDiagnosticTail,
    validateHostApprovalResponse,
    validateHostQuestionResponse,
 +  type ActionPreviewLease,
    type HarnessAdapter,
    type HarnessCommandAccepted,
    type HarnessCommandCapability,
-@@ -61,6 +63,7 @@ import {
+@@ -61,6 +64,7 @@ import {
    nativeSessionRefSchema,
    nativeTurnRefSchema,
    type AccountCreditsSnapshot,
@@ -172,7 +173,7 @@ index 6602113..23b6e67 100644
    type HarnessId,
    type HarnessThinkingOptionId,
    type HostInteractionId,
-@@ -107,6 +110,7 @@ import type {
+@@ -107,6 +111,7 @@ import type {
    ClaudeModelInspector,
    ClaudePlanLimitEvent,
    ClaudeQuestionRequest,
@@ -180,7 +181,7 @@ index 6602113..23b6e67 100644
    ClaudeTransportFailureKind,
    ClaudeTransportTurnResult,
    ClaudeTurnEvent,
-@@ -192,6 +196,7 @@ const claudeCommandCatalog = harnessCommandCatalogSchema.parse({
+@@ -192,6 +197,7 @@ const claudeCommandCatalog = harnessCommandCatalogSchema.parse({
        label: "Compact context",
        description: "Compact the current conversation context",
        argumentMode: "text",
@@ -188,7 +189,7 @@ index 6602113..23b6e67 100644
      },
      {
        id: "claude.init",
-@@ -209,11 +214,28 @@ const claudeCommandCatalog = harnessCommandCatalogSchema.parse({
+@@ -209,11 +215,28 @@ const claudeCommandCatalog = harnessCommandCatalogSchema.parse({
      },
    ],
  });
@@ -218,7 +219,50 @@ index 6602113..23b6e67 100644
  
  function parseClaudeHarnessCommand(
    command: HarnessCommandInvocation,
-@@ -475,6 +497,7 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -388,11 +411,41 @@ function startupFailure(error: unknown): HarnessError {
+   };
+ }
+ 
+-function faultError(): HarnessError {
++function safeFaultName(value: unknown): string {
++  return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(value)
++    ? value
++    : "Error";
++}
++
++function faultError(error: unknown): HarnessError {
++  const cause =
++    error instanceof Error && error.name === "ClaudeSdkQueryFault" && isRecord(error.cause)
++      ? error.cause
++      : null;
++  const name = safeFaultName(cause?.name ?? (error instanceof Error ? error.name : undefined));
++  const category =
++    cause?.category === "queryEnded" || cause?.category === "queryFailed"
++      ? cause.category
++      : "queryFailed";
++  const exitCode =
++    typeof cause?.exitCode === "number" && Number.isSafeInteger(cause.exitCode)
++      ? cause.exitCode
++      : undefined;
++  const stderrTail =
++    typeof cause?.stderrTail === "string" && cause.stderrTail.length > 0
++      ? sanitizeDiagnosticTail(cause.stderrTail)
++      : undefined;
+   return {
+     code: "processExited",
+     message: "Claude Code Session became unavailable",
+     retryable: true,
++    diagnostic: JSON.stringify({
++      name,
++      category,
++      ...(exitCode !== undefined ? { exitCode } : {}),
++    }),
++    stage: cause?.stage === "query.consume" ? "query.consume" : "query",
++    ...(stderrTail ? { stderrTail } : {}),
+   };
+ }
+ 
+@@ -475,6 +528,7 @@ class ClaudeHarnessSession implements HarnessSession {
    readonly initialUsage = null;
    readonly outputs: AsyncIterable<HarnessOutput>;
    readonly #channel = new HarnessOutputChannel<HarnessOutput>();
@@ -226,7 +270,7 @@ index 6602113..23b6e67 100644
    readonly #closeTimeoutMs: number;
    readonly #createTransport: ClaudeAdapterDependencies["createTransport"];
    readonly #cwd: string;
-@@ -554,7 +577,7 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -554,7 +608,7 @@ class ClaudeHarnessSession implements HarnessSession {
        formatVersion: 1,
      });
      this.commands = {
@@ -235,7 +279,7 @@ index 6602113..23b6e67 100644
        execute: (command) => this.#executeHarnessCommand(command),
      };
      this.initialState = this.#openMode === "resume" ? { nativeRef: this.#nativeRef } : {};
-@@ -719,6 +742,7 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -719,6 +773,7 @@ class ClaudeHarnessSession implements HarnessSession {
          outputLimit: this.#toolOutputLimit,
          newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
          emit: (event) => this.#event(event),
@@ -243,7 +287,21 @@ index 6602113..23b6e67 100644
        }),
        interactions: new Map(),
        interactionByRequestId: new Map(),
-@@ -768,7 +792,38 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -754,10 +809,10 @@ class ClaudeHarnessSession implements HarnessSession {
+       active.nativeTurnRef = nativeTurnRef;
+       void running.then(
+         (result) => this.#finishResult(active, result),
+-        () => this.#fault(faultError()),
++        (error) => this.#fault(faultError(error)),
+       );
+-    } catch {
+-      this.#finishFailed(active, faultError());
++    } catch (error) {
++      this.#finishFailed(active, faultError(error));
+     }
+     return { ok: true, value: { turnId: command.turnId } };
+   }
+@@ -768,7 +823,38 @@ class ClaudeHarnessSession implements HarnessSession {
      if (this.#phase !== "open") {
        return { ok: false, error: invalidState("Claude Code Session is not open") };
      }
@@ -283,7 +341,7 @@ index 6602113..23b6e67 100644
      if (!parsed.ok) return parsed;
      if (this.#acceptingTurn || this.#active || this.#configurationTask || this.#readingHistory) {
        return {
-@@ -829,6 +884,7 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -829,6 +915,7 @@ class ClaudeHarnessSession implements HarnessSession {
          outputLimit: this.#toolOutputLimit,
          newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
          emit: (event) => this.#event(event),
@@ -291,7 +349,7 @@ index 6602113..23b6e67 100644
        }),
        interactions: new Map(),
        interactionByRequestId: new Map(),
-@@ -857,7 +913,11 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -857,18 +944,50 @@ class ClaudeHarnessSession implements HarnessSession {
            )
          : parsed.value.id === "claude.init"
            ? transport.init(nativeTurnKey, (event) => this.#handleTurnEvent(active, event))
@@ -304,7 +362,14 @@ index 6602113..23b6e67 100644
      try {
        void running.then(
          (result) => this.#finishResult(active, result),
-@@ -869,6 +929,34 @@ class ClaudeHarnessSession implements HarnessSession {
+-        () => this.#fault(faultError()),
++        (error) => this.#fault(faultError(error)),
+       );
+-    } catch {
+-      this.#finishFailed(active, faultError());
++    } catch (error) {
++      this.#finishFailed(active, faultError(error));
+     }
      return { ok: true, value: { turnId: command.turnId } };
    }
  
@@ -339,7 +404,7 @@ index 6602113..23b6e67 100644
    refreshUsage(): Promise<void> {
      if (this.#phase !== "open" || !this.#transport) return Promise.resolve();
      const now = Date.now();
-@@ -1126,6 +1214,24 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -1126,6 +1245,24 @@ class ClaudeHarnessSession implements HarnessSession {
            },
          };
        }
@@ -364,7 +429,7 @@ index 6602113..23b6e67 100644
        response = {
          type: "approval",
          requestId: pending.request.requestId,
-@@ -1165,6 +1271,17 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -1165,6 +1302,17 @@ class ClaudeHarnessSession implements HarnessSession {
      }
      try {
        await transport.respondToInteraction(response);
@@ -382,7 +447,16 @@ index 6602113..23b6e67 100644
        return { ok: true, value: { accepted: true } };
      } catch {
        return {
-@@ -1375,7 +1492,14 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -1261,7 +1409,7 @@ class ClaudeHarnessSession implements HarnessSession {
+       thinkingOptionId: this.#requestedThinkingOptionId,
+       permissionMode,
+       onPermissionModeChanged: (mode) => this.#handlePermissionModeChanged(mode),
+-      onFault: () => this.#fault(faultError()),
++      onFault: (error) => this.#fault(faultError(error)),
+       onPlanLimit: (planLimit) => this.#handlePlanLimit(planLimit),
+     });
+     transport.setAutonomousTurnHandler((turn) => this.#handleAutonomousTurn(turn));
+@@ -1375,7 +1523,14 @@ class ClaudeHarnessSession implements HarnessSession {
          active.tools.progress(event);
          return;
        case "tool.completed":
@@ -398,7 +472,7 @@ index 6602113..23b6e67 100644
          return;
        case "subagent.started":
          this.#observeRootOutput();
-@@ -1445,7 +1569,9 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -1445,7 +1600,9 @@ class ClaudeHarnessSession implements HarnessSession {
          return;
        }
        case "interaction.requested":
@@ -409,7 +483,7 @@ index 6602113..23b6e67 100644
          return;
        case "interaction.closed":
          this.#closeInteraction(active, event.requestId, event.reason);
-@@ -1493,17 +1619,29 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -1493,17 +1650,29 @@ class ClaudeHarnessSession implements HarnessSession {
      });
    }
  
@@ -440,7 +514,7 @@ index 6602113..23b6e67 100644
          title: request.title,
          ...(request.description ? { description: request.description } : {}),
          subject: { type: "nativeAction" },
-@@ -1556,7 +1694,11 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -1556,7 +1725,11 @@ class ClaudeHarnessSession implements HarnessSession {
      }
      active.interactions.set(interactionId, pending);
      active.interactionByRequestId.set(request.requestId, interactionId);
@@ -453,7 +527,7 @@ index 6602113..23b6e67 100644
    }
  
    #closeInteraction(
-@@ -1567,8 +1709,15 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -1567,8 +1740,15 @@ class ClaudeHarnessSession implements HarnessSession {
      const interactionId = active.interactionByRequestId.get(requestId);
      if (!interactionId)
        throw new Error("Claude Code Interaction close references an unknown request");
@@ -469,7 +543,7 @@ index 6602113..23b6e67 100644
      this.#event({
        type: "interaction.closed",
        interactionId,
-@@ -1581,6 +1730,12 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -1581,6 +1761,12 @@ class ClaudeHarnessSession implements HarnessSession {
      for (const [interactionId, pending] of active.interactions) {
        active.interactions.delete(interactionId);
        active.interactionByRequestId.delete(pending.request.requestId);
@@ -482,7 +556,7 @@ index 6602113..23b6e67 100644
        this.#event({
          type: "interaction.closed",
          interactionId,
-@@ -1709,6 +1864,7 @@ class ClaudeHarnessSession implements HarnessSession {
+@@ -1709,6 +1895,7 @@ class ClaudeHarnessSession implements HarnessSession {
          outputLimit: this.#toolOutputLimit,
          newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
          emit: (event) => this.#event(event),
@@ -491,7 +565,7 @@ index 6602113..23b6e67 100644
        interactions: new Map(),
        interactionByRequestId: new Map(),
 diff --git a/packages/adapters/claude-code/src/sdk-transport.ts b/packages/adapters/claude-code/src/sdk-transport.ts
-index 338ef59..9401939 100644
+index 338ef59..139fc14 100644
 --- a/packages/adapters/claude-code/src/sdk-transport.ts
 +++ b/packages/adapters/claude-code/src/sdk-transport.ts
 @@ -17,7 +17,7 @@ import {
@@ -511,7 +585,42 @@ index 338ef59..9401939 100644
    ClaudeTransportContextUsage,
    ClaudeTransportTurnResult,
    ClaudeTurnEvent,
-@@ -327,6 +328,7 @@ function permissionSuggestionScope(value: unknown): ClaudeApprovalSuggestionScop
+@@ -176,6 +177,34 @@ function processExited(child: ChildProcessWithoutNullStreams): boolean {
+   return child.exitCode !== null || child.signalCode !== null;
+ }
+ 
++function safeErrorName(error: unknown): string {
++  const name = error instanceof Error ? error.name : "Error";
++  return /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(name) ? name : "Error";
++}
++
++function queryFault(
++  error: unknown,
++  children: readonly ChildProcessWithoutNullStreams[],
++  stderrTail: string,
++): Error {
++  const exitedChild = [...children].reverse().find(({ exitCode }) => Number.isInteger(exitCode));
++  const cause = {
++    name: safeErrorName(error),
++    category:
++      error instanceof Error && error.message === "Claude SDK Query ended unexpectedly"
++        ? "queryEnded"
++        : "queryFailed",
++    stage: "query.consume",
++    ...(exitedChild?.exitCode !== null && exitedChild?.exitCode !== undefined
++      ? { exitCode: exitedChild.exitCode }
++      : {}),
++    ...(stderrTail ? { stderrTail: sanitizeDiagnosticTail(stderrTail) } : {}),
++  };
++  const fault = new Error("Claude SDK Query became unavailable", { cause });
++  fault.name = "ClaudeSdkQueryFault";
++  return fault;
++}
++
+ function isRecord(value: unknown): value is Record<string, unknown> {
+   return typeof value === "object" && value !== null && !Array.isArray(value);
+ }
+@@ -327,6 +356,7 @@ function permissionSuggestionScope(value: unknown): ClaudeApprovalSuggestionScop
  function parseApprovalRequest(
    requestId: string,
    toolName: string,
@@ -519,7 +628,7 @@ index 338ef59..9401939 100644
    options: Parameters<CanUseTool>[2],
  ): ClaudeApprovalRequest | null {
    const title = [options.title, options.displayName, options.description, toolName]
-@@ -335,9 +337,14 @@ function parseApprovalRequest(
+@@ -335,9 +365,14 @@ function parseApprovalRequest(
    if (!title) return null;
    const description = boundedDisplayText(options.description, APPROVAL_DESCRIPTION_MAX_LENGTH);
    const suggestedScope = permissionSuggestionScope(options.suggestions);
@@ -534,7 +643,7 @@ index 338ef59..9401939 100644
      title,
      ...(description && description !== title ? { description } : {}),
      ...(suggestedScope ? { suggestedScope } : {}),
-@@ -510,6 +517,12 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
+@@ -510,6 +545,12 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
      return parseContextUsage(await activeQuery.getContextUsage());
    }
  
@@ -547,7 +656,7 @@ index 338ef59..9401939 100644
    getPermissionMode(): ClaudePermissionMode {
      if (!this.#started || !this.#query) throw new Error("Claude SDK transport is not started");
      return this.#permissionMode;
-@@ -702,7 +715,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
+@@ -702,7 +743,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
        const questions = parseQuestions(input);
        request = questions ? { type: "question", requestId, questions } : null;
      } else {
@@ -556,6 +665,21 @@ index 338ef59..9401939 100644
      }
      if (!request) {
        return Promise.resolve(
+@@ -873,11 +914,12 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
+       }
+       if (!this.#closePromise) throw new Error("Claude SDK Query ended unexpectedly");
+     } catch (error) {
++      const fault = queryFault(error, this.#children, this.#stderrTail);
+       const active = this.#active;
+       if (active) this.#closeInteractions(active, "cancelled");
+       this.#active = null;
+-      active?.reject(error);
+-      if (!this.#closePromise) this.#onFault(error);
++      active?.reject(fault);
++      if (!this.#closePromise) this.#onFault(fault);
+     }
+   }
+ 
 diff --git a/packages/adapters/claude-code/src/tool-lifecycle.ts b/packages/adapters/claude-code/src/tool-lifecycle.ts
 index f1cc030..9448489 100644
 --- a/packages/adapters/claude-code/src/tool-lifecycle.ts
@@ -805,7 +929,7 @@ index 6fef935..dca886d 100644
    getPermissionMode(): ClaudePermissionMode;
    setModel(model?: string): Promise<void>;
 diff --git a/packages/adapters/claude-code/test/claude-code-adapter.test.ts b/packages/adapters/claude-code/test/claude-code-adapter.test.ts
-index e2c340d..c03beee 100644
+index e2c340d..92d4ac0 100644
 --- a/packages/adapters/claude-code/test/claude-code-adapter.test.ts
 +++ b/packages/adapters/claude-code/test/claude-code-adapter.test.ts
 @@ -23,6 +23,7 @@ import type {
@@ -924,11 +1048,96 @@ index e2c340d..c03beee 100644
    it("maps declared native suggestion scopes without exposing suggestions", async () => {
      const { adapter, transports } = fixture();
      const session = await openSession(adapter);
+@@ -4298,6 +4386,69 @@ describe("Claude Code HarnessAdapter", () => {
+     await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+   });
+ 
++  it("preserves only safe Query fault diagnostics in Host errors", async () => {
++    const { adapter, transports } = fixture();
++    const session = await openSession(adapter);
++    const iterator = session.outputs[Symbol.asyncIterator]();
++
++    await session.execute(textTurn("diagnostic-fault"));
++    await nextEvent(iterator);
++    await nextEvent(iterator);
++    await nextEvent(iterator);
++    const unsafeMessage = "PROMPT_DO_NOT_LEAK https://gateway.invalid/private";
++    const fault = new Error(unsafeMessage, {
++      cause: {
++        name: "Error",
++        category: "queryEnded",
++        stage: "query.consume",
++        exitCode: 23,
++        stderrTail: "api_key=TAIL_DO_NOT_LEAK process exited",
++        environment: { SECRET_ENV: "ENV_DO_NOT_LEAK" },
++        capability: "CAPABILITY_DO_NOT_LEAK",
++        prompt: "PROMPT_DO_NOT_LEAK",
++        url: "https://gateway.invalid/private",
++      },
++    });
++    fault.name = "ClaudeSdkQueryFault";
++    transports[0]?.fault(fault);
++
++    await nextEvent(iterator);
++    const turnCompleted = await nextEvent(iterator);
++    const sessionFaulted = await nextEvent(iterator);
++    expect(turnCompleted).toMatchObject({
++      type: "turn.completed",
++      outcome: {
++        status: "failed",
++        error: {
++          code: "processExited",
++          retryable: true,
++          stage: "query.consume",
++          diagnostic: '{"name":"Error","category":"queryEnded","exitCode":23}',
++          stderrTail: "api_key=[redacted] process exited",
++        },
++      },
++    });
++    expect(sessionFaulted).toMatchObject({
++      type: "session.faulted",
++      error: {
++        code: "processExited",
++        retryable: true,
++        stage: "query.consume",
++      },
++    });
++    const exposed = JSON.stringify({ turnCompleted, sessionFaulted });
++    for (const secret of [
++      unsafeMessage,
++      "ENV_DO_NOT_LEAK",
++      "CAPABILITY_DO_NOT_LEAK",
++      "PROMPT_DO_NOT_LEAK",
++      "TAIL_DO_NOT_LEAK",
++      "https://gateway.invalid/private",
++    ]) {
++      expect(exposed).not.toContain(secret);
++    }
++  });
++
+   it("rejects missing installation before acceptance without outputs", async () => {
+     const dependencies: ClaudeAdapterDependencies = {
+       randomUUID: () => "claude-id",
 diff --git a/packages/adapters/claude-code/test/sdk-transport.test.ts b/packages/adapters/claude-code/test/sdk-transport.test.ts
-index e1787f8..fa79fcf 100644
+index e1787f8..395731b 100644
 --- a/packages/adapters/claude-code/test/sdk-transport.test.ts
 +++ b/packages/adapters/claude-code/test/sdk-transport.test.ts
-@@ -1402,6 +1402,9 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
+@@ -855,9 +855,11 @@ describe("ClaudeSdkTransport process environment", () => {
+   it("isolates routed credentials, injects the Session header, and revokes registration", async () => {
+     const fetcher = vi
+       .fn<typeof fetch>()
+-      .mockResolvedValueOnce(new Response("{}", {
+-        headers: { "x-everyone-codex-session": "session-secret" },
+-      }))
++      .mockResolvedValueOnce(
++        new Response("{}", {
++          headers: { "x-everyone-codex-session": "session-secret" },
++        }),
++      )
+       .mockResolvedValueOnce(new Response(null, { status: 204 }));
+     vi.stubGlobal("fetch", fetcher);
+     try {
+@@ -1402,6 +1404,9 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
        {
          type: "approval",
          requestId: "claude-approval-1",
@@ -938,7 +1147,7 @@ index e1787f8..fa79fcf 100644
          title: "Claude wants to edit a file",
          description: "One-shot file edit",
          suggestedScope: "session",
-@@ -1409,13 +1412,13 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
+@@ -1409,13 +1414,13 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
        {
          type: "approval",
          requestId: "claude-approval-2",
@@ -956,7 +1165,7 @@ index e1787f8..fa79fcf 100644
  
      await expect(
        value.transport.respondToInteraction({
-@@ -1527,7 +1530,7 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
+@@ -1527,7 +1532,7 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
        expect.objectContaining({ requestId: "claude-approval-2", suggestedScope: "always" }),
      ]);
      expect(JSON.stringify(events)).not.toContain("projectSettings");
@@ -965,6 +1174,77 @@ index e1787f8..fa79fcf 100644
  
      await expect(
        value.transport.respondToInteraction({
+@@ -1785,4 +1790,70 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
+     ).rejects.toThrow("not pending");
+     await value.transport.close();
+   });
++
++  it("reports a safe Query fault after an approved Tool when the Query exits", async () => {
++    const value = fixture();
++    await value.transport.start();
++    const canUseTool = options(value).canUseTool;
++    if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
++    const events: ClaudeTurnEvent[] = [];
++    const secretPrompt = "PROMPT_DO_NOT_LEAK";
++    const secretCapability = "CAPABILITY_DO_NOT_LEAK";
++    const secretUrl = "https://gateway.invalid/private";
++    const turn = value.transport.runTurn(
++      secretPrompt,
++      "00000000-0000-4000-8000-000000000013",
++      (event) => events.push(event),
++    );
++    const permission = canUseTool(
++      "Bash",
++      { command: `echo ${secretPrompt}` },
++      {
++        signal: new AbortController().signal,
++        toolUseID: "approved-tool",
++        requestId: "approved-control",
++        description: secretUrl,
++      },
++    );
++
++    await vi.waitFor(() => {
++      expect(events).toContainEqual(
++        expect.objectContaining({
++          type: "interaction.requested",
++          request: expect.objectContaining({ requestId: "claude-approval-1" }),
++        }),
++      );
++    });
++    await value.transport.respondToInteraction({
++      type: "approval",
++      requestId: "claude-approval-1",
++      decision: "allowOnce",
++    });
++    await expect(permission).resolves.toMatchObject({ behavior: "allow" });
++
++    value.fakeQuery.close();
++    await expect(turn).rejects.toThrow("Claude SDK Query became unavailable");
++    await vi.waitFor(() => expect(value.onFault).toHaveBeenCalledOnce());
++    const fault = value.onFault.mock.calls[0]?.[0] as Error & {
++      cause?: Record<string, unknown>;
++    };
++    expect(fault).toMatchObject({
++      name: "ClaudeSdkQueryFault",
++      message: "Claude SDK Query became unavailable",
++      cause: {
++        name: "Error",
++        category: "queryEnded",
++        stage: "query.consume",
++      },
++    });
++    const exposed = JSON.stringify({
++      name: fault.name,
++      message: fault.message,
++      cause: fault.cause,
++    });
++    expect(exposed).not.toContain(secretPrompt);
++    expect(exposed).not.toContain(secretCapability);
++    expect(exposed).not.toContain(secretUrl);
++    await value.transport.close();
++  });
+ });
 diff --git a/packages/adapters/deepseek-harness/package.json b/packages/adapters/deepseek-harness/package.json
 index 854306b..b812cbe 100644
 --- a/packages/adapters/deepseek-harness/package.json
@@ -2384,8 +2664,188 @@ index e063c80..3337b53 100644
 +    "diff": "8.0.4"
    }
  }
+diff --git a/packages/adapters/grok/src/acp-transport.ts b/packages/adapters/grok/src/acp-transport.ts
+index d7db728..1e0534a 100644
+--- a/packages/adapters/grok/src/acp-transport.ts
++++ b/packages/adapters/grok/src/acp-transport.ts
+@@ -56,7 +56,12 @@ import {
+ } from "./permission-modes.js";
+ 
+ export type GrokTransportFaultKind =
+-  "notInstalled" | "authenticationRequired" | "unavailable" | "protocolError" | "processExited";
++  | "notInstalled"
++  | "authenticationRequired"
++  | "unavailable"
++  | "protocolError"
++  | "processExited"
++  | "timeout";
+ 
+ export class GrokTransportError extends Error {
+   readonly diagnostic: string | undefined;
+@@ -137,6 +142,8 @@ export interface GrokAcpTransportOptions {
+   modelAliases?: Readonly<Record<string, string>>;
+   commandTimeoutMs?: number;
+   closeTimeoutMs?: number;
++  turnTimeoutMs?: number;
++  terminalGraceMs?: number;
+   onFault?: (error: GrokTransportError) => void;
+   sessionRegistration?: HarnessSessionRegistration;
+ }
+@@ -177,11 +184,13 @@ export interface GrokOpenResult {
+ interface ActivePrompt {
+   onEvent(event: GrokTransportEvent): void;
+   onPermission(request: GrokPermissionRequest): Promise<RequestPermissionResponse>;
++  cancelPromise: Promise<void> | null;
+ }
+ 
+ interface ActiveCompact {
+   onEvent(event: GrokTransportEvent): void;
+   cancellationRequested: boolean;
++  cancelPromise: Promise<void> | null;
+ }
+ 
+ function isRecord(value: unknown): value is Record<string, unknown> {
+@@ -486,13 +495,17 @@ function parseNativeHistory(contents: string, sessionId: string): GrokTransportE
+ 
+ export class GrokAcpTransport {
+   readonly #options: Required<
+-    Pick<GrokAcpTransportOptions, "commandTimeoutMs" | "closeTimeoutMs">
++    Pick<
++      GrokAcpTransportOptions,
++      "commandTimeoutMs" | "closeTimeoutMs" | "turnTimeoutMs" | "terminalGraceMs"
++    >
+   > &
+     GrokAcpTransportOptions;
+   #activeCompact: ActiveCompact | null = null;
+   #activePrompt: ActivePrompt | null = null;
+   #child: ChildProcessWithoutNullStreams | null = null;
+   #closed = false;
++  #closePromise: Promise<void> | null = null;
+   #closing = false;
+   #connection: ClientSideConnection | null = null;
+   #initialize: InitializeResponse | null = null;
+@@ -504,6 +517,8 @@ export class GrokAcpTransport {
+     this.#options = {
+       commandTimeoutMs: 30_000,
+       closeTimeoutMs: 2_000,
++      turnTimeoutMs: 10 * 60_000,
++      terminalGraceMs: 2_000,
+       ...options,
+     };
+   }
+@@ -808,14 +823,38 @@ export class GrokAcpTransport {
+       throw new GrokTransportError("unavailable", "Grok ACP Session is unavailable");
+     }
+     if (this.#activePrompt) throw new Error("Grok ACP Session already has an active Prompt");
+-    const active = { onEvent, onPermission };
++    const active: ActivePrompt = { onEvent, onPermission, cancelPromise: null };
+     this.#activePrompt = active;
++    const prompt = connection.prompt({
++      sessionId: this.#sessionId,
++      prompt: [{ type: "text", text }],
++    });
++    const timedOut = Symbol("grok-turn-timeout");
++    let timeout: NodeJS.Timeout | undefined;
+     try {
+-      return await connection.prompt({
+-        sessionId: this.#sessionId,
+-        prompt: [{ type: "text", text }],
+-      });
++      const result = await Promise.race([
++        prompt,
++        new Promise<typeof timedOut>((resolve) => {
++          timeout = setTimeout(() => resolve(timedOut), this.#options.turnTimeoutMs);
++        }),
++      ]);
++      if (result !== timedOut) return result;
++
++      // 超时只撤销这次 ACP Prompt；保留短暂终态窗口，让迟到的原生事件完成持久化。
++      await Promise.race([
++        this.#requestCancel(active).catch(() => undefined),
++        new Promise<void>((resolve) => setTimeout(resolve, this.#options.terminalGraceMs)),
++      ]);
++      await Promise.race([
++        prompt.then(
++          () => undefined,
++          () => undefined,
++        ),
++        new Promise<void>((resolve) => setTimeout(resolve, this.#options.terminalGraceMs)),
++      ]);
++      throw new GrokTransportError("timeout", "Grok Prompt timed out");
+     } finally {
++      if (timeout) clearTimeout(timeout);
+       if (this.#activePrompt === active) this.#activePrompt = null;
+     }
+   }
+@@ -834,7 +873,11 @@ export class GrokAcpTransport {
+         "Grok ACP Session already has an active operation",
+       );
+     }
+-    const active: ActiveCompact = { onEvent, cancellationRequested: false };
++    const active: ActiveCompact = {
++      onEvent,
++      cancellationRequested: false,
++      cancelPromise: null,
++    };
+     this.#activeCompact = active;
+     try {
+       const params = {
+@@ -900,19 +943,30 @@ export class GrokAcpTransport {
+   }
+ 
+   cancel(): Promise<void> {
+-    const connection = this.#connection;
+-    if (!connection || !this.#sessionId || (!this.#activePrompt && !this.#activeCompact)) {
++    const active = this.#activePrompt ?? this.#activeCompact;
++    if (!active) {
+       return Promise.reject(new Error("Grok ACP Session has no cancellable operation"));
+     }
+-    if (this.#activeCompact) this.#activeCompact.cancellationRequested = true;
+-    return connection.cancel({ sessionId: this.#sessionId });
++    return this.#requestCancel(active);
++  }
++
++  close(): Promise<void> {
++    if (!this.#closePromise) this.#closePromise = this.#close();
++    return this.#closePromise;
+   }
+ 
+-  async close(): Promise<void> {
++  async #close(): Promise<void> {
+     if (this.#closed) return;
+     this.#closing = true;
+     const child = this.#child;
+     const connection = this.#connection;
++    const active = this.#activePrompt ?? this.#activeCompact;
++    if (active) {
++      await Promise.race([
++        this.#requestCancel(active).catch(() => undefined),
++        new Promise<void>((resolve) => setTimeout(resolve, this.#options.terminalGraceMs)),
++      ]);
++    }
+     if (
+       connection &&
+       this.#sessionId &&
+@@ -938,6 +992,17 @@ export class GrokAcpTransport {
+     }
+   }
+ 
++  #requestCancel(active: ActivePrompt | ActiveCompact): Promise<void> {
++    if (active.cancelPromise) return active.cancelPromise;
++    const connection = this.#connection;
++    if (!connection || !this.#sessionId) {
++      return Promise.reject(new Error("Grok ACP Session has no cancellable operation"));
++    }
++    if ("cancellationRequested" in active) active.cancellationRequested = true;
++    active.cancelPromise = connection.cancel({ sessionId: this.#sessionId });
++    return active.cancelPromise;
++  }
++
+   #handleUpdate(notification: SessionNotification): void {
+     if (this.#sessionId && notification.sessionId !== this.#sessionId) return;
+     const metadata = isRecord(notification._meta) ? notification._meta : undefined;
 diff --git a/packages/adapters/grok/src/grok-adapter.ts b/packages/adapters/grok/src/grok-adapter.ts
-index dcec0f6..9bec87a 100644
+index dcec0f6..85d476d 100644
 --- a/packages/adapters/grok/src/grok-adapter.ts
 +++ b/packages/adapters/grok/src/grok-adapter.ts
 @@ -7,10 +7,13 @@ import type {
@@ -2426,7 +2886,16 @@ index dcec0f6..9bec87a 100644
  } from "./grok-tool-output.js";
  import {
    configuredGrokModelState,
-@@ -153,13 +161,17 @@ export interface GrokAcpTransportLike {
+@@ -119,6 +127,8 @@ export interface GrokAdapterOptions {
+   configuredModels?: readonly GrokConfiguredModel[];
+   commandTimeoutMs?: number;
+   closeTimeoutMs?: number;
++  turnTimeoutMs?: number;
++  terminalGraceMs?: number;
+   toolOutputLimit?: number;
+ }
+ 
+@@ -153,13 +163,17 @@ export interface GrokAcpTransportLike {
  }
  
  interface ActiveTool {
@@ -2445,7 +2914,7 @@ index dcec0f6..9bec87a 100644
    resolve(response: RequestPermissionResponse): void;
  }
  
-@@ -179,6 +191,7 @@ interface ActiveTurn {
+@@ -179,6 +193,7 @@ interface ActiveTurn {
    beforeNativeTurnKeys: Set<string>;
    completion: Promise<void>;
    resolveCompletion(): void;
@@ -2453,7 +2922,23 @@ index dcec0f6..9bec87a 100644
  }
  
  type SessionPhase = "open" | "closing" | "closed" | "faulted";
-@@ -267,6 +280,7 @@ class GrokHarnessSession implements HarnessSession {
+@@ -213,6 +228,15 @@ function invalidState(message: string): HarnessError {
+ 
+ function normalizeError(error: unknown, fallback: HarnessError["code"]): HarnessError {
+   if (error instanceof GrokTransportError) {
++    if (error.kind === "timeout") {
++      return {
++        code: "nativeFailure",
++        message: error.message,
++        retryable: true,
++        stage: "prompt",
++        ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}),
++      };
++    }
+     return {
+       code: error.kind,
+       message: error.message,
+@@ -267,6 +291,7 @@ class GrokHarnessSession implements HarnessSession {
    readonly initialUsage: HostUsage | null;
    readonly outputs: AsyncIterable<HarnessOutput>;
    readonly #channel = new HarnessOutputChannel<HarnessOutput>();
@@ -2461,7 +2946,7 @@ index dcec0f6..9bec87a 100644
    readonly #closeTimeoutMs: number;
    readonly #cwd: string;
    readonly #modelState: GrokModelState;
-@@ -453,13 +467,14 @@ class GrokHarnessSession implements HarnessSession {
+@@ -453,13 +478,14 @@ class GrokHarnessSession implements HarnessSession {
        ),
        completion,
        resolveCompletion,
@@ -2477,7 +2962,7 @@ index dcec0f6..9bec87a 100644
          (request) => this.#requestPermission(active, request),
        )
        .then(
-@@ -544,11 +559,12 @@ class GrokHarnessSession implements HarnessSession {
+@@ -544,11 +570,12 @@ class GrokHarnessSession implements HarnessSession {
        beforeNativeTurnKeys: new Set(),
        completion,
        resolveCompletion,
@@ -2491,7 +2976,7 @@ index dcec0f6..9bec87a 100644
        .then(
          (result) => this.#settleManualCompact(active, result),
          (error) =>
-@@ -797,6 +813,30 @@ class GrokHarnessSession implements HarnessSession {
+@@ -797,6 +824,30 @@ class GrokHarnessSession implements HarnessSession {
            retryable: false,
          },
        };
@@ -2522,7 +3007,7 @@ index dcec0f6..9bec87a 100644
      active.approvals.delete(command.interactionId);
      pending.resolve({ outcome: { outcome: "selected", optionId: option.optionId } });
      this.#event({
-@@ -808,12 +848,31 @@ class GrokHarnessSession implements HarnessSession {
+@@ -808,12 +859,31 @@ class GrokHarnessSession implements HarnessSession {
      return { ok: true, value: { accepted: true } };
    }
  
@@ -2556,7 +3041,7 @@ index dcec0f6..9bec87a 100644
      }
      const interactionId = hostInteractionIdSchema.parse(this.#randomUUID());
      const options = new Map<string, PermissionOption>();
-@@ -822,21 +881,48 @@ class GrokHarnessSession implements HarnessSession {
+@@ -822,21 +892,48 @@ class GrokHarnessSession implements HarnessSession {
        options.set(id, option);
        return { id, label: option.name, effect: effectForOption(option) };
      });
@@ -2608,7 +3093,7 @@ index dcec0f6..9bec87a 100644
      if (this.#active !== active || this.#phase !== "open") return;
      const contextUsage = usageFromUpdate(
        event.type === "usage" ? event.update : undefined,
-@@ -849,7 +935,7 @@ class GrokHarnessSession implements HarnessSession {
+@@ -849,7 +946,7 @@ class GrokHarnessSession implements HarnessSession {
      if (event.type === "agent.text") this.#appendAgent(active, event.text, event.messageId);
      else if (event.type === "agent.thought")
        this.#appendReasoning(active, event.text, event.messageId);
@@ -2617,7 +3102,7 @@ index dcec0f6..9bec87a 100644
      else if (event.type === "tool.update") this.#updateTool(active, event);
      else if (event.type === "compaction.started") this.#startCompaction(active, event);
      else if (event.type === "compaction.completed") {
-@@ -964,10 +1050,17 @@ class GrokHarnessSession implements HarnessSession {
+@@ -964,10 +1061,17 @@ class GrokHarnessSession implements HarnessSession {
      });
    }
  
@@ -2637,7 +3122,7 @@ index dcec0f6..9bec87a 100644
        itemId: hostItemIdSchema.parse(this.#randomUUID()),
        name: event.name,
        title: event.title,
-@@ -975,10 +1068,41 @@ class GrokHarnessSession implements HarnessSession {
+@@ -975,10 +1079,41 @@ class GrokHarnessSession implements HarnessSession {
        rawInput: event.rawInput,
        cwd: this.#cwd,
      });
@@ -2682,7 +3167,7 @@ index dcec0f6..9bec87a 100644
      if (event.status === "completed" || event.status === "failed") {
        this.#completeTool(active, event.callId, event.status, event.content, event.rawOutput);
      }
-@@ -990,8 +1114,22 @@ class GrokHarnessSession implements HarnessSession {
+@@ -990,8 +1125,22 @@ class GrokHarnessSession implements HarnessSession {
    ): void {
      const tool = active.tools.get(event.callId);
      if (!tool) return;
@@ -2706,7 +3191,7 @@ index dcec0f6..9bec87a 100644
        const previous = tool.item.type === "commandExecution" ? (tool.item.output ?? "") : undefined;
        tool.item = applyGrokToolProjection(tool.item, projection);
        if (tool.item.type === "commandExecution" && projection.output) {
-@@ -999,12 +1137,7 @@ class GrokHarnessSession implements HarnessSession {
+@@ -999,12 +1148,7 @@ class GrokHarnessSession implements HarnessSession {
          if (previous !== undefined && next.startsWith(previous)) {
            const delta = next.slice(previous.length);
            if (delta.length > 0) {
@@ -2720,7 +3205,7 @@ index dcec0f6..9bec87a 100644
            }
          }
        } else if (tool.item.type === "toolExecution" && projection.output) {
-@@ -1033,24 +1166,44 @@ class GrokHarnessSession implements HarnessSession {
+@@ -1033,24 +1177,44 @@ class GrokHarnessSession implements HarnessSession {
      if (!tool) return;
      active.tools.delete(callId);
      const projection = projectGrokToolOutput(content, rawOutput, this.#toolOutputLimit);
@@ -2772,7 +3257,7 @@ index dcec0f6..9bec87a 100644
      const fileItem: HostFileChangeItem = {
        type: "fileChange",
        itemId: hostItemIdSchema.parse(this.#randomUUID()),
-@@ -1089,6 +1242,8 @@ class GrokHarnessSession implements HarnessSession {
+@@ -1089,6 +1253,8 @@ class GrokHarnessSession implements HarnessSession {
      outcome: TurnOutcome,
      response?: PromptResponse,
    ): Promise<void> {
@@ -2781,7 +3266,7 @@ index dcec0f6..9bec87a 100644
      let history: GrokTransportEvent[] = [];
      let nativeTurnRef: NativeTurnRef | undefined;
      let checkpoint: NativeCheckpointRef | undefined;
-@@ -1132,7 +1287,10 @@ class GrokHarnessSession implements HarnessSession {
+@@ -1132,7 +1298,10 @@ class GrokHarnessSession implements HarnessSession {
        this.#completeItem(active, active.compactionItem, itemOutcome);
        active.compactionItem = null;
      }
@@ -2995,7 +3480,7 @@ index a65e91e..33b941a 100644
    if (!Array.isArray(content)) return "";
    return content
 diff --git a/packages/adapters/grok/test/grok-adapter.test.ts b/packages/adapters/grok/test/grok-adapter.test.ts
-index 187fc39..5e4f210 100644
+index 187fc39..c7c0fb2 100644
 --- a/packages/adapters/grok/test/grok-adapter.test.ts
 +++ b/packages/adapters/grok/test/grok-adapter.test.ts
 @@ -4,6 +4,9 @@ import type {
@@ -3008,7 +3493,26 @@ index 187fc39..5e4f210 100644
  import { resolve } from "node:path";
  import {
    harnessModelRefSchema,
-@@ -193,12 +196,17 @@ class FakeGrokTransport implements GrokAcpTransportLike {
+@@ -78,6 +81,7 @@ class FakeGrokTransport implements GrokAcpTransportLike {
+   #onEvent: ((event: GrokTransportEvent) => void) | null = null;
+   #onPermission: ((request: GrokPermissionRequest) => Promise<RequestPermissionResponse>) | null =
+     null;
++  #reject: ((error: unknown) => void) | null = null;
+   #resolve: ((response: PromptResponse) => void) | null = null;
+   #compactResolve: ((result: GrokCompactResult) => void) | null = null;
+   #compactOnEvent: ((event: GrokTransportEvent) => void) | null = null;
+@@ -162,8 +166,9 @@ class FakeGrokTransport implements GrokAcpTransportLike {
+     this.#activePromptEvents = [];
+     this.#onEvent = onEvent;
+     this.#onPermission = onPermission;
+-    return new Promise((resolve) => {
++    return new Promise((resolve, reject) => {
+       this.#resolve = resolve;
++      this.#reject = reject;
+     });
+   }
+ 
+@@ -193,12 +198,17 @@ class FakeGrokTransport implements GrokAcpTransportLike {
      });
    }
  
@@ -3028,7 +3532,21 @@ index 187fc39..5e4f210 100644
          options: [
            { optionId: "native-allow", name: "Allow once", kind: "allow_once" },
            { optionId: "native-deny", name: "Reject", kind: "reject_once" },
-@@ -240,6 +248,7 @@ async function openedSession(
+@@ -233,6 +243,13 @@ class FakeGrokTransport implements GrokAcpTransportLike {
+     this.#activePromptEvents = [];
+     this.#resolve?.(response);
+     this.#resolve = null;
++    this.#reject = null;
++  }
++
++  fail(error: unknown): void {
++    this.#reject?.(error);
++    this.#resolve = null;
++    this.#reject = null;
+   }
+ }
+ 
+@@ -240,6 +257,7 @@ async function openedSession(
    transport: FakeGrokTransport,
    kind: "create" | "resume" = "create",
    knownTurnRefs?: NativeTurnRef[],
@@ -3036,7 +3554,7 @@ index 187fc39..5e4f210 100644
  ) {
    let uuid = 0;
    const adapter = new GrokAdapter(
-@@ -252,10 +261,10 @@ async function openedSession(
+@@ -252,10 +270,10 @@ async function openedSession(
    );
    const opened = await adapter.open(
      kind === "create"
@@ -3049,7 +3567,7 @@ index 187fc39..5e4f210 100644
            nativeRef: {
              harnessId: adapter.harnessId,
              nativeSessionId: transport.sessionId,
-@@ -283,6 +292,130 @@ async function nextEvent(
+@@ -283,6 +301,130 @@ async function nextEvent(
  }
  
  describe("Grok Adapter ACP projection", () => {
@@ -3180,7 +3698,7 @@ index 187fc39..5e4f210 100644
    it("reports a single available Grok Model as selectable", async () => {
      const transport = new FakeGrokTransport();
      const adapter = new GrokAdapter(
-@@ -530,16 +663,27 @@ describe("Grok Adapter ACP projection", () => {
+@@ -530,16 +672,27 @@ describe("Grok Adapter ACP projection", () => {
        status: "in_progress",
      });
      expect((await nextEvent(iterator)).type).toBe("item.completed");
@@ -3209,7 +3727,7 @@ index 187fc39..5e4f210 100644
        title: "Run tests",
        actions: [
          { id: "native-1", effect: "allowOnce" },
-@@ -571,7 +715,12 @@ describe("Grok Adapter ACP projection", () => {
+@@ -571,7 +724,12 @@ describe("Grok Adapter ACP projection", () => {
      expect(await nextEvent(iterator)).toMatchObject({
        type: "item.completed",
        snapshot: {
@@ -3223,7 +3741,7 @@ index 187fc39..5e4f210 100644
          outcome: { status: "succeeded" },
        },
      });
-@@ -638,6 +787,7 @@ describe("Grok Adapter ACP projection", () => {
+@@ -638,6 +796,7 @@ describe("Grok Adapter ACP projection", () => {
        item: {
          type: "toolExecution",
          toolName: "read_file",
@@ -3231,7 +3749,7 @@ index 187fc39..5e4f210 100644
          arguments: { target_file: "/synthetic/a.txt" },
        },
      });
-@@ -710,6 +860,7 @@ describe("Grok Adapter ACP projection", () => {
+@@ -710,6 +869,7 @@ describe("Grok Adapter ACP projection", () => {
                  item: {
                    type: "toolExecution",
                    toolName: "read_file",
@@ -3239,7 +3757,7 @@ index 187fc39..5e4f210 100644
                    output: { content: [{ type: "text", text: "file body" }] },
                  },
                },
-@@ -717,6 +868,7 @@ describe("Grok Adapter ACP projection", () => {
+@@ -717,6 +877,7 @@ describe("Grok Adapter ACP projection", () => {
                  item: {
                    type: "toolExecution",
                    toolName: "list_dir",
@@ -3247,7 +3765,7 @@ index 187fc39..5e4f210 100644
                    output: { content: [{ type: "text", text: "a.ts\nb.ts" }] },
                  },
                },
-@@ -728,6 +880,86 @@ describe("Grok Adapter ACP projection", () => {
+@@ -728,6 +889,86 @@ describe("Grok Adapter ACP projection", () => {
      await adapter.close();
    });
  
@@ -3334,6 +3852,43 @@ index 187fc39..5e4f210 100644
    it("projects only successful terminal ACP Diff Content and restores it from history", async () => {
      const transport = new FakeGrokTransport();
      const { adapter, session } = await openedSession(transport);
+@@ -1205,6 +1446,36 @@ describe("Grok Adapter ACP projection", () => {
+     await adapter.close();
+   });
+ 
++  it("publishes a retryable failed Turn when the ACP Prompt reaches its bound", async () => {
++    const transport = new FakeGrokTransport();
++    const { adapter, session } = await openedSession(transport);
++    const iterator = session.outputs[Symbol.asyncIterator]();
++    const turnId = hostTurnIdSchema.parse("turn-timeout");
++
++    await session.execute({
++      type: "turn.start",
++      turnId,
++      input: [{ type: "text", text: "wait" }],
++    });
++    expect((await nextEvent(iterator)).type).toBe("turn.started");
++    transport.fail(new GrokTransportError("timeout", "Grok Prompt timed out"));
++
++    await expect(nextEvent(iterator)).resolves.toMatchObject({
++      type: "turn.completed",
++      turnId,
++      outcome: {
++        status: "failed",
++        error: {
++          code: "nativeFailure",
++          message: "Grok Prompt timed out",
++          retryable: true,
++          stage: "prompt",
++        },
++      },
++    });
++    await adapter.close();
++  });
++
+   it("rejects unsupported history mutation and invalid create Model selection", async () => {
+     const transport = new FakeGrokTransport();
+     const adapter = new GrokAdapter(
 diff --git a/packages/adapters/grok/test/grok-tool-output.test.ts b/packages/adapters/grok/test/grok-tool-output.test.ts
 index b96ecdd..7590786 100644
 --- a/packages/adapters/grok/test/grok-tool-output.test.ts
@@ -3370,6 +3925,217 @@ index b96ecdd..7590786 100644
 +    });
    });
  });
+diff --git a/packages/adapters/grok/test/grok-turn-timeout.test.ts b/packages/adapters/grok/test/grok-turn-timeout.test.ts
+new file mode 100644
+index 0000000..9f49c27
+--- /dev/null
++++ b/packages/adapters/grok/test/grok-turn-timeout.test.ts
+@@ -0,0 +1,205 @@
++import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
++import os from "node:os";
++import path from "node:path";
++import { pathToFileURL } from "node:url";
++
++import { describe, expect, it } from "vitest";
++
++import {
++  GROK_DEFAULT_PERMISSION_MODE_ID,
++  GrokAcpTransport,
++  GrokTransportError,
++  type GrokTransportEvent,
++} from "../src/index.js";
++
++async function withFakeAgent<T>(
++  scenario: "hung" | "late-terminal" | "user-cancel",
++  run: (input: { command: string; marker: string; directory: string }) => Promise<T>,
++): Promise<T> {
++  const directory = await mkdtemp(path.join(os.tmpdir(), "codexhost-grok-timeout-"));
++  const marker = path.join(directory, "events.txt");
++  const script = path.join(directory, "agent.mjs");
++  const sdk = pathToFileURL(path.resolve("node_modules/@agentclientprotocol/sdk/dist/acp.js")).href;
++  const source = `
++import * as acp from ${JSON.stringify(sdk)};
++import { appendFileSync } from "node:fs";
++import { Readable, Writable } from "node:stream";
++
++const scenario = process.env.GROK_TEST_SCENARIO;
++const marker = process.env.GROK_TEST_MARKER;
++let pending = null;
++const mark = (value) => appendFileSync(marker, value + "\\n", "utf8");
++
++const stream = acp.ndJsonStream(
++  Writable.toWeb(process.stdout),
++  Readable.toWeb(process.stdin),
++);
++
++acp.agent({ name: "timeout-fixture" })
++  .onRequest("initialize", () => ({
++    protocolVersion: acp.PROTOCOL_VERSION,
++    agentCapabilities: { loadSession: false, sessionCapabilities: { close: true } },
++  }))
++  .onRequest("session/new", () => ({ sessionId: "timeout-session" }))
++  .onRequest("session/prompt", (ctx) => new Promise((resolve) => {
++    mark("prompt");
++    pending = { client: ctx.client, resolve };
++  }))
++  .onNotification("session/cancel", () => {
++    mark("cancel");
++    const current = pending;
++    if (!current) return;
++    if (scenario === "user-cancel") {
++      current.resolve({ stopReason: "cancelled" });
++      pending = null;
++    } else if (scenario === "late-terminal") {
++      setTimeout(async () => {
++        await current.client.notify("_x.ai/session/update", {
++          sessionId: "timeout-session",
++          update: {
++            sessionUpdate: "turn_completed",
++            prompt_id: "late-prompt",
++            stop_reason: "cancelled",
++          },
++        });
++        mark("terminal");
++        current.resolve({ stopReason: "cancelled" });
++        pending = null;
++      }, 5);
++    }
++  })
++  .onRequest("session/close", () => {
++    mark("close");
++    pending?.resolve({ stopReason: "cancelled" });
++    pending = null;
++    return {};
++  })
++  .connect(stream);
++`;
++  await writeFile(script, source, "utf8");
++
++  let command: string;
++  if (process.platform === "win32") {
++    command = path.join(directory, "grok-fixture.cmd");
++    await writeFile(command, `@"${process.execPath}" "${script}" %*\r\n`, "utf8");
++  } else {
++    command = path.join(directory, "grok-fixture");
++    await writeFile(command, `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`, "utf8");
++    await chmod(command, 0o755);
++  }
++
++  try {
++    return await run({ command, marker, directory });
++  } finally {
++    await rm(directory, { recursive: true, force: true });
++  }
++}
++
++async function markerEvents(marker: string): Promise<string[]> {
++  try {
++    return (await readFile(marker, "utf8")).trim().split("\n").filter(Boolean);
++  } catch {
++    return [];
++  }
++}
++
++async function openTransport(
++  scenario: "hung" | "late-terminal" | "user-cancel",
++  command: string,
++  marker: string,
++  overrides: { turnTimeoutMs?: number; terminalGraceMs?: number } = {},
++): Promise<GrokAcpTransport> {
++  const transport = new GrokAcpTransport({
++    cwd: path.dirname(marker),
++    command,
++    environment: {
++      ...process.env,
++      GROK_TEST_MARKER: marker,
++      GROK_TEST_SCENARIO: scenario,
++    },
++    commandTimeoutMs: 2_000,
++    closeTimeoutMs: 100,
++    turnTimeoutMs: overrides.turnTimeoutMs ?? 30,
++    terminalGraceMs: overrides.terminalGraceMs ?? 30,
++  });
++  await transport.open({
++    kind: "create",
++    permissionModeId: GROK_DEFAULT_PERMISSION_MODE_ID,
++  });
++  return transport;
++}
++
++describe("Grok ACP bounded Turn termination", () => {
++  it("cancels one hung Prompt and returns a retryable timeout after terminal grace", async () => {
++    await withFakeAgent("hung", async ({ command, marker }) => {
++      const transport = await openTransport("hung", command, marker);
++      try {
++        await expect(transport.runTurn("hang", () => undefined, async () => ({
++          outcome: { outcome: "cancelled" },
++        }))).rejects.toMatchObject({
++          kind: "timeout",
++          message: "Grok Prompt timed out",
++        } satisfies Partial<GrokTransportError>);
++        expect(await markerEvents(marker)).toEqual(["prompt", "cancel"]);
++      } finally {
++        await transport.close();
++      }
++    });
++  });
++
++  it("accepts a late terminal during grace but still reports the elapsed Turn as timeout", async () => {
++    await withFakeAgent("late-terminal", async ({ command, marker }) => {
++      const transport = await openTransport("late-terminal", command, marker, {
++        terminalGraceMs: 100,
++      });
++      const events: GrokTransportEvent[] = [];
++      try {
++        await expect(transport.runTurn("late", (event) => events.push(event), async () => ({
++          outcome: { outcome: "cancelled" },
++        }))).rejects.toMatchObject({ kind: "timeout" });
++        expect(events).toContainEqual({
++          type: "turn.completed",
++          nativeTurnKey: "late-prompt",
++          stopReason: "cancelled",
++        });
++        expect(await markerEvents(marker)).toEqual(["prompt", "cancel", "terminal"]);
++      } finally {
++        await transport.close();
++      }
++    });
++  });
++
++  it("coalesces repeated user cancellation into one ACP cancel", async () => {
++    await withFakeAgent("user-cancel", async ({ command, marker }) => {
++      const transport = await openTransport("user-cancel", command, marker, {
++        turnTimeoutMs: 1_000,
++      });
++      try {
++        const turn = transport.runTurn("cancel", () => undefined, async () => ({
++          outcome: { outcome: "cancelled" },
++        }));
++        await new Promise((resolve) => setTimeout(resolve, 10));
++        await Promise.all([transport.cancel(), transport.cancel()]);
++        await expect(turn).resolves.toEqual({ stopReason: "cancelled" });
++        expect(await markerEvents(marker)).toEqual(["prompt", "cancel"]);
++      } finally {
++        await transport.close();
++      }
++    });
++  });
++
++  it("coalesces close and cancels its active Prompt once", async () => {
++    await withFakeAgent("hung", async ({ command, marker }) => {
++      const transport = await openTransport("hung", command, marker, {
++        turnTimeoutMs: 1_000,
++      });
++      const turn = transport.runTurn("close", () => undefined, async () => ({
++        outcome: { outcome: "cancelled" },
++      }));
++      await new Promise((resolve) => setTimeout(resolve, 10));
++      await Promise.all([transport.close(), transport.close()]);
++      await expect(turn).resolves.toEqual({ stopReason: "cancelled" });
++      expect(await markerEvents(marker)).toEqual(["prompt", "cancel", "close"]);
++    });
++  });
++});
 diff --git a/packages/adapters/omp/package.json b/packages/adapters/omp/package.json
 index d656d63..a61bbdd 100644
 --- a/packages/adapters/omp/package.json
