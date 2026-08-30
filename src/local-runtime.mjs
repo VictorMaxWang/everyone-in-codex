@@ -17,6 +17,10 @@ import { promisify } from "node:util";
 import { ProfileManager } from "./profile-manager.mjs";
 import { RouterCatalogBridge } from "./router-catalog-bridge.mjs";
 import {
+  fetchCodex2NativeCatalog,
+  parseCodex2AuthJson,
+} from "./codex2-native-catalog.mjs";
+import {
   publishHarnessConfigs,
   reserveLoopbackPort,
   restoreHarnessConfigs,
@@ -29,6 +33,9 @@ const MODULE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const DEFAULT_READY_TIMEOUT_MS = 90_000;
 const SECRET_PATTERN = /^[A-Za-z0-9_-]{32,}$/;
 const LEASE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const ROUTED_HARNESS_IDS = Object.freeze([
+  "pi", "omp", "deepseek-harness", "grok", "claude-code",
+]);
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -156,7 +163,27 @@ function normalizeFusionConfig(document, configPath) {
   const gatewayDaemonPath = document.runtime?.gatewayDaemonPath === undefined
     ? fileURLToPath(new URL("./gateway-daemon.mjs", import.meta.url))
     : requireAbsolutePath(document.runtime.gatewayDaemonPath, "runtime.gatewayDaemonPath");
-
+  let nativeOpenAiBaseUrl = null;
+  if (document.nativeOpenAi
+    && (Object.hasOwn(document.nativeOpenAi, "validationAuthPath")
+      || Object.hasOwn(document.nativeOpenAi, "validationOnly"))) {
+    throw new Error("cross_profile_auth_forbidden");
+  }
+  if (document.nativeOpenAi?.apiBaseUrl !== undefined) {
+    const candidate = new URL(document.nativeOpenAi.apiBaseUrl);
+    if (
+      candidate.protocol !== "https:"
+      || candidate.hostname !== "api.openai.com"
+      || candidate.username
+      || candidate.password
+      || candidate.search
+      || candidate.hash
+    ) {
+      throw new Error("nativeOpenAi.apiBaseUrl 必须是无凭据的 api.openai.com HTTPS URL");
+    }
+    candidate.pathname = `${candidate.pathname.replace(/\/$/u, "")}/`;
+    nativeOpenAiBaseUrl = candidate.href;
+  }
   return Object.freeze({
     schemaVersion: 1,
     profile,
@@ -166,6 +193,9 @@ function normalizeFusionConfig(document, configPath) {
       healthUrl: healthUrl.href,
     }),
     webgpt: Object.freeze({ healthUrl: webgptHealthUrl.href }),
+    nativeOpenAi: Object.freeze({
+      apiBaseUrl: nativeOpenAiBaseUrl,
+    }),
     runtime: Object.freeze({
       codexHostExecutable: resolveCodexHostExecutable(document, configDirectory),
       nodeExecutable,
@@ -378,6 +408,68 @@ function safeBaseEnvironment(source = process.env) {
   return result;
 }
 
+function codexHostFusionModels(models) {
+  return models.map((model) => ({
+    id: model.id,
+    displayName: String(model.display_name ?? model.name ?? model.id),
+    reasoningLevels: [...new Set((Array.isArray(model.supported_reasoning_levels)
+      ? model.supported_reasoning_levels
+        .map((entry) => (typeof entry === "string" ? entry : entry?.effort))
+        .filter((entry) => typeof entry === "string")
+      : [])
+      .map((level) => (level === "ultra" ? "max" : level)))],
+  }));
+}
+
+async function defaultCodex2NativeCatalogProvider({ profile, sourceEnvironment, config }) {
+  const codexExecutable = path.join(profile.desktopRoot, "app", "resources", "codex.exe");
+  const authPath = path.join(profile.codexHome, "auth.json");
+  await Promise.all([
+    assertRegularFile(codexExecutable, "Codex 2 CLI"),
+    assertRegularFile(authPath, "Codex 2 auth.json"),
+  ]);
+  // 先验证 Codex 2 会话可用；目录发布不得因为 Router 自己的 Codex 1 fallback
+  // 看似在线而把当前 Profile 实际无法消费的原生模型暴露给 Harness。
+  const session = parseCodex2AuthJson(await readFile(authPath, "utf8"));
+  if (session.kind === "oauth") {
+    const { stdout } = await execFileAsync(codexExecutable, ["--version"], {
+      cwd: profile.desktopRoot,
+      env: safeBaseEnvironment(sourceEnvironment),
+      windowsHide: true,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024,
+    });
+    const clientVersion = /(?:^|\s)(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?:\s|$)/u.exec(stdout)?.[1];
+    if (!clientVersion) throw new Error("codex2_native_client_version_invalid");
+    return fetchCodex2NativeCatalog(session, { clientVersion });
+  }
+  if (session.kind === "api-key" && !config?.nativeOpenAi?.apiBaseUrl) {
+    // 自定义 Provider 的 key 不能被误当成 OpenAI key；没有显式官方端点时隐藏原生行。
+    return { models: [] };
+  }
+  const { stdout } = await execFileAsync(codexExecutable, ["debug", "models", "--bundled"], {
+    cwd: profile.desktopRoot,
+    env: {
+      ...safeBaseEnvironment(sourceEnvironment),
+      CODEX_HOME: profile.codexHome,
+      CODEX_SQLITE_HOME: profile.sqliteHome,
+    },
+    windowsHide: true,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  let document;
+  try {
+    document = JSON.parse(stdout);
+  } catch (error) {
+    throw new Error("codex2_native_catalog_invalid", { cause: error });
+  }
+  if (!Array.isArray(document) && !Array.isArray(document?.models)) {
+    throw new Error("codex2_native_catalog_invalid");
+  }
+  return document;
+}
+
 function safeLeaseId(value) {
   if (typeof value !== "string" || !LEASE_ID_PATTERN.test(value)) {
     throw new Error("invalid_lease_id");
@@ -408,6 +500,9 @@ function waitForGatewayReady(child, leaseId, timeoutMs) {
       ) return;
       try {
         const normalizeLease = (lease, target) => {
+          const expectedProtocol = target === "claude-code"
+            ? "anthropic-messages"
+            : "openai-responses";
           if (
             typeof lease?.capability !== "string"
             || lease.capability.length < 16
@@ -415,6 +510,7 @@ function waitForGatewayReady(child, leaseId, timeoutMs) {
             || lease.modelCount < 1
             || typeof lease.catalogRevision !== "string"
             || !lease.catalogRevision
+            || lease.protocol !== expectedProtocol
           ) {
             throw new Error(`gateway_${target}_ready_invalid`);
           }
@@ -422,10 +518,26 @@ function waitForGatewayReady(child, leaseId, timeoutMs) {
           if (url.pathname !== "/") throw new Error("gateway_ready_url_has_path");
           return { ...lease, baseUrl: url.origin };
         };
+        const harnesses = Object.fromEntries(ROUTED_HARNESS_IDS.map((harnessId) => [
+          harnessId,
+          normalizeLease(message.harnesses?.[harnessId], harnessId),
+        ]));
+        if (
+          typeof message.control?.capability !== "string"
+          || message.control.capability.length < 16
+        ) {
+          throw new Error("gateway_control_ready_invalid");
+        }
+        const controlUrl = normalizeLoopbackUrl(
+          message.control.baseUrl,
+          "Gateway control baseUrl",
+        );
+        if (controlUrl.pathname !== "/") throw new Error("gateway_ready_url_has_path");
         settle(resolve, {
           ...message,
           codex: normalizeLease(message.codex, "codex"),
-          external: normalizeLease(message.external, "external"),
+          harnesses,
+          control: { ...message.control, baseUrl: controlUrl.origin },
         });
       } catch (error) {
         settle(reject, error);
@@ -650,6 +762,7 @@ export class LocalFusionRuntime {
     harnesses,
     sourceEnvironment = process.env,
     loopbackPortAllocator = reserveLoopbackPort,
+    nativeCatalogProvider = defaultCodex2NativeCatalogProvider,
   } = {}) {
     if (typeof fetchImpl !== "function" || typeof spawnImpl !== "function") {
       throw new Error("LocalFusionRuntime 需要 fetch 与 spawn 边界");
@@ -676,6 +789,10 @@ export class LocalFusionRuntime {
       throw new Error("LocalFusionRuntime 需要回环端口分配器");
     }
     this.loopbackPortAllocator = loopbackPortAllocator;
+    if (typeof nativeCatalogProvider !== "function") {
+      throw new Error("LocalFusionRuntime 需要 Codex 2 native catalog provider");
+    }
+    this.nativeCatalogProvider = nativeCatalogProvider;
 
     this.validationPolicy = Object.freeze({
       assert: async (profile) => this.#assertConfiguredProfile(profile),
@@ -755,11 +872,23 @@ export class LocalFusionRuntime {
     await this.#assertConfiguredProfile(profile);
     const callerSecret = await readRouterCallerSecret(config.router.stateDir);
     const routerBaseUrl = routerCapabilityBaseUrl(config, callerSecret);
+    let nativeCatalog = { models: [] };
+    try {
+      nativeCatalog = await this.nativeCatalogProvider({
+        profile,
+        config,
+        sourceEnvironment: this.sourceEnvironment,
+      });
+    } catch {
+      // 目录刷新必须失败关闭：账号失效时隐藏原生项，但仍发布 API/WebGPT。
+      nativeCatalog = { models: [] };
+    }
     const bridge = new RouterCatalogBridge({
       mergedModelsPath: path.join(config.router.stateDir, "merged-models.json"),
       modelPickerPath: path.join(config.router.stateDir, "model-picker.json"),
       routerModelsUrl: new URL("models", routerBaseUrl).href,
       fetchImpl: this.fetchImpl,
+      nativeCatalog,
     });
     const activated = await bridge.activate({ target });
     const snapshotPath = this.#snapshotPath(target);
@@ -913,7 +1042,12 @@ export class LocalFusionRuntime {
       });
       const harnessConfig = await publishHarnessConfigs({
         root: path.join(this.leaseDirectory, leaseId, "harnesses"),
-        gatewayBaseUrl: gatewayReady.external.baseUrl,
+        gatewayBaseUrls: {
+          pi: gatewayReady.harnesses.pi.baseUrl,
+          omp: gatewayReady.harnesses.omp.baseUrl,
+          "deepseek-harness": gatewayReady.harnesses["deepseek-harness"].baseUrl,
+          grok: gatewayReady.harnesses.grok.baseUrl,
+        },
         models: externalSnapshot.models,
         loopbackPortAllocator: this.loopbackPortAllocator,
       });
@@ -930,7 +1064,24 @@ export class LocalFusionRuntime {
           catalogPath: profileReceipt.catalogPath,
         }),
         EVERYONE_CODEX_LEASE_CAPABILITY: gatewayReady.codex.capability,
-        EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY: gatewayReady.external.capability,
+        EVERYONE_CODEX_PI_LEASE_CAPABILITY: gatewayReady.harnesses.pi.capability,
+        EVERYONE_CODEX_PI_BASE_URL: gatewayReady.harnesses.pi.baseUrl,
+        EVERYONE_CODEX_OMP_LEASE_CAPABILITY: gatewayReady.harnesses.omp.capability,
+        EVERYONE_CODEX_OMP_BASE_URL: gatewayReady.harnesses.omp.baseUrl,
+        EVERYONE_CODEX_DSH_LEASE_CAPABILITY:
+          gatewayReady.harnesses["deepseek-harness"].capability,
+        EVERYONE_CODEX_DSH_BASE_URL:
+          gatewayReady.harnesses["deepseek-harness"].baseUrl,
+        EVERYONE_CODEX_GROK_LEASE_CAPABILITY: gatewayReady.harnesses.grok.capability,
+        EVERYONE_CODEX_GROK_BASE_URL: gatewayReady.harnesses.grok.baseUrl,
+        EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY:
+          gatewayReady.harnesses["claude-code"].capability,
+        EVERYONE_CODEX_CLAUDE_BASE_URL: gatewayReady.harnesses["claude-code"].baseUrl,
+        EVERYONE_CODEX_HOST_CONTROL_URL: gatewayReady.control.baseUrl,
+        EVERYONE_CODEX_HOST_CONTROL_CAPABILITY: gatewayReady.control.capability,
+        CODEXHOST_FUSION_MODELS_JSON: JSON.stringify(
+          codexHostFusionModels(externalSnapshot.models),
+        ),
       };
       for (const harness of await this.harnesses.list()) {
         if (
@@ -970,7 +1121,10 @@ export class LocalFusionRuntime {
         leaseId,
         profile,
         gatewayBaseUrl: gatewayReady.codex.baseUrl,
-        externalGatewayBaseUrl: gatewayReady.external.baseUrl,
+        harnessGatewayBaseUrls: Object.fromEntries(ROUTED_HARNESS_IDS.map((harnessId) => [
+          harnessId,
+          gatewayReady.harnesses[harnessId].baseUrl,
+        ])),
         catalogRevision: {
           codex: codexSnapshot.catalogRevision,
           external: externalSnapshot.catalogRevision,
@@ -987,6 +1141,10 @@ export class LocalFusionRuntime {
         catalogRevision: codexSnapshot.catalogRevision,
         modelCount: codexSnapshot.models.length,
         externalModelCount: externalSnapshot.models.length,
+        harnessModelCounts: Object.fromEntries(ROUTED_HARNESS_IDS.map((harnessId) => [
+          harnessId,
+          gatewayReady.harnesses[harnessId].modelCount,
+        ])),
         processes: Object.freeze({ gateway: gatewayChild.pid, codexHost: hostChild.pid }),
       });
     } catch (error) {
@@ -1053,10 +1211,18 @@ export class LocalFusionRuntime {
       return (rank[left.role] ?? 9) - (rank[right.role] ?? 9);
     });
     const stoppedPids = [];
+    const stalePids = [];
     for (const owned of ordered) {
       const current = await this.processInspector(owned.pid);
       if (!current) continue;
-      assertOwnedProcess(current, owned);
+      try {
+        assertOwnedProcess(current, owned);
+      } catch (error) {
+        if (!String(error?.message).startsWith("process_ownership_conflict:")) throw error;
+        // PID 已复用时绝不终止新进程；其旧 lease 已失效，仍可安全恢复受管文件。
+        stalePids.push(owned.pid);
+        continue;
+      }
       const result = await this.processTerminator(current);
       if (result?.stopped !== false) stoppedPids.push(owned.pid);
     }
@@ -1072,7 +1238,7 @@ export class LocalFusionRuntime {
     }
     await manager.restore();
     await unlink(receiptPath);
-    return { restored: true, leaseId, stoppedPids };
+    return { restored: true, leaseId, stoppedPids, stalePids };
   }
 }
 

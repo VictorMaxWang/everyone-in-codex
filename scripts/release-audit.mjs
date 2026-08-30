@@ -19,7 +19,7 @@ const REQUIRED_PORTABLE_FILES = [
 const ALLOWED_PORTABLE_PATHS = [
   /^(?:README\.md|LICENSE|THIRD_PARTY_NOTICES\.md|package\.json|release-manifest\.json)$/,
   /^bin\/everyone-codex\.cmd$/,
-  /^src\/[A-Za-z0-9._/-]+\.(?:mjs|json|md)$/,
+  /^src\/[A-Za-z0-9._/-]+\.(?:mjs|json|md|ps1)$/,
   /^config\/[A-Za-z0-9._/-]+\.json$/,
   /^locks\/[A-Za-z0-9._/-]+\.json$/,
   /^runtime\/node\/(?:node\.exe|LICENSE)$/,
@@ -38,6 +38,7 @@ const TEXT_EXTENSIONS = new Set([
   ".md",
   ".mjs",
   ".patch",
+  ".ps1",
   ".sha256",
   ".txt",
 ]);
