@@ -24,7 +24,9 @@ import {
 
 const execFileAsync = promisify(execFile);
 const MODULE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const DEFAULT_READY_TIMEOUT_MS = 30_000;
+// Windows 冷启动会同时拉起 Electron、Shim 与官方 app-server；实机可超过 30 秒，
+// 因而给首次启动留出 90 秒，同时仍由单一总超时约束失败清理。
+const DEFAULT_READY_TIMEOUT_MS = 90_000;
 const SECRET_PATTERN = /^[A-Za-z0-9_-]{32,}$/;
 const LEASE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
