@@ -107,8 +107,8 @@ try {
         -Source (Join-Path $resolvedRepoRoot 'config') `
         -Destination (Join-Path $stagingRoot 'config')
     Copy-DirectoryContents `
-        -Source (Join-Path $resolvedRepoRoot 'patches') `
-        -Destination (Join-Path $stagingRoot 'patches')
+        -Source (Join-Path $resolvedRepoRoot 'patches\router') `
+        -Destination (Join-Path $stagingRoot 'patches\router')
 
     if (-not $NodeRoot) {
         if ($env:EVERYONE_CODEX_NODE_ROOT) {
