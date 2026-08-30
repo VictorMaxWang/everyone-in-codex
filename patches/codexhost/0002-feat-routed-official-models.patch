@@ -1,0 +1,1626 @@
+diff --git a/packages/adapters/claude-code/src/claude-code-adapter.ts b/packages/adapters/claude-code/src/claude-code-adapter.ts
+index 6295789..6602113 100644
+--- a/packages/adapters/claude-code/src/claude-code-adapter.ts
++++ b/packages/adapters/claude-code/src/claude-code-adapter.ts
+@@ -76,8 +76,10 @@ import { claudeTranscriptItemId } from "./item-identity.js";
+ import { readClaudeTranscript } from "./claude-transcript.js";
+ import {
+   CLAUDE_DEFAULT_MODEL_REF,
+-  decodeClaudeModelRef,
++  decodeClaudeModelSelection,
+   normalizeClaudeModelCatalog,
++  parseClaudeRoutedModels,
++  type ClaudeRoutedModel,
+ } from "./model-catalog.js";
+ import {
+   CLAUDE_DEFAULT_PERMISSION_MODE_ID,
+@@ -117,6 +119,11 @@ export interface ClaudeCodeAdapterOptions {
+   closeTimeoutMs?: number;
+   toolOutputLimit?: number;
+   continuationQuiescenceMs?: number;
++  routedModels?: readonly ClaudeRoutedModel[];
++}
++
++function environmentValue(environment: NodeJS.ProcessEnv, name: string): string | undefined {
++  return Object.entries(environment).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
+ }
+ 
+ type SessionPhase = "open" | "closing" | "closed" | "faulted";
+@@ -480,6 +487,7 @@ class ClaudeHarnessSession implements HarnessSession {
+   #requestedPermissionModeId: HarnessPermissionModeId;
+   #requestedThinkingOptionId: HarnessThinkingOptionId;
+   readonly #readSessionMessages: ClaudeAdapterDependencies["readSessionMessages"];
++  readonly #routedModelIds: ReadonlySet<string>;
+   readonly #sessionId: string;
+   readonly #toolOutputLimit: number;
+   readonly #continuationQuiescenceMs: number;
+@@ -522,6 +530,7 @@ class ClaudeHarnessSession implements HarnessSession {
+       requestedThinkingOptionId: HarnessThinkingOptionId;
+       toolOutputLimit: number;
+       continuationQuiescenceMs: number;
++      routedModelIds: ReadonlySet<string>;
+     },
+   ) {
+     this.#cwd = cwd;
+@@ -538,6 +547,7 @@ class ClaudeHarnessSession implements HarnessSession {
+     this.#sessionId = options.sessionId;
+     this.#toolOutputLimit = options.toolOutputLimit;
+     this.#continuationQuiescenceMs = options.continuationQuiescenceMs;
++    this.#routedModelIds = options.routedModelIds;
+     this.#nativeRef = nativeSessionRefSchema.parse({
+       harnessId: this.harnessId,
+       nativeSessionId: this.#sessionId,
+@@ -889,9 +899,12 @@ class ClaudeHarnessSession implements HarnessSession {
+         },
+       };
+     }
+-    let model: string | undefined;
++    let selection: ReturnType<typeof decodeClaudeModelSelection>;
+     try {
+-      model = decodeClaudeModelRef(command.model);
++      selection = decodeClaudeModelSelection(command.model);
++      if (selection.kind === "routed" && !this.#routedModelIds.has(selection.model)) {
++        throw new Error("Claude routed Model is not configured");
++      }
+     } catch {
+       return {
+         ok: false,
+@@ -912,8 +925,21 @@ class ClaudeHarnessSession implements HarnessSession {
+     try {
+       const transport = this.#transport;
+       if (transport) {
++        const currentSelection = this.#requestedModel
++          ? decodeClaudeModelSelection(this.#requestedModel)
++          : { kind: "native" as const };
++        if (selection.kind !== currentSelection.kind) {
++          return {
++            ok: false,
++            error: {
++              code: "invalidState",
++              message: "Claude Code cannot switch routing boundary after Session startup",
++              retryable: false,
++            },
++          };
++        }
+         try {
+-          await transport.setModel(model);
++          await transport.setModel(selection.model);
+         } catch {
+           return {
+             ok: false,
+@@ -1221,13 +1247,17 @@ class ClaudeHarnessSession implements HarnessSession {
+     if (this.#transport) return this.#transport;
+     const selectedModel =
+       this.#requestedModel ?? (this.#openMode === "create" ? CLAUDE_DEFAULT_MODEL_REF : undefined);
+-    const model = selectedModel ? decodeClaudeModelRef(selectedModel) : undefined;
++    const selection = selectedModel
++      ? decodeClaudeModelSelection(selectedModel)
++      : ({ kind: "native" } as const);
++    const model = "model" in selection ? selection.model : undefined;
+     const permissionMode = decodeClaudePermissionModeId(this.#requestedPermissionModeId);
+     const transport = this.#createTransport({
+       cwd: this.#cwd,
+       sessionId: this.#sessionId,
+       openMode: this.#openMode,
+       ...(model ? { model } : {}),
++      ...(selection.kind === "routed" ? { routed: true } : {}),
+       thinkingOptionId: this.#requestedThinkingOptionId,
+       permissionMode,
+       onPermissionModeChanged: (mode) => this.#handlePermissionModeChanged(mode),
+@@ -2178,6 +2208,7 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
+   readonly #inspectionInFlight = new Map<string, Promise<HarnessInspection>>();
+   readonly #inspectors = new Set<ClaudeModelInspector>();
+   readonly #sessions = new Set<ClaudeHarnessSession>();
++  readonly #routedModels: readonly ClaudeRoutedModel[];
+   #closePromise: Promise<void> | null = null;
+   #latestPlanLimit: ClaudePlanLimitEvent | null = null;
+ 
+@@ -2195,6 +2226,11 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
+     ) {
+       throw new RangeError("Claude Code continuation quiescence must be a positive safe integer");
+     }
++    this.#routedModels =
++      options.routedModels ??
++      parseClaudeRoutedModels(
++        environmentValue(options.environment ?? process.env, "CODEXHOST_FUSION_MODELS_JSON"),
++      );
+     this.#dependencies = dependencies ?? {
+       randomUUID,
+       inspectInstallation: () => {
+@@ -2295,7 +2331,7 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
+           },
+         };
+       }
+-      const { catalog } = normalizeClaudeModelCatalog(snapshot);
++      const { catalog } = normalizeClaudeModelCatalog(snapshot, this.#routedModels);
+       return {
+         status: "ready",
+         catalog,
+@@ -2446,7 +2482,13 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
+     }
+     if (input.kind === "create" && input.model) {
+       try {
+-        decodeClaudeModelRef(input.model);
++        const selection = decodeClaudeModelSelection(input.model);
++        if (
++          selection.kind === "routed" &&
++          !this.#routedModels.some((model) => model.id === selection.model)
++        ) {
++          throw new Error("Claude routed Model is not configured");
++        }
+       } catch {
+         return {
+           ok: false,
+@@ -2518,6 +2560,7 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
+         requestedThinkingOptionId,
+         toolOutputLimit: this.#toolOutputLimit,
+         continuationQuiescenceMs: this.#continuationQuiescenceMs,
++        routedModelIds: new Set(this.#routedModels.map((model) => model.id)),
+       },
+     );
+     this.#sessions.add(session);
+diff --git a/packages/adapters/claude-code/src/model-catalog.ts b/packages/adapters/claude-code/src/model-catalog.ts
+index a5e7f37..86ef0a2 100644
+--- a/packages/adapters/claude-code/src/model-catalog.ts
++++ b/packages/adapters/claude-code/src/model-catalog.ts
+@@ -19,6 +19,7 @@ import {
+ } from "./thinking-options.js";
+ 
+ const CLAUDE_MODEL_REF_PREFIX = "claude-model-v1.";
++const CLAUDE_ROUTED_MODEL_REF_PREFIX = "claude-routed-model-v1.";
+ const CLAUDE_MODEL_VALUE_MAX_LENGTH = 512;
+ 
+ const modelInfoSchema = z.object({
+@@ -38,6 +39,21 @@ export interface NormalizedClaudeModelCatalog {
+   defaultModel: HarnessModelRef;
+ }
+ 
++export interface ClaudeRoutedModel {
++  id: string;
++  displayName: string;
++  reasoningLevels: string[];
++}
++
++export type ClaudeModelSelection =
++  { kind: "native"; model?: string } | { kind: "routed"; model: string };
++
++const routedModelSchema = z.object({
++  id: z.string().trim().min(1).max(CLAUDE_MODEL_VALUE_MAX_LENGTH),
++  displayName: z.string().trim().min(1).max(HARNESS_MODEL_LABEL_MAX_LENGTH),
++  reasoningLevels: z.array(z.string().trim().min(1).max(32)).max(16).default([]),
++});
++
+ export const CLAUDE_DEFAULT_MODEL_REF = encodeClaudeModelRef("default");
+ 
+ export function encodeClaudeModelRef(value: string): HarnessModelRef {
+@@ -68,6 +84,54 @@ export function decodeClaudeModelRef(ref: HarnessModelRef): string | undefined {
+   return value === "default" ? undefined : value;
+ }
+ 
++export function encodeClaudeRoutedModelRef(value: string): HarnessModelRef {
++  const parsed = z.string().trim().min(1).max(CLAUDE_MODEL_VALUE_MAX_LENGTH).parse(value);
++  const id = `${CLAUDE_ROUTED_MODEL_REF_PREFIX}${Buffer.from(parsed, "utf8").toString("base64url")}`;
++  if (id.length > HARNESS_MODEL_REF_MAX_LENGTH) {
++    throw new Error("Claude routed Model value is too long for a Model Ref");
++  }
++  return harnessModelRefSchema.parse({ id });
++}
++
++export function decodeClaudeModelSelection(ref: HarnessModelRef): ClaudeModelSelection {
++  const parsed = harnessModelRefSchema.parse(ref);
++  if (!parsed.id.startsWith(CLAUDE_ROUTED_MODEL_REF_PREFIX)) {
++    const model = decodeClaudeModelRef(parsed);
++    return model === undefined ? { kind: "native" } : { kind: "native", model };
++  }
++  const encoded = parsed.id.slice(CLAUDE_ROUTED_MODEL_REF_PREFIX.length);
++  if (!encoded) throw new Error("Claude routed Model Ref is empty");
++  const model = Buffer.from(encoded, "base64url").toString("utf8");
++  if (encodeClaudeRoutedModelRef(model).id !== parsed.id) {
++    throw new Error("Claude routed Model Ref is not canonical");
++  }
++  return { kind: "routed", model };
++}
++
++export function parseClaudeRoutedModels(value: string | undefined): ClaudeRoutedModel[] {
++  if (value === undefined) return [];
++  if (value.length === 0 || value.length > 64 * 1024) {
++    throw new Error("CODEXHOST_FUSION_MODELS_JSON has an invalid size");
++  }
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(value);
++  } catch {
++    throw new Error("CODEXHOST_FUSION_MODELS_JSON is invalid JSON");
++  }
++  const rows = z.array(routedModelSchema).min(1).max(50).parse(parsed);
++  const byId = new Map<string, ClaudeRoutedModel>();
++  for (const row of rows) {
++    if (byId.has(row.id)) throw new Error("CODEXHOST_FUSION_MODELS_JSON contains duplicate Models");
++    byId.set(row.id, {
++      id: row.id,
++      displayName: row.displayName,
++      reasoningLevels: [...new Set(row.reasoningLevels)],
++    });
++  }
++  return [...byId.values()];
++}
++
+ function uniqueDisplayLabels(rows: Array<z.infer<typeof modelInfoSchema>>): Map<string, string> {
+   const groups = new Map<string, Array<z.infer<typeof modelInfoSchema>>>();
+   for (const row of rows) {
+@@ -115,8 +179,29 @@ function normalizeRows(value: unknown): Array<z.infer<typeof modelInfoSchema>> {
+   return [...byValue.values()];
+ }
+ 
++function disambiguateCombinedLabels(models: HarnessModel[]): void {
++  const byLabel = new Map<string, HarnessModel[]>();
++  for (const model of models) {
++    const group = byLabel.get(model.label) ?? [];
++    group.push(model);
++    byLabel.set(model.label, group);
++  }
++  for (const [label, group] of byLabel) {
++    if (group.length < 2) continue;
++    for (const model of group) {
++      const selection = decodeClaudeModelSelection(model.ref);
++      const rawSuffix =
++        selection.kind === "routed" ? selection.model : (selection.model ?? "default");
++      const suffixValue = rawSuffix.length > 64 ? `${rawSuffix.slice(0, 61)}...` : rawSuffix;
++      const suffix = ` (${suffixValue})`;
++      model.label = `${label.slice(0, HARNESS_MODEL_LABEL_MAX_LENGTH - suffix.length)}${suffix}`;
++    }
++  }
++}
++
+ export function normalizeClaudeModelCatalog(
+   snapshot: ClaudeModelInspectionSnapshot,
++  routedModels: readonly ClaudeRoutedModel[] = [],
+ ): NormalizedClaudeModelCatalog {
+   if (!snapshot.canSelectModel) throw new Error("Claude Code Model selection is unavailable");
+   const rows = normalizeRows(snapshot.models);
+@@ -129,6 +214,24 @@ export function normalizeClaudeModelCatalog(
+       supportedThinkingOptionIds: [...CLAUDE_THINKING_OPTION_IDS],
+     };
+   });
++  for (const routed of routedModels) {
++    const supportedThinkingOptionIds = [
++      ...new Set(
++        routed.reasoningLevels
++          .map((level) => (level === "ultra" ? "max" : level))
++          .flatMap((level) => {
++            const id = CLAUDE_THINKING_OPTION_IDS.find((candidate) => candidate === level);
++            return id ? [id] : [];
++          }),
++      ),
++    ];
++    models.push({
++      ref: encodeClaudeRoutedModelRef(routed.id),
++      label: routed.displayName,
++      supportedThinkingOptionIds,
++    });
++  }
++  disambiguateCombinedLabels(models);
+   models.sort((left, right) => {
+     if (left.ref.id === CLAUDE_DEFAULT_MODEL_REF.id) return -1;
+     if (right.ref.id === CLAUDE_DEFAULT_MODEL_REF.id) return 1;
+diff --git a/packages/adapters/claude-code/src/sdk-transport.ts b/packages/adapters/claude-code/src/sdk-transport.ts
+index cde8f15..338ef59 100644
+--- a/packages/adapters/claude-code/src/sdk-transport.ts
++++ b/packages/adapters/claude-code/src/sdk-transport.ts
+@@ -9,7 +9,14 @@ import {
+   type SDKUserMessage,
+   type SpawnOptions,
+ } from "@anthropic-ai/claude-agent-sdk";
+-import { sanitizeDiagnosticTail } from "@codexhost/harness-adapter";
++import {
++  EVERYONE_CODEX_HOST_CONTROL_CAPABILITY_ENV,
++  EVERYONE_CODEX_HOST_CONTROL_URL_ENV,
++  EVERYONE_CODEX_SESSION_TOKEN_ENV,
++  registerHarnessSession,
++  sanitizeDiagnosticTail,
++  type HarnessSessionRegistration,
++} from "@codexhost/harness-adapter";
+ import type { HarnessThinkingOptionId } from "@codexhost/shared-contracts";
+ 
+ import { resolveClaudeCodeExecutable, withNodeRuntimeOnPath } from "./command.js";
+@@ -94,6 +101,7 @@ export interface ClaudeSdkTransportOptions {
+   sessionId: string;
+   openMode: "create" | "resume";
+   model?: string;
++  routed?: boolean;
+   thinkingOptionId: HarnessThinkingOptionId;
+   permissionMode: ClaudePermissionMode;
+   closeTimeoutMs: number;
+@@ -115,6 +123,49 @@ function delay(milliseconds: number): Promise<void> {
+   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+ }
+ 
++const EVERYONE_CODEX_CLAUDE_BASE_URL_ENV = "EVERYONE_CODEX_CLAUDE_BASE_URL";
++const EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY_ENV = "EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY";
++
++function environmentValue(environment: NodeJS.ProcessEnv, name: string): string | undefined {
++  return Object.entries(environment).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
++}
++
++function deleteEnvironmentValue(environment: NodeJS.ProcessEnv, name: string): void {
++  for (const key of Object.keys(environment)) {
++    if (key.toLowerCase() === name.toLowerCase()) Reflect.deleteProperty(environment, key);
++  }
++}
++
++function routedClaudeEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
++  const baseUrl = environmentValue(environment, EVERYONE_CODEX_CLAUDE_BASE_URL_ENV);
++  const leaseCapability = environmentValue(environment, EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY_ENV);
++  const sessionToken = environmentValue(environment, EVERYONE_CODEX_SESSION_TOKEN_ENV);
++  if (!baseUrl || !leaseCapability || !sessionToken) {
++    throw new Error("Claude routed Session environment is incomplete");
++  }
++  const childEnvironment = { ...environment };
++  // Routed Session 必须与官方 Claude OAuth 完全隔离；只下沉该 lease 的临时能力。
++  for (const name of [
++    "CLAUDE_CODE_OAUTH_TOKEN",
++    "ANTHROPIC_API_KEY",
++    "ANTHROPIC_AUTH_TOKEN",
++    "ANTHROPIC_BEARER_TOKEN",
++    "ANTHROPIC_BASE_URL",
++    "ANTHROPIC_CUSTOM_HEADERS",
++    EVERYONE_CODEX_HOST_CONTROL_URL_ENV,
++    EVERYONE_CODEX_HOST_CONTROL_CAPABILITY_ENV,
++    EVERYONE_CODEX_CLAUDE_BASE_URL_ENV,
++    EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY_ENV,
++    EVERYONE_CODEX_SESSION_TOKEN_ENV,
++  ]) {
++    deleteEnvironmentValue(childEnvironment, name);
++  }
++  childEnvironment.ANTHROPIC_BASE_URL = baseUrl;
++  childEnvironment.ANTHROPIC_AUTH_TOKEN = sessionToken;
++  childEnvironment.ANTHROPIC_CUSTOM_HEADERS = `x-everyone-codex-session: ${sessionToken}`;
++  return childEnvironment;
++}
++
+ export function allowsDangerouslySkipPermissions(
+   getuid: (() => number) | undefined = process.getuid,
+ ): boolean {
+@@ -325,6 +376,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
+   readonly #environment: NodeJS.ProcessEnv;
+   readonly #input = new PushableInput<SDKUserMessage>();
+   readonly #model: string | undefined;
++  readonly #routed: boolean;
+   readonly #onFault: (error: unknown) => void;
+   readonly #onPermissionModeChanged: (permissionMode: ClaudePermissionMode) => void;
+   readonly #onPlanLimit: (planLimit: ClaudePlanLimitEvent) => void;
+@@ -348,6 +400,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
+   #interactionOrdinal = 0;
+   #provider: string | undefined;
+   #query: Query | null = null;
++  #registration: HarnessSessionRegistration | null = null;
+   #started = false;
+ 
+   constructor(options: ClaudeSdkTransportOptions) {
+@@ -357,6 +410,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
+     this.#command = options.command;
+     this.#environment = options.environment ?? process.env;
+     this.#model = options.model;
++    this.#routed = options.routed === true;
+     this.#onFault = options.onFault;
+     this.#onPermissionModeChanged = options.onPermissionModeChanged;
+     this.#onPlanLimit = options.onPlanLimit;
+@@ -387,31 +441,54 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
+       environment: this.#environment,
+     });
+     const thinking = claudeThinkingConfiguration(this.#thinkingOptionId);
+-    const activeQuery = this.#queryFactory({
+-      prompt: this.#input,
+-      options: {
++    if (this.#routed) {
++      this.#registration = await registerHarnessSession({
++        environment: this.#environment,
++        harnessId: "claude-code",
++        sessionId: this.sessionId,
+         cwd: this.#cwd,
+-        ...(this.#openMode === "resume"
+-          ? { resume: this.sessionId }
+-          : { sessionId: this.sessionId }),
+-        ...(this.#model ? { model: this.#model } : {}),
+-        thinking: thinking.enabled ? { type: "adaptive" } : { type: "disabled" },
+-        ...(thinking.effort ? { effort: thinking.effort } : {}),
+-        pathToClaudeCodeExecutable: executable,
+-        settingSources: ["user"],
++        workspaceRoots: [this.#cwd],
+         permissionMode: this.#permissionMode,
+-        ...(allowsDangerouslySkipPermissions() ? { allowDangerouslySkipPermissions: true } : {}),
+-        canUseTool: (toolName, input, options) => this.#canUseTool(toolName, input, options),
+-        persistSession: true,
+-        includePartialMessages: true,
+-        forwardSubagentText: true,
+-        env: withNodeRuntimeOnPath({
+-          ...this.#environment,
+-          CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
+-        }),
+-        spawnClaudeCodeProcess: (options) => this.#spawn(options),
+-      },
+-    });
++      });
++      if (!this.#registration) {
++        throw new Error("Claude routed Session requires Host registration");
++      }
++    }
++    const queryEnvironment = this.#routed
++      ? routedClaudeEnvironment(this.#registration!.environment)
++      : this.#environment;
++    let activeQuery: Query;
++    try {
++      activeQuery = this.#queryFactory({
++        prompt: this.#input,
++        options: {
++          cwd: this.#cwd,
++          ...(this.#openMode === "resume"
++            ? { resume: this.sessionId }
++            : { sessionId: this.sessionId }),
++          ...(this.#model ? { model: this.#model } : {}),
++          thinking: thinking.enabled ? { type: "adaptive" } : { type: "disabled" },
++          ...(thinking.effort ? { effort: thinking.effort } : {}),
++          pathToClaudeCodeExecutable: executable,
++          settingSources: ["user"],
++          permissionMode: this.#permissionMode,
++          ...(allowsDangerouslySkipPermissions() ? { allowDangerouslySkipPermissions: true } : {}),
++          canUseTool: (toolName, input, options) => this.#canUseTool(toolName, input, options),
++          persistSession: true,
++          includePartialMessages: true,
++          forwardSubagentText: true,
++          env: withNodeRuntimeOnPath({
++            ...queryEnvironment,
++            CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
++          }),
++          spawnClaudeCodeProcess: (options) => this.#spawn(options),
++        },
++      });
++    } catch (error) {
++      await this.#registration?.close().catch(() => undefined);
++      this.#registration = null;
++      throw error;
++    }
+     this.#query = activeQuery;
+     try {
+       await activeQuery.initializationResult();
+@@ -419,6 +496,8 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
+     } catch (error) {
+       activeQuery.close();
+       this.#query = null;
++      await this.#registration?.close().catch(() => undefined);
++      this.#registration = null;
+       throw error;
+     }
+     this.#started = true;
+@@ -715,6 +794,8 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
+       if (!processExited(child)) child.kill("SIGKILL");
+     }
+     this.#query = null;
++    await this.#registration?.close().catch(() => undefined);
++    this.#registration = null;
+     const active = this.#active;
+     this.#active = null;
+     this.#autonomous = null;
+diff --git a/packages/adapters/claude-code/src/transport.ts b/packages/adapters/claude-code/src/transport.ts
+index d9a5d21..6fef935 100644
+--- a/packages/adapters/claude-code/src/transport.ts
++++ b/packages/adapters/claude-code/src/transport.ts
+@@ -203,6 +203,7 @@ export interface ClaudeTransportFactoryInput {
+   sessionId: string;
+   openMode: "create" | "resume";
+   model?: string;
++  routed?: boolean;
+   thinkingOptionId: HarnessThinkingOptionId;
+   permissionMode: ClaudePermissionMode;
+   onPermissionModeChanged(permissionMode: ClaudePermissionMode): void;
+diff --git a/packages/adapters/claude-code/test/model-catalog.test.ts b/packages/adapters/claude-code/test/model-catalog.test.ts
+index 9de6bf5..b7edab7 100644
+--- a/packages/adapters/claude-code/test/model-catalog.test.ts
++++ b/packages/adapters/claude-code/test/model-catalog.test.ts
+@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
+ 
+ import {
+   CLAUDE_DEFAULT_MODEL_REF,
++  decodeClaudeModelSelection,
+   decodeClaudeModelRef,
+   encodeClaudeModelRef,
++  encodeClaudeRoutedModelRef,
+   normalizeClaudeModelCatalog,
++  parseClaudeRoutedModels,
+ } from "../src/model-catalog.js";
+ 
+ function snapshot(models: unknown) {
+@@ -22,6 +25,35 @@ describe("Claude Code runtime Model catalog", () => {
+     expect(() => decodeClaudeModelRef({ id: `${alias.id}=` } as never)).toThrow();
+   });
+ 
++  it("appends routed models with explicit private Refs and short friendly labels", () => {
++    const routed = parseClaudeRoutedModels(
++      JSON.stringify([
++        {
++          id: "chatgpt-web/pro",
++          displayName: "ChatGPT/Pro",
++          reasoningLevels: ["ultra", "high"],
++        },
++      ]),
++    );
++    const normalized = normalizeClaudeModelCatalog(
++      snapshot([{ value: "default", displayName: "Default" }]),
++      routed,
++    );
++    const model = normalized.catalog.models.find(({ label }) => label === "ChatGPT/Pro");
++
++    expect(model?.ref.id).toMatch(/^claude-routed-model-v1\./u);
++    expect(decodeClaudeModelSelection(model!.ref)).toEqual({
++      kind: "routed",
++      model: "chatgpt-web/pro",
++    });
++    expect(model?.supportedThinkingOptionIds).toEqual(["max", "high"]);
++    expect(decodeClaudeModelSelection(encodeClaudeRoutedModelRef("gpt-5.6-sol"))).toEqual({
++      kind: "routed",
++      model: "gpt-5.6-sol",
++    });
++    expect(normalized.catalog.models[0]?.label).toBe("Default");
++  });
++
+   it("preserves default, aliases, and custom rows that resolve to one actual Model", () => {
+     const normalized = normalizeClaudeModelCatalog(
+       snapshot([
+diff --git a/packages/adapters/claude-code/test/sdk-transport.test.ts b/packages/adapters/claude-code/test/sdk-transport.test.ts
+index 7ed04f8..e1787f8 100644
+--- a/packages/adapters/claude-code/test/sdk-transport.test.ts
++++ b/packages/adapters/claude-code/test/sdk-transport.test.ts
+@@ -78,6 +78,7 @@ function fixture(
+   permissionMode: ClaudeSdkTransportOptions["permissionMode"] = "default",
+   thinkingOptionId = harnessThinkingOptionIdSchema.parse("auto"),
+   environment?: NodeJS.ProcessEnv,
++  routed = false,
+ ) {
+   const fakeQuery = new FakeQuery();
+   let queryInput: QueryInput | undefined;
+@@ -94,6 +95,7 @@ function fixture(
+     cwd: process.cwd(),
+     sessionId: "00000000-0000-4000-8000-000000000001",
+     openMode,
++    ...(routed ? { routed: true } : {}),
+     permissionMode,
+     thinkingOptionId,
+     closeTimeoutMs: 100,
+@@ -849,6 +851,67 @@ describe("ClaudeSdkTransport process environment", () => {
+     );
+     await value.transport.close();
+   });
++
++  it("isolates routed credentials, injects the Session header, and revokes registration", async () => {
++    const fetcher = vi
++      .fn<typeof fetch>()
++      .mockResolvedValueOnce(new Response("{}", {
++        headers: { "x-everyone-codex-session": "session-secret" },
++      }))
++      .mockResolvedValueOnce(new Response(null, { status: 204 }));
++    vi.stubGlobal("fetch", fetcher);
++    try {
++      const value = fixture(
++        "create",
++        "default",
++        harnessThinkingOptionIdSchema.parse("auto"),
++        {
++          PATH: process.env.PATH,
++          CLAUDE_CODE_OAUTH_TOKEN: "official-oauth",
++          ANTHROPIC_API_KEY: "official-api-key",
++          EVERYONE_CODEX_HOST_CONTROL_URL: "http://127.0.0.1:54321",
++          EVERYONE_CODEX_HOST_CONTROL_CAPABILITY: "host-secret",
++          EVERYONE_CODEX_CLAUDE_BASE_URL: "http://127.0.0.1:54322/v1",
++          EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY: "lease-secret",
++        },
++        true,
++      );
++
++      await value.transport.start();
++      expect(options(value).env).toMatchObject({
++        ANTHROPIC_BASE_URL: "http://127.0.0.1:54322/v1",
++        ANTHROPIC_AUTH_TOKEN: "session-secret",
++        ANTHROPIC_CUSTOM_HEADERS: "x-everyone-codex-session: session-secret",
++      });
++      for (const secretName of [
++        "CLAUDE_CODE_OAUTH_TOKEN",
++        "ANTHROPIC_API_KEY",
++        "EVERYONE_CODEX_HOST_CONTROL_CAPABILITY",
++        "EVERYONE_CODEX_SESSION_TOKEN",
++      ]) {
++        expect(options(value).env).not.toHaveProperty(secretName);
++      }
++      await value.transport.close();
++      expect(fetcher).toHaveBeenCalledTimes(2);
++    } finally {
++      vi.unstubAllGlobals();
++    }
++  });
++
++  it("preserves native Claude authentication environment", async () => {
++    const value = fixture("create", "default", harnessThinkingOptionIdSchema.parse("auto"), {
++      PATH: process.env.PATH,
++      CLAUDE_CODE_OAUTH_TOKEN: "official-oauth",
++      ANTHROPIC_API_KEY: "official-api-key",
++    });
++
++    await value.transport.start();
++    expect(options(value).env).toMatchObject({
++      CLAUDE_CODE_OAUTH_TOKEN: "official-oauth",
++      ANTHROPIC_API_KEY: "official-api-key",
++    });
++    await value.transport.close();
++  });
+ });
+ 
+ describe("ClaudeSdkTransport Permission Mode control", () => {
+diff --git a/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts b/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts
+index d2993ad..08e7051 100644
+--- a/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts
++++ b/packages/adapters/deepseek-harness/src/deepseek-harness-adapter.ts
+@@ -1,4 +1,5 @@
+ import { randomUUID } from "node:crypto";
++import { createServer } from "node:net";
+ import path from "node:path";
+ 
+ import type {
+@@ -12,6 +13,7 @@ import type { SessionId } from "@deepseek-ai/dsh-session/types";
+ 
+ import {
+   HarnessOutputChannel,
++  registerHarnessSession,
+   validateHostApprovalResponse,
+   validateHostQuestionResponse,
+   type HarnessAdapter,
+@@ -109,6 +111,24 @@ export interface DeepSeekHostConnectionLike {
+ export interface DeepSeekHarnessAdapterDependencies {
+   randomUUID(): string;
+   createConnection(options: DeepSeekHostConnectionOptions): DeepSeekHostConnectionLike;
++  reserveEndpoint?(): Promise<string>;
++}
++
++async function reserveSessionEndpoint(): Promise<string> {
++  const server = createServer();
++  await new Promise<void>((resolve, reject) => {
++    server.once("error", reject);
++    server.listen(0, "127.0.0.1", resolve);
++  });
++  const address = server.address();
++  if (!address || typeof address === "string") {
++    server.close();
++    throw new Error("DeepSeek Harness Session endpoint allocation failed");
++  }
++  await new Promise<void>((resolve, reject) => {
++    server.close((error) => (error ? reject(error) : resolve()));
++  });
++  return `http://127.0.0.1:${address.port}/`;
+ }
+ 
+ interface ActiveTool {
+@@ -1224,7 +1244,6 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+       };
+     }
+     try {
+-      await this.#connection.connect();
+       const cwd = path.resolve(input.cwd);
+       let sessionId: string;
+       if (input.kind === "create") {
+@@ -1244,16 +1263,59 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+         sessionId = parsed.data.nativeSessionId;
+       }
+ 
++      const sessionEnvironment = this.#options.environment ?? process.env;
++      const registration =
++        sessionEnvironment.EVERYONE_CODEX_DSH_BASE_URL &&
++        sessionEnvironment.EVERYONE_CODEX_DSH_LEASE_CAPABILITY
++          ? await registerHarnessSession({
++              environment: sessionEnvironment,
++              harnessId: "deepseek-harness",
++              sessionId,
++              cwd,
++              workspaceRoots: [cwd],
++              permissionMode: "native",
++            })
++          : null;
++      // 检查连接不承载用户会话；每个 Session 用独立进程环境获得自己的短期 token。
++      let sessionConnection: DeepSeekHostConnectionLike;
++      try {
++        const sessionEndpoint = registration
++          ? await (this.#dependencies.reserveEndpoint?.() ?? reserveSessionEndpoint())
++          : undefined;
++        sessionConnection = registration
++          ? this.#dependencies.createConnection({
++              ...this.#options,
++              ...(sessionEndpoint ? { endpoint: sessionEndpoint } : {}),
++              environment: {
++                ...registration.environment,
++                // DSH 的 apiKeyEnv 可安全读取进程环境，但 settings headers 不做动态插值。
++                // 让可撤销 Session token 同时承担该 Session 的 Bearer 门禁，绝不落盘。
++                EVERYONE_CODEX_DSH_LEASE_CAPABILITY: registration.sessionToken,
++              },
++            })
++          : this.#connection;
++      } catch (error) {
++        await registration?.close().catch(() => undefined);
++        throw error;
++      }
++      try {
++        await sessionConnection.connect();
++      } catch (error) {
++        await registration?.close().catch(() => undefined);
++        await sessionConnection.close().catch(() => undefined);
++        throw error;
++      }
++
+       const pending: DeepSeekMuxEnvelope[] = [];
+       let session: DeepSeekHarnessSession | null = null;
+-      const unsubscribe = this.#connection.subscribe(sessionId, {
++      const unsubscribe = sessionConnection.subscribe(sessionId, {
+         onMux: (envelope) => (session ? session.onMux(envelope) : pending.push(envelope)),
+         onFault: (error) => session?.onFault(error),
+       });
+       try {
+         if (input.kind === "create") {
+           const created = unwrapRpc(
+-            await this.#connection.client.sessions.create({
++            await sessionConnection.client.sessions.create({
+               sessionId: sessionId as SessionId,
+               cwd,
+             }),
+@@ -1267,7 +1329,7 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+           }
+           if (requestedCreateModel) {
+             unwrapRpc(
+-              await this.#connection.client.sessions.selectModel({
++              await sessionConnection.client.sessions.selectModel({
+                 sessionId: sessionId as SessionId,
+                 provider: requestedCreateModel.provider,
+                 model: requestedCreateModel.model,
+@@ -1277,8 +1339,8 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+           }
+         }
+         const [entries, modelState] = await Promise.all([
+-          readAllDeepSeekHistory(this.#connection.client, sessionId as SessionId),
+-          this.#connection.client.sessions.models({ sessionId: sessionId as SessionId }),
++          readAllDeepSeekHistory(sessionConnection.client, sessionId as SessionId),
++          sessionConnection.client.sessions.models({ sessionId: sessionId as SessionId }),
+         ]);
+         const models = unwrapRpc(modelState, "session.models");
+         if (this.#allowedProviders && !this.#allowedProviders.has(models.current.provider)) {
+@@ -1296,7 +1358,7 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+           toolOutputLimit: this.#toolOutputLimit,
+         });
+         session = new DeepSeekHarnessSession({
+-          client: this.#connection.client,
++          client: sessionConnection.client,
+           model: projection.effectiveModel ?? model,
+           nativeSessionId: sessionId,
+           lastSeq: projection.lastSeq,
+@@ -1307,13 +1369,23 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
+           snapshot: projection.snapshot,
+           toolOutputLimit: this.#toolOutputLimit,
+           unsubscribe,
+-          onClosed: () => this.#sessions.delete(session as DeepSeekHarnessSession),
++          onClosed: () => {
++            this.#sessions.delete(session as DeepSeekHarnessSession);
++            void registration?.close().catch(() => undefined);
++            if (sessionConnection !== this.#connection) {
++              void sessionConnection.close().catch(() => undefined);
++            }
++          },
+         });
+         this.#sessions.add(session);
+         for (const envelope of pending) session.onMux(envelope);
+         return { ok: true, value: session };
+       } catch (error) {
+         unsubscribe();
++        await registration?.close().catch(() => undefined);
++        if (sessionConnection !== this.#connection) {
++          await sessionConnection.close().catch(() => undefined);
++        }
+         throw error;
+       }
+     } catch (error) {
+diff --git a/packages/adapters/deepseek-harness/src/model-catalog.ts b/packages/adapters/deepseek-harness/src/model-catalog.ts
+index 65789a0..ecae84c 100644
+--- a/packages/adapters/deepseek-harness/src/model-catalog.ts
++++ b/packages/adapters/deepseek-harness/src/model-catalog.ts
+@@ -70,7 +70,8 @@ export function normalizeDeepSeekModelCatalog(
+   const models = groups.flatMap((group) =>
+     group.models.map((model) => ({
+       ref: encodeDeepSeekHarnessModelRef({ provider: group.id, model: model.id }),
+-      label: `${group.name} / ${model.name}`,
++      // Fusion group 已由当前 Harness 上下文表达，重复展示会遮住真正的模型名称。
++      label: group.id === "everyone-in-codex" ? model.name : `${group.name} / ${model.name}`,
+       ...(model.description ? { description: model.description } : {}),
+     })),
+   );
+diff --git a/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts b/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts
+index 9c17b9e..2b9f24f 100644
+--- a/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts
++++ b/packages/adapters/deepseek-harness/test/deepseek-harness-adapter.test.ts
+@@ -24,7 +24,11 @@ import type {
+   DeepSeekHostSubscriber,
+   DeepSeekMuxEnvelope,
+ } from "../src/host-client.js";
+-import { encodeDeepSeekHarnessModelRef } from "../src/model-catalog.js";
++import {
++  decodeDeepSeekHarnessModelRef,
++  encodeDeepSeekHarnessModelRef,
++  normalizeDeepSeekModelCatalog,
++} from "../src/model-catalog.js";
+ import { projectToolResult } from "../src/projection.js";
+ 
+ const SESSION_ID = "session-native-1" as SessionId;
+@@ -43,6 +47,25 @@ const MODEL_GROUPS = [
+   },
+ ];
+ 
++it("shortens the Everyone in Codex group label without changing the Model Ref", () => {
++  const catalog = normalizeDeepSeekModelCatalog(
++    [
++      {
++        id: "everyone-in-codex",
++        name: "Everyone in Codex",
++        models: [{ id: "gpt-5.6-sol", name: "GPT-5.6 Sol" }],
++      },
++    ],
++    { provider: "everyone-in-codex", model: "gpt-5.6-sol" },
++  );
++
++  expect(catalog.models[0]?.label).toBe("GPT-5.6 Sol");
++  expect(decodeDeepSeekHarnessModelRef(catalog.models[0]!.ref)).toEqual({
++    provider: "everyone-in-codex",
++    model: "gpt-5.6-sol",
++  });
++});
++
+ function success<T>(value: T) {
+   return { rpcId: RpcId("response"), result: { ok: true as const, value } };
+ }
+@@ -226,8 +249,8 @@ describe("DeepSeekHarnessAdapter local Host", () => {
+       status: "ready",
+       catalog: {
+         models: [
+-          expect.objectContaining({ label: "Everyone in Codex / GLM-5.3-Flash" }),
+-          expect.objectContaining({ label: "Everyone in Codex / DeepSeek V4 Flash" }),
++          expect.objectContaining({ label: "GLM-5.3-Flash" }),
++          expect.objectContaining({ label: "DeepSeek V4 Flash" }),
+         ],
+       },
+     });
+diff --git a/packages/adapters/grok/src/acp-transport.ts b/packages/adapters/grok/src/acp-transport.ts
+index 7441132..d7db728 100644
+--- a/packages/adapters/grok/src/acp-transport.ts
++++ b/packages/adapters/grok/src/acp-transport.ts
+@@ -4,7 +4,10 @@ import os from "node:os";
+ import path from "node:path";
+ import { Readable, Writable } from "node:stream";
+ 
+-import { sanitizeDiagnosticTail } from "@codexhost/harness-adapter";
++import {
++  sanitizeDiagnosticTail,
++  type HarnessSessionRegistration,
++} from "@codexhost/harness-adapter";
+ import type { HarnessPermissionModeId } from "@codexhost/shared-contracts";
+ import {
+   ClientSideConnection,
+@@ -135,6 +138,7 @@ export interface GrokAcpTransportOptions {
+   commandTimeoutMs?: number;
+   closeTimeoutMs?: number;
+   onFault?: (error: GrokTransportError) => void;
++  sessionRegistration?: HarnessSessionRegistration;
+ }
+ 
+ export interface GrokForkOpenInput {
+@@ -924,10 +928,14 @@ export class GrokAcpTransport {
+         await waitForExit(child, this.#options.closeTimeoutMs);
+       }
+     }
+-    this.#closed = true;
+-    this.#closing = false;
+-    this.#activePrompt = null;
+-    this.#activeCompact = null;
++    try {
++      await this.#options.sessionRegistration?.close().catch(() => undefined);
++    } finally {
++      this.#closed = true;
++      this.#closing = false;
++      this.#activePrompt = null;
++      this.#activeCompact = null;
++    }
+   }
+ 
+   #handleUpdate(notification: SessionNotification): void {
+diff --git a/packages/adapters/grok/src/grok-adapter.ts b/packages/adapters/grok/src/grok-adapter.ts
+index 23e92f8..dcec0f6 100644
+--- a/packages/adapters/grok/src/grok-adapter.ts
++++ b/packages/adapters/grok/src/grok-adapter.ts
+@@ -8,6 +8,7 @@ import type {
+ } from "@agentclientprotocol/sdk";
+ import {
+   HarnessOutputChannel,
++  registerHarnessSession,
+   validateHostApprovalResponse,
+   type HarnessAdapter,
+   type HarnessCommandAccepted,
+@@ -1372,7 +1373,41 @@ export class GrokAdapter implements HarnessAdapter {
+       };
+     }
+     let session: GrokHarnessSession | null = null;
+-    const transport = this.#createTransport(cwd, (error) => session?.handleTransportFault(error));
++    let registration;
++    try {
++      const sessionEnvironment = this.#environment ?? process.env;
++      registration =
++        sessionEnvironment.EVERYONE_CODEX_GROK_BASE_URL &&
++        sessionEnvironment.EVERYONE_CODEX_GROK_LEASE_CAPABILITY
++          ? await registerHarnessSession({
++              environment: sessionEnvironment,
++              harnessId: "grok",
++              sessionId: `grok-${this.#dependencies.randomUUID()}`,
++              cwd,
++              workspaceRoots: [cwd],
++              permissionMode: requestedPermissionModeId,
++            })
++          : null;
++    } catch (error) {
++      return { ok: false, error: normalizeError(error, "unavailable") };
++    }
++    let transport: GrokAcpTransportLike;
++    try {
++      transport = this.#createTransport(
++        cwd,
++        (error) => session?.handleTransportFault(error),
++        registration
++          ? {
++              ...registration.environment,
++              EVERYONE_CODEX_GROK_LEASE_CAPABILITY: registration.sessionToken,
++            }
++          : undefined,
++        registration ?? undefined,
++      );
++    } catch (error) {
++      await registration?.close().catch(() => undefined);
++      return { ok: false, error: normalizeError(error, "unavailable") };
++    }
+     let sourceConfiguration:
+       | {
+           model: HarnessModelRef;
+@@ -1599,7 +1634,14 @@ export class GrokAdapter implements HarnessAdapter {
+   #createTransport(
+     cwd: string,
+     onFault: (error: GrokTransportError) => void,
++    environment?: NodeJS.ProcessEnv,
++    sessionRegistration?: GrokAcpTransportOptions["sessionRegistration"],
+   ): GrokAcpTransportLike {
+-    return this.#dependencies.createTransport({ cwd, onFault });
++    return this.#dependencies.createTransport({
++      cwd,
++      onFault,
++      ...(environment ? { environment } : {}),
++      ...(sessionRegistration ? { sessionRegistration } : {}),
++    });
+   }
+ }
+diff --git a/packages/adapters/omp/src/omp-model-catalog.ts b/packages/adapters/omp/src/omp-model-catalog.ts
+index d9cad5b..1a340f7 100644
+--- a/packages/adapters/omp/src/omp-model-catalog.ts
++++ b/packages/adapters/omp/src/omp-model-catalog.ts
+@@ -136,7 +136,9 @@ export function normalizeOmpModelCatalog(
+     byRef.set(ref.id, {
+       model: {
+         ref,
+-        label: `${native.provider} / ${native.id}`,
++        // 只缩短 Fusion 展示名；opaque Model Ref 仍保留完整 provider/model 身份。
++        label:
++          native.provider === "everyone-in-codex" ? native.id : `${native.provider} / ${native.id}`,
+       },
+       reasoning: native.reasoning,
+     });
+diff --git a/packages/adapters/omp/src/omp-rpc-session.ts b/packages/adapters/omp/src/omp-rpc-session.ts
+index 45ca612..fa5a4af 100644
+--- a/packages/adapters/omp/src/omp-rpc-session.ts
++++ b/packages/adapters/omp/src/omp-rpc-session.ts
+@@ -2,7 +2,13 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:chil
+ import { randomUUID } from "node:crypto";
+ import path from "node:path";
+ 
+-import { parseHostUsage, sanitizeDiagnosticTail, type HostUsage } from "@codexhost/harness-adapter";
++import {
++  parseHostUsage,
++  registerHarnessSession,
++  sanitizeDiagnosticTail,
++  type HarnessSessionRegistration,
++  type HostUsage,
++} from "@codexhost/harness-adapter";
+ import {
+   harnessThinkingOptionIdSchema,
+   jsonValueSchema,
+@@ -463,6 +469,7 @@ export class OmpRpcSession {
+   #compactionTimeout: NodeJS.Timeout | null = null;
+   #failed = false;
+   #pending = new Map<string, PendingCommand>();
++  #registration: HarnessSessionRegistration | null = null;
+   #state: OmpSessionState | null = null;
+   #latestCacheHitRatePercent: number | null | undefined;
+   #manualCompaction: ManualCompaction | null = null;
+@@ -504,13 +511,31 @@ export class OmpRpcSession {
+ 
+   async start(): Promise<this> {
+     if (this.#child || this.#closed) throw new Error("Omp RPC Session cannot be started twice");
++    const baseEnvironment: NodeJS.ProcessEnv = {
++      ...(this.#options.environment ?? process.env),
++      OMP_SKIP_VERSION_CHECK: "1",
++      OMP_TELEMETRY: "0",
++    };
++    this.#registration =
++      baseEnvironment.EVERYONE_CODEX_OMP_BASE_URL &&
++      baseEnvironment.EVERYONE_CODEX_OMP_LEASE_CAPABILITY
++        ? await registerHarnessSession({
++            environment: baseEnvironment,
++            harnessId: "omp",
++            sessionId: `omp-${randomUUID()}`,
++            cwd: this.#options.cwd,
++            workspaceRoots: [this.#options.cwd],
++            permissionMode: this.#options.readOnly ? "read-only" : "native",
++          })
++        : null;
+     const child = this.#processAdapter.spawn({
+       cwd: this.#options.cwd,
+       ...(this.#options.command ? { command: this.#options.command } : {}),
+       environment: withNodeRuntimeOnPath({
+-        ...(this.#options.environment ?? process.env),
+-        OMP_SKIP_VERSION_CHECK: "1",
+-        OMP_TELEMETRY: "0",
++        ...(this.#registration?.environment ?? baseEnvironment),
++        ...(this.#registration
++          ? { EVERYONE_CODEX_OMP_LEASE_CAPABILITY: this.#registration.sessionToken }
++          : {}),
+       }),
+       ...(this.#options.readOnly !== undefined ? { readOnly: this.#options.readOnly } : {}),
+       ...(this.#options.sessionFile ? { sessionFile: this.#options.sessionFile } : {}),
+@@ -860,7 +885,12 @@ export class OmpRpcSession {
+     if (this.#closed) return;
+     this.#closed = true;
+     this.#rejectAll(new Error("Omp RPC Session closed"));
+-    await this.#stopProcess();
++    try {
++      await this.#stopProcess();
++    } finally {
++      await this.#registration?.close().catch(() => undefined);
++      this.#registration = null;
++    }
+   }
+ 
+   async #stopProcess(): Promise<void> {
+diff --git a/packages/adapters/omp/test/omp-model-catalog.test.ts b/packages/adapters/omp/test/omp-model-catalog.test.ts
+new file mode 100644
+index 0000000..c97515c
+--- /dev/null
++++ b/packages/adapters/omp/test/omp-model-catalog.test.ts
+@@ -0,0 +1,21 @@
++import { harnessThinkingOptionIdSchema } from "@codexhost/shared-contracts";
++import { describe, expect, it } from "vitest";
++
++import { decodeOmpModelRef, normalizeOmpModelCatalog } from "../src/omp-model-catalog.js";
++
++describe("OMP Model Catalog normalization", () => {
++  it("shortens only Everyone in Codex labels without changing Model Refs", () => {
++    const catalog = normalizeOmpModelCatalog(
++      [{ provider: "everyone-in-codex", id: "gpt-5.6-sol", reasoning: true }],
++      { provider: "everyone-in-codex", id: "gpt-5.6-sol" },
++      [harnessThinkingOptionIdSchema.parse("high")],
++      harnessThinkingOptionIdSchema.parse("high"),
++    );
++
++    expect(catalog.models[0]?.label).toBe("gpt-5.6-sol");
++    expect(decodeOmpModelRef(catalog.models[0]!.ref)).toEqual({
++      provider: "everyone-in-codex",
++      id: "gpt-5.6-sol",
++    });
++  });
++});
+diff --git a/packages/adapters/pi/src/pi-model-catalog.ts b/packages/adapters/pi/src/pi-model-catalog.ts
+index 22772d7..6e4d9cb 100644
+--- a/packages/adapters/pi/src/pi-model-catalog.ts
++++ b/packages/adapters/pi/src/pi-model-catalog.ts
+@@ -136,7 +136,9 @@ export function normalizePiModelCatalog(
+     byRef.set(ref.id, {
+       model: {
+         ref,
+-        label: `${native.provider} / ${native.id}`,
++        // Fusion provider 的前缀没有区分价值，且会挤占模型选择器的可视宽度。
++        label:
++          native.provider === "everyone-in-codex" ? native.id : `${native.provider} / ${native.id}`,
+       },
+       reasoning: native.reasoning,
+     });
+diff --git a/packages/adapters/pi/src/pi-rpc-session.ts b/packages/adapters/pi/src/pi-rpc-session.ts
+index c89f146..c6e55aa 100644
+--- a/packages/adapters/pi/src/pi-rpc-session.ts
++++ b/packages/adapters/pi/src/pi-rpc-session.ts
+@@ -2,7 +2,13 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:chil
+ import { randomUUID } from "node:crypto";
+ import path from "node:path";
+ 
+-import { parseHostUsage, sanitizeDiagnosticTail, type HostUsage } from "@codexhost/harness-adapter";
++import {
++  parseHostUsage,
++  registerHarnessSession,
++  sanitizeDiagnosticTail,
++  type HarnessSessionRegistration,
++  type HostUsage,
++} from "@codexhost/harness-adapter";
+ import {
+   harnessThinkingOptionIdSchema,
+   jsonValueSchema,
+@@ -452,6 +458,7 @@ export class PiRpcSession {
+   #compactionTimeout: NodeJS.Timeout | null = null;
+   #failed = false;
+   #pending = new Map<string, PendingCommand>();
++  #registration: HarnessSessionRegistration | null = null;
+   #state: PiSessionState | null = null;
+   #latestCacheHitRatePercent: number | null | undefined;
+   #manualCompaction: ManualCompaction | null = null;
+@@ -488,13 +495,31 @@ export class PiRpcSession {
+ 
+   async start(): Promise<this> {
+     if (this.#child || this.#closed) throw new Error("Pi RPC Session cannot be started twice");
++    const baseEnvironment: NodeJS.ProcessEnv = {
++      ...(this.#options.environment ?? process.env),
++      PI_SKIP_VERSION_CHECK: "1",
++      PI_TELEMETRY: "0",
++    };
++    this.#registration =
++      baseEnvironment.EVERYONE_CODEX_PI_BASE_URL &&
++      baseEnvironment.EVERYONE_CODEX_PI_LEASE_CAPABILITY
++        ? await registerHarnessSession({
++            environment: baseEnvironment,
++            harnessId: "pi",
++            sessionId: `pi-${randomUUID()}`,
++            cwd: this.#options.cwd,
++            workspaceRoots: [this.#options.cwd],
++            permissionMode: "native",
++          })
++        : null;
+     const child = this.#processAdapter.spawn({
+       cwd: this.#options.cwd,
+       ...(this.#options.command ? { command: this.#options.command } : {}),
+       environment: withNodeRuntimeOnPath({
+-        ...(this.#options.environment ?? process.env),
+-        PI_SKIP_VERSION_CHECK: "1",
+-        PI_TELEMETRY: "0",
++        ...(this.#registration?.environment ?? baseEnvironment),
++        ...(this.#registration
++          ? { EVERYONE_CODEX_PI_LEASE_CAPABILITY: this.#registration.sessionToken }
++          : {}),
+       }),
+       ...(this.#options.sessionFile ? { sessionFile: this.#options.sessionFile } : {}),
+       ...(this.#options.forkSessionFile ? { forkSessionFile: this.#options.forkSessionFile } : {}),
+@@ -817,7 +842,12 @@ export class PiRpcSession {
+     if (this.#closed) return;
+     this.#closed = true;
+     this.#rejectAll(new Error("Pi RPC Session closed"));
+-    await this.#stopProcess();
++    try {
++      await this.#stopProcess();
++    } finally {
++      await this.#registration?.close().catch(() => undefined);
++      this.#registration = null;
++    }
+   }
+ 
+   async #stopProcess(): Promise<void> {
+diff --git a/packages/adapters/pi/test/pi-model-catalog.test.ts b/packages/adapters/pi/test/pi-model-catalog.test.ts
+index ecbc1f5..7996e22 100644
+--- a/packages/adapters/pi/test/pi-model-catalog.test.ts
++++ b/packages/adapters/pi/test/pi-model-catalog.test.ts
+@@ -50,6 +50,21 @@ describe("Pi Model Catalog normalization", () => {
+     expect(catalog.models[0]?.supportedThinkingOptionIds).toEqual(["off"]);
+   });
+ 
++  it("shortens only Everyone in Codex labels without changing Model Refs", () => {
++    const catalog = normalizePiModelCatalog(
++      [{ provider: "everyone-in-codex", id: "chatgpt-web/pro", reasoning: true }],
++      { provider: "everyone-in-codex", id: "chatgpt-web/pro" },
++      [harnessThinkingOptionIdSchema.parse("high")],
++      harnessThinkingOptionIdSchema.parse("high"),
++    );
++
++    expect(catalog.models[0]?.label).toBe("chatgpt-web/pro");
++    expect(decodePiModelRef(catalog.models[0]!.ref)).toEqual({
++      provider: "everyone-in-codex",
++      id: "chatgpt-web/pro",
++    });
++  });
++
+   it("normalizes only Pi-reported Thinking levels and keeps unknown labels Adapter-owned", () => {
+     expect(
+       normalizePiThinkingOptions([
+diff --git a/packages/harness-adapter/src/index.ts b/packages/harness-adapter/src/index.ts
+index fd2281c..b9d1cb6 100644
+--- a/packages/harness-adapter/src/index.ts
++++ b/packages/harness-adapter/src/index.ts
+@@ -7,6 +7,17 @@ export { sanitizeDiagnosticTail } from "./diagnostics.js";
+ export { validateHostQuestionResponse } from "./question.js";
+ export { parseHostUsage } from "./usage.js";
+ export type { HostUsage } from "./usage.js";
++export {
++  EVERYONE_CODEX_HOST_CONTROL_CAPABILITY_ENV,
++  EVERYONE_CODEX_HOST_CONTROL_URL_ENV,
++  EVERYONE_CODEX_SESSION_TOKEN_ENV,
++  registerHarnessSession,
++} from "./session-registration.js";
++export type {
++  HarnessSessionRegistration,
++  HarnessSessionRegistrationInput,
++  RoutedHarnessId,
++} from "./session-registration.js";
+ export type {
+   AutonomousTurnStartedEvent,
+   CreateSessionInput,
+diff --git a/packages/harness-adapter/src/session-registration.ts b/packages/harness-adapter/src/session-registration.ts
+new file mode 100644
+index 0000000..ad83b45
+--- /dev/null
++++ b/packages/harness-adapter/src/session-registration.ts
+@@ -0,0 +1,109 @@
++export const EVERYONE_CODEX_HOST_CONTROL_URL_ENV = "EVERYONE_CODEX_HOST_CONTROL_URL";
++export const EVERYONE_CODEX_HOST_CONTROL_CAPABILITY_ENV = "EVERYONE_CODEX_HOST_CONTROL_CAPABILITY";
++export const EVERYONE_CODEX_SESSION_TOKEN_ENV = "EVERYONE_CODEX_SESSION_TOKEN";
++
++export type RoutedHarnessId = "pi" | "omp" | "deepseek-harness" | "grok" | "claude-code";
++
++export interface HarnessSessionRegistrationInput {
++  environment: NodeJS.ProcessEnv;
++  harnessId: RoutedHarnessId;
++  sessionId: string;
++  cwd: string;
++  workspaceRoots?: readonly string[];
++  permissionMode: string;
++}
++
++export interface HarnessSessionRegistration {
++  sessionToken: string;
++  environment: NodeJS.ProcessEnv;
++  close(): Promise<void>;
++}
++
++function environmentValue(environment: NodeJS.ProcessEnv, name: string): string | undefined {
++  return Object.entries(environment).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
++}
++
++function controlEndpoint(raw: string): URL {
++  const url = new URL(raw);
++  if (
++    url.protocol !== "http:" ||
++    !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) ||
++    (url.pathname !== "/" && url.pathname !== "") ||
++    url.search ||
++    url.hash
++  ) {
++    throw new Error("Everyone in Codex Host control URL must be a loopback HTTP origin");
++  }
++  return url;
++}
++
++function nonBlank(value: unknown): value is string {
++  return typeof value === "string" && value.trim().length > 0;
++}
++
++/**
++ * 注册一个 Harness Session，并只把短期 token 下沉给该 Session 的客户端进程。
++ * 主项目拥有控制面；CodexHost overlay 只实现最小、可撤销的客户端边界。
++ */
++export async function registerHarnessSession(
++  input: HarnessSessionRegistrationInput,
++  fetcher: typeof fetch = fetch,
++): Promise<HarnessSessionRegistration | null> {
++  const rawUrl = environmentValue(input.environment, EVERYONE_CODEX_HOST_CONTROL_URL_ENV);
++  const capability = environmentValue(
++    input.environment,
++    EVERYONE_CODEX_HOST_CONTROL_CAPABILITY_ENV,
++  );
++  if (rawUrl === undefined && capability === undefined) return null;
++  if (!nonBlank(rawUrl) || !nonBlank(capability)) {
++    throw new Error("Everyone in Codex Host control configuration is incomplete");
++  }
++  const origin = controlEndpoint(rawUrl);
++  const endpoint = new URL("/v1/sessions", origin);
++  const response = await fetcher(endpoint, {
++    method: "POST",
++    headers: {
++      authorization: `Bearer ${capability}`,
++      "content-type": "application/json",
++    },
++    body: JSON.stringify({
++      harnessId: input.harnessId,
++      sessionId: input.sessionId,
++      cwd: input.cwd,
++      workspaceRoots: input.workspaceRoots ?? [input.cwd],
++      permissionMode: input.permissionMode,
++    }),
++  });
++  if (!response.ok) throw new Error("Everyone in Codex Session registration was rejected");
++  const sessionToken = response.headers.get("x-everyone-codex-session") ?? undefined;
++  if (!nonBlank(sessionToken)) {
++    throw new Error("Everyone in Codex Session registration returned no token");
++  }
++  const sessionEnvironment = { ...input.environment };
++  for (const key of Object.keys(sessionEnvironment)) {
++    if (
++      [EVERYONE_CODEX_HOST_CONTROL_URL_ENV, EVERYONE_CODEX_HOST_CONTROL_CAPABILITY_ENV].some(
++        (name) => name.toLowerCase() === key.toLowerCase(),
++      )
++    ) {
++      Reflect.deleteProperty(sessionEnvironment, key);
++    }
++  }
++  sessionEnvironment[EVERYONE_CODEX_SESSION_TOKEN_ENV] = sessionToken;
++
++  let closed = false;
++  return {
++    sessionToken,
++    environment: sessionEnvironment,
++    close: async () => {
++      if (closed) return;
++      closed = true;
++      const deletion = new URL(`/v1/sessions/${encodeURIComponent(sessionToken)}`, origin);
++      const deleted = await fetcher(deletion, {
++        method: "DELETE",
++        headers: { authorization: `Bearer ${capability}` },
++      });
++      if (!deleted.ok) throw new Error("Everyone in Codex Session revocation was rejected");
++    },
++  };
++}
+diff --git a/packages/harness-adapter/test/session-registration.test.ts b/packages/harness-adapter/test/session-registration.test.ts
+new file mode 100644
+index 0000000..dc1e4a4
+--- /dev/null
++++ b/packages/harness-adapter/test/session-registration.test.ts
+@@ -0,0 +1,61 @@
++import { describe, expect, it, vi } from "vitest";
++
++import {
++  EVERYONE_CODEX_SESSION_TOKEN_ENV,
++  registerHarnessSession,
++} from "../src/session-registration.js";
++
++describe("Harness Session registration", () => {
++  it("registers, projects only the Session token, and revokes exactly once", async () => {
++    const fetcher = vi
++      .fn<typeof fetch>()
++      .mockResolvedValueOnce(new Response("{}", {
++        headers: { "x-everyone-codex-session": "session-secret" },
++      }))
++      .mockResolvedValueOnce(new Response(null, { status: 204 }));
++    const registration = await registerHarnessSession(
++      {
++        environment: {
++          EVERYONE_CODEX_HOST_CONTROL_URL: "http://127.0.0.1:54321",
++          EVERYONE_CODEX_HOST_CONTROL_CAPABILITY: "host-secret",
++        },
++        harnessId: "pi",
++        sessionId: "session-1",
++        cwd: "C:\\workspace",
++        workspaceRoots: ["C:\\workspace"],
++        permissionMode: "default",
++      },
++      fetcher,
++    );
++
++    expect(registration?.environment[EVERYONE_CODEX_SESSION_TOKEN_ENV]).toBe("session-secret");
++    const post = fetcher.mock.calls[0];
++    expect(post?.[0].toString()).toBe("http://127.0.0.1:54321/v1/sessions");
++    expect(JSON.parse(String(post?.[1]?.body))).toEqual({
++      harnessId: "pi",
++      sessionId: "session-1",
++      cwd: "C:\\workspace",
++      workspaceRoots: ["C:\\workspace"],
++      permissionMode: "default",
++    });
++
++    await registration?.close();
++    await registration?.close();
++    expect(fetcher).toHaveBeenCalledTimes(2);
++    expect(fetcher.mock.calls[1]?.[0].toString()).toBe(
++      "http://127.0.0.1:54321/v1/sessions/session-secret",
++    );
++  });
++
++  it("is inert without a configured Host control pair", async () => {
++    await expect(
++      registerHarnessSession({
++        environment: {},
++        harnessId: "omp",
++        sessionId: "session-2",
++        cwd: "/workspace",
++        permissionMode: "read-only",
++      }),
++    ).resolves.toBeNull();
++  });
++});
+diff --git a/packages/harness-adapter/tsconfig.json b/packages/harness-adapter/tsconfig.json
+index a67d23f..8dbf23e 100644
+--- a/packages/harness-adapter/tsconfig.json
++++ b/packages/harness-adapter/tsconfig.json
+@@ -2,6 +2,7 @@
+   "extends": "../../tsconfig.base.json",
+   "compilerOptions": {
+     "composite": true,
++    "types": ["node"],
+     "rootDir": "src",
+     "outDir": "dist",
+     "tsBuildInfoFile": "dist/tsconfig.tsbuildinfo"
+diff --git a/packages/host-runtime/src/adapter-composition.ts b/packages/host-runtime/src/adapter-composition.ts
+index cf58833..f9e2b05 100644
+--- a/packages/host-runtime/src/adapter-composition.ts
++++ b/packages/host-runtime/src/adapter-composition.ts
+@@ -17,6 +17,19 @@ export const CODEXHOST_OMP_DATA_DIR_ENV = "CODEXHOST_OMP_DATA_DIR";
+ export const CODEXHOST_DSH_HOME_ENV = "CODEXHOST_DSH_HOME";
+ export const CODEXHOST_GROK_HOME_ENV = "CODEXHOST_GROK_HOME";
+ export const CODEXHOST_GROK_MODELS_JSON_ENV = "CODEXHOST_GROK_MODELS_JSON";
++export const CODEXHOST_FUSION_MODELS_JSON_ENV = "CODEXHOST_FUSION_MODELS_JSON";
++export const EVERYONE_CODEX_HOST_CONTROL_URL_ENV = "EVERYONE_CODEX_HOST_CONTROL_URL";
++export const EVERYONE_CODEX_HOST_CONTROL_CAPABILITY_ENV = "EVERYONE_CODEX_HOST_CONTROL_CAPABILITY";
++export const EVERYONE_CODEX_PI_BASE_URL_ENV = "EVERYONE_CODEX_PI_BASE_URL";
++export const EVERYONE_CODEX_PI_LEASE_CAPABILITY_ENV = "EVERYONE_CODEX_PI_LEASE_CAPABILITY";
++export const EVERYONE_CODEX_OMP_BASE_URL_ENV = "EVERYONE_CODEX_OMP_BASE_URL";
++export const EVERYONE_CODEX_OMP_LEASE_CAPABILITY_ENV = "EVERYONE_CODEX_OMP_LEASE_CAPABILITY";
++export const EVERYONE_CODEX_DSH_BASE_URL_ENV = "EVERYONE_CODEX_DSH_BASE_URL";
++export const EVERYONE_CODEX_DSH_LEASE_CAPABILITY_ENV = "EVERYONE_CODEX_DSH_LEASE_CAPABILITY";
++export const EVERYONE_CODEX_GROK_BASE_URL_ENV = "EVERYONE_CODEX_GROK_BASE_URL";
++export const EVERYONE_CODEX_GROK_LEASE_CAPABILITY_ENV = "EVERYONE_CODEX_GROK_LEASE_CAPABILITY";
++export const EVERYONE_CODEX_CLAUDE_BASE_URL_ENV = "EVERYONE_CODEX_CLAUDE_BASE_URL";
++export const EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY_ENV = "EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY";
+ export const EVERYONE_CODEX_LEASE_CAPABILITY_ENV = "EVERYONE_CODEX_LEASE_CAPABILITY";
+ export const EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV =
+   "EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY";
+@@ -28,6 +41,14 @@ const harnessDataDirectoryEnvironment = [
+   CODEXHOST_GROK_HOME_ENV,
+ ] as const;
+ 
++const routedHarnessEnvironment = {
++  pi: [EVERYONE_CODEX_PI_BASE_URL_ENV, EVERYONE_CODEX_PI_LEASE_CAPABILITY_ENV],
++  omp: [EVERYONE_CODEX_OMP_BASE_URL_ENV, EVERYONE_CODEX_OMP_LEASE_CAPABILITY_ENV],
++  "deepseek-harness": [EVERYONE_CODEX_DSH_BASE_URL_ENV, EVERYONE_CODEX_DSH_LEASE_CAPABILITY_ENV],
++  grok: [EVERYONE_CODEX_GROK_BASE_URL_ENV, EVERYONE_CODEX_GROK_LEASE_CAPABILITY_ENV],
++  "claude-code": [EVERYONE_CODEX_CLAUDE_BASE_URL_ENV, EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY_ENV],
++} satisfies Record<ExternalHarnessId, readonly [string, string]>;
++
+ type InspectableHarnessAdapter = Pick<HarnessAdapter, "inspect">;
+ 
+ function environmentValue(environment: NodeJS.ProcessEnv, name: string): string | undefined {
+@@ -118,6 +139,13 @@ export function externalHarnessEnvironment(
+   deleteEnvironmentValue(environment, EVERYONE_CODEX_LEASE_CAPABILITY_ENV);
+   for (const name of harnessDataDirectoryEnvironment) deleteEnvironmentValue(environment, name);
+   deleteEnvironmentValue(environment, CODEXHOST_GROK_MODELS_JSON_ENV);
++  if (harnessId !== "claude-code") {
++    deleteEnvironmentValue(environment, CODEXHOST_FUSION_MODELS_JSON_ENV);
++  }
++  for (const pair of Object.values(routedHarnessEnvironment)) {
++    if (pair === routedHarnessEnvironment[harnessId]) continue;
++    for (const name of pair) deleteEnvironmentValue(environment, name);
++  }
+ 
+   if (harnessId === "claude-code") {
+     deleteEnvironmentValue(environment, EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV);
+diff --git a/packages/host-runtime/src/index.ts b/packages/host-runtime/src/index.ts
+index e48ac0f..e123521 100644
+--- a/packages/host-runtime/src/index.ts
++++ b/packages/host-runtime/src/index.ts
+@@ -15,11 +15,24 @@ export {
+   CODEXHOST_DSH_HOME_ENV,
+   CODEXHOST_GROK_HOME_ENV,
+   CODEXHOST_GROK_MODELS_JSON_ENV,
++  CODEXHOST_FUSION_MODELS_JSON_ENV,
+   CODEXHOST_OMP_DATA_DIR_ENV,
+   CODEXHOST_PI_DATA_DIR_ENV,
+   DEEPSEEK_HARNESS_COMMAND_ENV,
+   DEEPSEEK_HARNESS_ENDPOINT_ENV,
+   EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV,
++  EVERYONE_CODEX_HOST_CONTROL_CAPABILITY_ENV,
++  EVERYONE_CODEX_HOST_CONTROL_URL_ENV,
++  EVERYONE_CODEX_PI_BASE_URL_ENV,
++  EVERYONE_CODEX_PI_LEASE_CAPABILITY_ENV,
++  EVERYONE_CODEX_OMP_BASE_URL_ENV,
++  EVERYONE_CODEX_OMP_LEASE_CAPABILITY_ENV,
++  EVERYONE_CODEX_DSH_BASE_URL_ENV,
++  EVERYONE_CODEX_DSH_LEASE_CAPABILITY_ENV,
++  EVERYONE_CODEX_GROK_BASE_URL_ENV,
++  EVERYONE_CODEX_GROK_LEASE_CAPABILITY_ENV,
++  EVERYONE_CODEX_CLAUDE_BASE_URL_ENV,
++  EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY_ENV,
+   EVERYONE_CODEX_LEASE_CAPABILITY_ENV,
+   GROK_COMMAND_ENV,
+   OMP_COMMAND_ENV,
+diff --git a/packages/host-runtime/test/adapter-composition.test.ts b/packages/host-runtime/test/adapter-composition.test.ts
+index af903cd..7d4d687 100644
+--- a/packages/host-runtime/test/adapter-composition.test.ts
++++ b/packages/host-runtime/test/adapter-composition.test.ts
+@@ -6,10 +6,19 @@ import {
+   CODEXHOST_DSH_HOME_ENV,
+   CODEXHOST_GROK_HOME_ENV,
+   CODEXHOST_GROK_MODELS_JSON_ENV,
++  CODEXHOST_FUSION_MODELS_JSON_ENV,
+   CODEXHOST_OMP_DATA_DIR_ENV,
+   CODEXHOST_PI_DATA_DIR_ENV,
+   EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV,
+   EVERYONE_CODEX_LEASE_CAPABILITY_ENV,
++  EVERYONE_CODEX_HOST_CONTROL_CAPABILITY_ENV,
++  EVERYONE_CODEX_HOST_CONTROL_URL_ENV,
++  EVERYONE_CODEX_PI_BASE_URL_ENV,
++  EVERYONE_CODEX_PI_LEASE_CAPABILITY_ENV,
++  EVERYONE_CODEX_OMP_BASE_URL_ENV,
++  EVERYONE_CODEX_OMP_LEASE_CAPABILITY_ENV,
++  EVERYONE_CODEX_CLAUDE_BASE_URL_ENV,
++  EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY_ENV,
+   GROK_COMMAND_ENV,
+   createExternalHarnessAdapters,
+   externalHarnessEnvironment,
+@@ -59,6 +68,17 @@ describe("Host external Harness composition", () => {
+       PATH: "/synthetic/bin",
+       [EVERYONE_CODEX_LEASE_CAPABILITY_ENV]: "codex-only-capability",
+       [EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV]: "external-only-capability",
++      [EVERYONE_CODEX_HOST_CONTROL_URL_ENV]: "http://127.0.0.1:54321",
++      [EVERYONE_CODEX_HOST_CONTROL_CAPABILITY_ENV]: "host-capability",
++      [EVERYONE_CODEX_PI_BASE_URL_ENV]: "http://127.0.0.1:54322/pi",
++      [EVERYONE_CODEX_PI_LEASE_CAPABILITY_ENV]: "pi-capability",
++      [EVERYONE_CODEX_OMP_BASE_URL_ENV]: "http://127.0.0.1:54322/omp",
++      [EVERYONE_CODEX_OMP_LEASE_CAPABILITY_ENV]: "omp-capability",
++      [EVERYONE_CODEX_CLAUDE_BASE_URL_ENV]: "http://127.0.0.1:54322/claude",
++      [EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY_ENV]: "claude-capability",
++      [CODEXHOST_FUSION_MODELS_JSON_ENV]: JSON.stringify([
++        { id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", reasoningLevels: ["max"] },
++      ]),
+       [CODEXHOST_PI_DATA_DIR_ENV]: "/fusion/pi",
+       [CODEXHOST_OMP_DATA_DIR_ENV]: "/fusion/omp",
+       [CODEXHOST_DSH_HOME_ENV]: "/fusion/dsh",
+@@ -84,10 +104,14 @@ describe("Host external Harness composition", () => {
+       PATH: "/synthetic/bin",
+       [EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV]: "external-only-capability",
+       PI_CODING_AGENT_DIR: "/fusion/pi",
++      [EVERYONE_CODEX_PI_BASE_URL_ENV]: "http://127.0.0.1:54322/pi",
++      [EVERYONE_CODEX_PI_LEASE_CAPABILITY_ENV]: "pi-capability",
+     });
+     expect(omp).toMatchObject({
+       [EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV]: "external-only-capability",
+       PI_CODING_AGENT_DIR: "/fusion/omp",
++      [EVERYONE_CODEX_OMP_BASE_URL_ENV]: "http://127.0.0.1:54322/omp",
++      [EVERYONE_CODEX_OMP_LEASE_CAPABILITY_ENV]: "omp-capability",
+     });
+     expect(pi.PI_CODING_AGENT_DIR).not.toBe(omp.PI_CODING_AGENT_DIR);
+     expect(deepSeek).toMatchObject({
+@@ -104,6 +128,20 @@ describe("Host external Harness composition", () => {
+     }
+     expect(claude).not.toHaveProperty(EVERYONE_CODEX_LEASE_CAPABILITY_ENV);
+     expect(claude).not.toHaveProperty(EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY_ENV);
++    expect(claude).toMatchObject({
++      [EVERYONE_CODEX_CLAUDE_BASE_URL_ENV]: "http://127.0.0.1:54322/claude",
++      [EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY_ENV]: "claude-capability",
++      [CODEXHOST_FUSION_MODELS_JSON_ENV]: source[CODEXHOST_FUSION_MODELS_JSON_ENV],
++    });
++    for (const environment of [pi, omp, deepSeek, grok, claude]) {
++      expect(environment).toMatchObject({
++        [EVERYONE_CODEX_HOST_CONTROL_URL_ENV]: "http://127.0.0.1:54321",
++        [EVERYONE_CODEX_HOST_CONTROL_CAPABILITY_ENV]: "host-capability",
++      });
++    }
++    expect(pi).not.toHaveProperty(EVERYONE_CODEX_OMP_LEASE_CAPABILITY_ENV);
++    expect(omp).not.toHaveProperty(EVERYONE_CODEX_PI_LEASE_CAPABILITY_ENV);
++    expect(claude).not.toHaveProperty(EVERYONE_CODEX_PI_LEASE_CAPABILITY_ENV);
+     for (const environment of [pi, omp, deepSeek, grok, claude]) {
+       expect(environment).not.toHaveProperty(CODEXHOST_PI_DATA_DIR_ENV);
+       expect(environment).not.toHaveProperty(CODEXHOST_OMP_DATA_DIR_ENV);
+@@ -111,6 +149,9 @@ describe("Host external Harness composition", () => {
+       expect(environment).not.toHaveProperty(CODEXHOST_GROK_HOME_ENV);
+       expect(environment).not.toHaveProperty(CODEXHOST_GROK_MODELS_JSON_ENV);
+     }
++    for (const environment of [pi, omp, deepSeek, grok]) {
++      expect(environment).not.toHaveProperty(CODEXHOST_FUSION_MODELS_JSON_ENV);
++    }
+   });
+ 
+   it("preserves an explicit user-installed Grok command", async () => {

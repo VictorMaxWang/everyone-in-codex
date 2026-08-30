@@ -10,8 +10,15 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 
-const EXTERNAL_CAPABILITY_ENV = "EVERYONE_CODEX_EXTERNAL_LEASE_CAPABILITY";
-const REASONING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const CAPABILITY_ENV_BY_HARNESS = Object.freeze({
+  pi: "EVERYONE_CODEX_PI_LEASE_CAPABILITY",
+  omp: "EVERYONE_CODEX_OMP_LEASE_CAPABILITY",
+  "deepseek-harness": "EVERYONE_CODEX_DSH_LEASE_CAPABILITY",
+  grok: "EVERYONE_CODEX_GROK_LEASE_CAPABILITY",
+});
+const REASONING_LEVELS = new Set([
+  "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+]);
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -50,6 +57,22 @@ function normalizeGatewayBaseUrl(value) {
   return url.href.replace(/\/$/, "");
 }
 
+function normalizeGatewayBaseUrls(values) {
+  if (!values || typeof values !== "object" || Array.isArray(values)) {
+    throw new Error("external_gateway_urls_invalid");
+  }
+  try {
+    return Object.freeze(Object.fromEntries(
+      Object.keys(CAPABILITY_ENV_BY_HARNESS).map((harnessId) => [
+        harnessId,
+        normalizeGatewayBaseUrl(values[harnessId]),
+      ]),
+    ));
+  } catch {
+    throw new Error("external_gateway_urls_invalid");
+  }
+}
+
 function normalizeModels(models) {
   if (!Array.isArray(models) || models.length === 0) {
     throw new Error("external_catalog_models_invalid");
@@ -57,7 +80,7 @@ function normalizeModels(models) {
   const seen = new Set();
   return models.map((model) => {
     const id = String(model?.id ?? "").trim();
-    if (!id || seen.has(id) || id.startsWith("chatgpt-web/")) {
+    if (!id || seen.has(id)) {
       throw new Error("external_catalog_models_invalid");
     }
     seen.add(id);
@@ -76,12 +99,16 @@ function normalizeModels(models) {
         ))
         .filter((entry) => REASONING_LEVELS.has(entry))
       : [];
+    // 外部 Harness 统一只暴露到 max；Gateway 再按目标模型把 Pro 的 max 映射回 ultra。
+    const projectedReasoningLevels = [...new Set(
+      reasoningLevels.map((level) => (level === "ultra" ? "max" : level)),
+    )];
     return Object.freeze({
       id,
       displayName: String(model.display_name ?? model.name ?? id),
       ...(Number.isInteger(contextWindow) && contextWindow > 0 ? { contextWindow } : {}),
       inputModalities: inputModalities.length > 0 ? inputModalities : ["text"],
-      reasoningLevels: [...new Set(reasoningLevels)],
+      reasoningLevels: projectedReasoningLevels,
     });
   });
 }
@@ -91,6 +118,13 @@ function jsonModel(model) {
     id: model.id,
     name: model.displayName,
     reasoning: model.reasoningLevels.length > 0,
+    ...(model.reasoningLevels.length > 0
+      ? {
+        thinkingLevelMap: Object.fromEntries(
+          model.reasoningLevels.map((level) => [level, level]),
+        ),
+      }
+      : {}),
     input: model.inputModalities,
     ...(model.contextWindow ? { contextWindow: model.contextWindow } : {}),
   };
@@ -102,7 +136,7 @@ function renderPi(baseUrl, models) {
       "everyone-in-codex": {
         baseUrl,
         api: "openai-responses",
-        apiKey: `$${EXTERNAL_CAPABILITY_ENV}`,
+        apiKey: `$${CAPABILITY_ENV_BY_HARNESS.pi}`,
         authHeader: true,
         models: models.map(jsonModel),
       },
@@ -115,6 +149,14 @@ function yamlModelLines(models, indentation = "      ") {
     `${indentation}- id: ${JSON.stringify(model.id)}`,
     `${indentation}  name: ${JSON.stringify(model.displayName)}`,
     `${indentation}  reasoning: ${model.reasoningLevels.length > 0}`,
+    ...(model.reasoningLevels.length > 0
+      ? [
+        `${indentation}  thinkingLevelMap:`,
+        ...model.reasoningLevels.map((level) => (
+          `${indentation}    ${level}: ${level}`
+        )),
+      ]
+      : []),
     `${indentation}  input: [${model.inputModalities.map(JSON.stringify).join(", ")}]`,
     ...(model.contextWindow
       ? [`${indentation}  contextWindow: ${model.contextWindow}`]
@@ -128,7 +170,7 @@ function renderOmp(baseUrl, models) {
     "  everyone-in-codex:",
     `    baseUrl: ${JSON.stringify(baseUrl)}`,
     "    api: openai-responses",
-    `    apiKey: ${EXTERNAL_CAPABILITY_ENV}`,
+    `    apiKey: ${CAPABILITY_ENV_BY_HARNESS.omp}`,
     "    authHeader: true",
     "    models:",
     ...yamlModelLines(models),
@@ -155,7 +197,7 @@ function renderDsh(baseUrl, models) {
     "  providers:",
     "    everyone-in-codex:",
     '      displayName: "Everyone in Codex"',
-    `      apiKeyEnv: ${EXTERNAL_CAPABILITY_ENV}`,
+    `      apiKeyEnv: ${CAPABILITY_ENV_BY_HARNESS["deepseek-harness"]}`,
     "      api: openai-responses",
     `      baseURL: ${JSON.stringify(baseUrl)}`,
     "      models:",
@@ -183,7 +225,7 @@ function renderGrok(baseUrl, models) {
       `model = ${tomlString(model.id)}`,
       `base_url = ${tomlString(baseUrl)}`,
       `name = ${tomlString(model.displayName)}`,
-      `env_key = ${tomlString(EXTERNAL_CAPABILITY_ENV)}`,
+      `env_key = ${tomlString(CAPABILITY_ENV_BY_HARNESS.grok)}`,
       'api_backend = "responses"',
       'extra_headers = { "x-everyone-codex-harness" = "grok" }',
       ...(model.contextWindow ? [`context_window = ${model.contextWindow}`] : []),
@@ -272,13 +314,13 @@ export async function reserveLoopbackPort() {
  */
 export async function publishHarnessConfigs({
   root,
-  gatewayBaseUrl,
+  gatewayBaseUrls,
   models,
   loopbackPortAllocator = reserveLoopbackPort,
 } = {}) {
   const safeRoot = await assertDirectoryChainSafe(root);
   const normalizedModels = normalizeModels(models);
-  const baseUrl = normalizeGatewayBaseUrl(gatewayBaseUrl);
+  const baseUrls = normalizeGatewayBaseUrls(gatewayBaseUrls);
   if (typeof loopbackPortAllocator !== "function") {
     throw new Error("loopback_port_allocator_invalid");
   }
@@ -297,19 +339,19 @@ export async function publishHarnessConfigs({
   try {
     files.push(await writeManagedFile(
       path.join(directories.pi, "models.json"),
-      renderPi(baseUrl, normalizedModels),
+      renderPi(baseUrls.pi, normalizedModels),
     ));
     files.push(await writeManagedFile(
       path.join(directories.omp, "models.yml"),
-      renderOmp(baseUrl, normalizedModels),
+      renderOmp(baseUrls.omp, normalizedModels),
     ));
     files.push(await writeManagedFile(
       path.join(directories.dsh, "settings.yaml"),
-      renderDsh(baseUrl, normalizedModels),
+      renderDsh(baseUrls["deepseek-harness"], normalizedModels),
     ));
     files.push(await writeManagedFile(
       path.join(directories.grok, "config.toml"),
-      renderGrok(baseUrl, normalizedModels),
+      renderGrok(baseUrls.grok, normalizedModels),
     ));
   } catch (error) {
     await restoreHarnessConfigs(

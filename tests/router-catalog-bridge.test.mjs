@@ -27,6 +27,53 @@ const WEBGPT_MODEL_IDS = [
   "chatgpt-web/pro",
 ];
 
+const NATIVE_MODEL_IDS = [
+  "gpt-5.6-sol",
+  "gpt-5.6-sol-1m",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-daybreak-blue-latest",
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-5.2",
+];
+
+function nativeCatalogFixture() {
+  const baseModels = NATIVE_MODEL_IDS.filter((id) => id !== "gpt-5.6-sol-1m");
+  return {
+    models: [
+      ...baseModels.map((slug, priority) => ({
+        slug,
+        display_name: slug,
+        context_window: 256_000,
+        priority,
+        visibility: "list",
+        supported_in_api: true,
+        live: true,
+      })),
+      {
+        slug: "gpt-5.3-codex-spark",
+        visibility: "list",
+        supported_in_api: false,
+        live: true,
+      },
+      {
+        slug: "gpt-daybreak-red-latest",
+        visibility: "hide",
+        supported_in_api: true,
+        live: true,
+      },
+      {
+        slug: "gpt-reserve",
+        visibility: "list",
+        supported_in_api: true,
+        live: false,
+      },
+    ],
+  };
+}
+
 async function withCatalogFiles(run) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "everyone-catalog-"));
   const mergedModelsPath = path.join(directory, "merged-models.json");
@@ -48,7 +95,7 @@ async function withCatalogFiles(run) {
   }
 }
 
-test("目录桥接只向 consumer 发布当前可见且可路由的兼容模型", async () => {
+test("目录桥接向所有 consumer 发布 10 API、5 WebGPT 和 9 个 Codex 2 原生模型", async () => {
   await withCatalogFiles(async ({ mergedModelsPath, modelPickerPath, models }) => {
     const liveIds = models
       .map((model) => model.id)
@@ -57,6 +104,7 @@ test("目录桥接只向 consumer 发布当前可见且可路由的兼容模型"
       mergedModelsPath,
       modelPickerPath,
       routerModelsUrl: "http://127.0.0.1:4202/v1/models",
+      nativeCatalog: nativeCatalogFixture(),
       fetchImpl: async () => new Response(JSON.stringify({ data: liveIds.map((id) => ({ id })) })),
     });
 
@@ -66,10 +114,49 @@ test("目录桥接只向 consumer 发布当前可见且可路由的兼容模型"
     assert.deepEqual(codexLease.models.map((model) => model.id), [
       ...API_MODEL_IDS,
       ...WEBGPT_MODEL_IDS,
+      ...NATIVE_MODEL_IDS,
     ]);
-    assert.deepEqual(harnessLease.models.map((model) => model.id), API_MODEL_IDS);
-    assert.equal(codexLease.models.some((model) => model.id === "gpt-5.6-sol-1m"), false);
+    assert.deepEqual(harnessLease.models.map((model) => model.id), [
+      ...API_MODEL_IDS,
+      ...WEBGPT_MODEL_IDS,
+      ...NATIVE_MODEL_IDS,
+    ]);
+    assert.equal(codexLease.models.length, 24);
+    assert.equal(harnessLease.models.length, 24);
+    assert.deepEqual(
+      harnessLease.models.map((model) => model.source),
+      [
+        ...API_MODEL_IDS.map(() => "router-provider"),
+        ...WEBGPT_MODEL_IDS.map(() => "webgpt"),
+        ...NATIVE_MODEL_IDS.map(() => "native-openai"),
+      ],
+    );
     assert.equal(codexLease.models.some((model) => model.id === "hidden/provider-model"), false);
+    assert.equal(codexLease.models.some((model) => model.id === "gpt-5.3-codex-spark"), false);
+  });
+});
+
+test("API 和 WebGPT 仍必须同时存在于 picker、merged 和 Router live 目录", async () => {
+  await withCatalogFiles(async ({ mergedModelsPath, modelPickerPath, models }) => {
+    const bridge = new RouterCatalogBridge({
+      mergedModelsPath,
+      modelPickerPath,
+      routerModelsUrl: "http://127.0.0.1:4202/v1/models",
+      nativeCatalog: nativeCatalogFixture(),
+      fetchImpl: async () => new Response(JSON.stringify({
+        data: models
+          .map((model) => model.id)
+          .filter((id) => id !== WEBGPT_MODEL_IDS[0])
+          .map((id) => ({ id })),
+      })),
+    });
+
+    const lease = await bridge.activate({ target: "external", harnessId: "grok" });
+
+    assert.equal(lease.allowedModelIds.includes(WEBGPT_MODEL_IDS[0]), false);
+    assert.equal(lease.allowedModelIds.includes(WEBGPT_MODEL_IDS[1]), true);
+    assert.equal(lease.allowedModelIds.includes("offline/provider-model"), false);
+    assert.equal(lease.allowedModelIds.includes("hidden/provider-model"), false);
   });
 });
 

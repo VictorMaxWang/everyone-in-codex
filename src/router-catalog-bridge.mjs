@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { selectCodex2NativeModels } from "./codex2-native-catalog.mjs";
 
 const DEFAULT_STABILITY_ATTEMPTS = 3;
 
@@ -45,13 +46,12 @@ function extractVisible(document) {
     .filter(Boolean);
 }
 
-function isNativeOpenAiModel(id) {
-  // Provider 前缀是外部路由身份的一部分；只排除没有 Provider 的原生 GPT 条目。
-  return !id.includes("/") && /^(?:gpt|o\d|chatgpt)-/i.test(id);
-}
-
 function isWebGptModel(id) {
   return id.startsWith("chatgpt-web/");
+}
+
+function isNativeOpenAiModel(id) {
+  return !id.includes("/") && /^(?:gpt|o\d|chatgpt)-/i.test(id);
 }
 
 function revisionFor(...texts) {
@@ -66,6 +66,7 @@ export class RouterCatalogBridge {
     fetchImpl = globalThis.fetch,
     readTextFile = (filePath) => readFile(filePath, "utf8"),
     stabilityAttempts = DEFAULT_STABILITY_ATTEMPTS,
+    nativeCatalog = null,
   }) {
     if (!mergedModelsPath || !modelPickerPath || !routerModelsUrl) {
       throw new TypeError("mergedModelsPath, modelPickerPath and routerModelsUrl are required");
@@ -80,6 +81,8 @@ export class RouterCatalogBridge {
     this.fetchImpl = fetchImpl;
     this.readTextFile = readTextFile;
     this.stabilityAttempts = Math.max(1, Number(stabilityAttempts) || DEFAULT_STABILITY_ATTEMPTS);
+    // 原生目录由 Codex 2 调用方显式注入，桥接层不自行寻找任何 Profile。
+    this.nativeCatalog = nativeCatalog;
   }
 
   async activate(target) {
@@ -105,20 +108,28 @@ export class RouterCatalogBridge {
     const liveModels = extractModels(await response.json());
     const liveIds = new Set(liveModels.map((model) => model.id));
     const byId = new Map(extractModels(snapshot.merged).map((model) => [model.id, model]));
-    const models = extractVisible(snapshot.picker)
+    const routedModels = extractVisible(snapshot.picker)
       .filter((id) => liveIds.has(id) && byId.has(id))
+      // 原生条目只信任 Codex 2 独立目录，不能被 Router picker 旁路注入。
       .filter((id) => !isNativeOpenAiModel(id))
-      .filter((id) => kind === "codex" || !isWebGptModel(id))
-      .map((id) => Object.freeze({ ...byId.get(id) }));
+      .map((id) => Object.freeze({
+        ...byId.get(id),
+        source: isWebGptModel(id) ? "webgpt" : "router-provider",
+      }));
+    const nativeModels = this.nativeCatalog
+      ? selectCodex2NativeModels(this.nativeCatalog)
+      : [];
+    const models = Object.freeze([...routedModels, ...nativeModels]);
+    const catalogRevision = revisionFor(snapshot.revision, JSON.stringify(nativeModels));
 
     return Object.freeze({
       consumer: Object.freeze({
         kind,
         ...(typeof target?.harnessId === "string" ? { harnessId: target.harnessId } : {}),
       }),
-      models: Object.freeze(models),
+      models,
       allowedModelIds: Object.freeze(models.map((model) => model.id)),
-      catalogRevision: snapshot.revision,
+      catalogRevision,
     });
   }
 

@@ -3,6 +3,7 @@
 import { pathToFileURL } from "node:url";
 
 import { FusionGateway } from "./fusion-gateway.mjs";
+import { parseCodex2AuthJson } from "./codex2-native-catalog.mjs";
 import {
   readFusionConfig,
   readRouterCallerSecret,
@@ -46,13 +47,21 @@ async function readCatalog(catalogPath, expectedTarget) {
     || parsed.target !== expectedTarget
     || typeof parsed.catalogRevision !== "string"
     || !Array.isArray(parsed.models)
-    || (expectedTarget === "external" && parsed.models.some((model) => (
-      typeof model?.id !== "string" || model.id.startsWith("chatgpt-web/")
-    )))
+    || parsed.models.some((model) => typeof model?.id !== "string")
   ) {
     throw new Error("catalog_snapshot_invalid");
   }
   return parsed;
+}
+
+async function readCodex2NativeSession(config) {
+  const authPath = path.join(config.profile.codexHome, "auth.json");
+  const info = await lstat(authPath);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error("codex2_auth_invalid");
+  const session = parseCodex2AuthJson(await readFile(authPath, "utf8"));
+  // API-key 模式只有显式绑定官方端点时才可用；自定义 Provider key 绝不能外送。
+  if (session.kind === "api-key" && !config.nativeOpenAi?.apiBaseUrl) return null;
+  return session;
 }
 
 /**
@@ -66,6 +75,7 @@ export async function startGatewayDaemonService({
   pid = process.pid,
   send = (value) => process.send?.(value),
   gatewayFactory = (options) => new FusionGateway(options),
+  nativeFetch = globalThis.fetch,
 } = {}) {
   if (!LEASE_ID_PATTERN.test(leaseId ?? "") || typeof send !== "function") {
     throw new Error("gateway_daemon_invalid_arguments");
@@ -77,10 +87,26 @@ export async function startGatewayDaemonService({
   ]);
   const callerSecret = await readRouterCallerSecret(config.router.stateDir);
   const routerBaseUrl = routerCapabilityBaseUrl(config, callerSecret);
+  const gateway = gatewayFactory({
+    routerBaseUrl,
+    nativeOpenAiBaseUrl: config.nativeOpenAi?.apiBaseUrl ?? null,
+    nativeFetch,
+    nativeOpenAiSessionProvider: async () => {
+      try {
+        return await readCodex2NativeSession(config);
+      } catch {
+        return null;
+      }
+    },
+  });
   const leases = [];
-  const startIsolatedLease = async (target, catalog) => {
-    const gateway = gatewayFactory({ routerBaseUrl }, target);
-    const lease = await gateway.start({ models: catalog.models });
+  const startIsolatedLease = async (consumerId, catalog, protocol = "openai-responses") => {
+    const lease = await gateway.start({
+      models: catalog.models,
+      consumerId,
+      harnessId: consumerId,
+      protocol,
+    });
     leases.push(lease);
     const authorization = lease.authorizationHeaders().authorization;
     const match = /^Bearer (\S+)$/.exec(authorization);
@@ -90,19 +116,36 @@ export async function startGatewayDaemonService({
       capability: match[1],
       modelCount: lease.models.length,
       catalogRevision: catalog.catalogRevision,
+      protocol,
     };
   };
 
   try {
     // 两份 allowlist 必须由两个独立 capability 保护，不得复用同一 lease。
     const codex = await startIsolatedLease("codex", codexCatalog);
-    const external = await startIsolatedLease("external", externalCatalog);
+    const harnesses = {};
+    // 顺序启动保证任一后继失败时 catch 已持有并可关闭此前的全部 server。
+    for (const harnessId of ["pi", "omp", "deepseek-harness", "grok"]) {
+      harnesses[harnessId] = await startIsolatedLease(harnessId, externalCatalog);
+    }
+    harnesses["claude-code"] = await startIsolatedLease(
+      "claude-code",
+      externalCatalog,
+      "anthropic-messages",
+    );
+    const controlHeaders = leases[1]?.controlAuthorizationHeaders?.();
+    const controlMatch = /^Bearer (\S+)$/.exec(controlHeaders?.authorization ?? "");
+    if (!controlMatch) throw new Error("gateway_host_capability_invalid");
     send({
       type: "ready",
       leaseId,
       pid,
       codex,
-      external,
+      harnesses,
+      control: {
+        baseUrl: harnesses.pi.baseUrl,
+        capability: controlMatch[1],
+      },
     });
   } catch (error) {
     await Promise.allSettled(leases.map((lease) => lease.close()));
