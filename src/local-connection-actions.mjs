@@ -43,16 +43,33 @@ export function createSecurePromptAction({
   };
 }
 
-export function createInteractiveLoginAction({ spawnImpl = spawn, sourceEnvironment = process.env } = {}) {
+export function createInteractiveLoginAction({
+  spawnImpl = spawn,
+  sourceEnvironment = process.env,
+  powershellExecutable = "pwsh.exe",
+  launcherScript = path.join(MODULE_ROOT, "src", "start-interactive-login.ps1"),
+} = {}) {
   return async (plan) => {
     if (typeof plan?.command !== "string" || !plan.command) {
       return Object.freeze({ state: "waiting-user", message: "Open the owner login flow" });
     }
-    const child = spawnImpl(plan.command, Array.isArray(plan.args) ? plan.args : [], {
-      cwd: typeof plan.cwd === "string" ? plan.cwd : undefined,
-      env: { ...sourceEnvironment, ...(plan.environment ?? {}) },
+    const encodedPlan = Buffer.from(JSON.stringify({
+      command: plan.command,
+      args: Array.isArray(plan.args) ? plan.args : [],
+      ...(typeof plan.cwd === "string" ? { cwd: plan.cwd } : {}),
+      ...(plan.environment ? { environment: plan.environment } : {}),
+    }), "utf8").toString("base64");
+    const child = spawnImpl(powershellExecutable, [
+      "-NoLogo",
+      "-NoProfile",
+      "-File",
+      launcherScript,
+      "-PlanBase64",
+      encodedPlan,
+    ], {
+      env: sourceEnvironment,
       detached: true,
-      windowsHide: false,
+      windowsHide: true,
       stdio: "ignore",
     });
     child.once("error", () => {});

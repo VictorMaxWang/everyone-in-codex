@@ -36,11 +36,13 @@ The project deliberately keeps three responsibilities separate:
 
 ## Native previews and Connections
 
-- Pi, OMP, DeepSeek Harness, Grok and Claude Code project commands, tools, approvals, output and
-  file changes into the same Codex `HostItem` lifecycle. Reopened history uses the same categories.
-- Path-like write tools receive an approval-time local Diff only when the input is unambiguous and
-  remains inside the workspace. The baseline is revalidated before approval; actual Diff mismatch
-  stops the Turn with a protocol error.
+- Pi, OMP, Grok and Claude Code expose their supported command catalogs; all five Harnesses project
+  tools, approvals, output and file changes into the same Codex `HostItem` lifecycle. DeepSeek
+  Harness command listing remains unavailable until its host API exposes list/execute methods.
+- Claude, Grok and DeepSeek Harness path writes receive an approval-time local Diff when their
+  protocols expose structured arguments early enough. Pi exposes those arguments only at
+  `tool.started`, so it shows the Diff then and never fabricates an earlier approval; OMP stays
+  read-only. Every available approval baseline is revalidated, and actual Diff mismatch stops the Turn.
 - The CodexHost settings page contains one Connections center for Router providers, custom APIs,
   Codex 2, WebGPT and each Harness identity. Custom APIs support OpenAI Responses, OpenAI Chat
   Completions and Anthropic Messages, with multiple model IDs per connection.
@@ -56,6 +58,7 @@ everyone-codex harness adopt|install|login|list|remove
 everyone-codex models sync
 everyone-codex setup
 everyone-codex connections add|list|login|remove|apply
+everyone-codex connections prepare-router --backup-directory <absolute-empty-path>
 everyone-codex launch
 everyone-codex restore
 ```
@@ -67,3 +70,7 @@ For a local or portable setup, copy the two templates in `config/` to
 placeholder with the exact Codex 2, Router and Desktop paths. All four Codex 2
 paths must be explicitly allowlisted; any symlink or Windows reparse ancestor is
 rejected before a process starts.
+
+The bundled Router patch is never applied to an unknown checkout. `connections prepare-router`
+accepts only the exact locked pre-v0.3 cohort, copies its managed source files to the explicitly
+provided backup directory, runs `git apply --check`, applies once, and verifies every patched file.

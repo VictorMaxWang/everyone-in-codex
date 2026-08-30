@@ -333,6 +333,10 @@ export class FusionController {
     return requireBoundary(this.connections, "submitSecret", "ConnectionHub")(input);
   }
 
+  async prepareConnectionRouter(input) {
+    return requireBoundary(this.connections, "prepareRouter", "ConnectionHub")(input);
+  }
+
   async openConnections() {
     return requireBoundary(this.connections, "open", "ConnectionHub")();
   }

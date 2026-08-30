@@ -30,5 +30,17 @@
     "src/support-bundle.mjs": "b4bccfb89ea4ce0595d05459dba2e8ce2ca1419d3c38cc98938d4c8555130296",
     "test/custom-connections-control.test.mjs": "4b4174f49ce7da7b48a1bb9e776ea7d43dba5140a4b1519270891c250a1ce318",
     "test/custom-connections.test.mjs": "cbea88f20e8f1ca954af54b1f9d3bcd7cb12503694c5efbb54b74a4dcc4797fb"
+  },
+  "baselineFileSha256": {
+    "codex-router.ps1": "100e1b3b62c86dee5d2c6b853dc567f4cff9334150fdf36ef8e8ec5420a288c9",
+    "bin/connections": null,
+    "src/api-forwarder.mjs": "938dfd21fb436dfd2ca63f41fc2dbe7272e4d791988cd062683e70717a0e2831",
+    "src/control.mjs": "ba39969920994c71a708fac0cf556e4e1df89a43593ded5dcb0634f79d9b3271",
+    "src/custom-connections.mjs": null,
+    "src/model-registry.mjs": "6463e73c342c1ab38281c0538b37b5785610683923033e22ca6c9818b3ad97bd",
+    "src/paths.mjs": "5ed6e07fd37f857cb613d1084053dc3d115670148438e28c45b49c5ffeb9019d",
+    "src/support-bundle.mjs": "ed837ed57992ddf5b016079bcd838837615e4b2b4c5e0f4e83e20f2e89fc8065",
+    "test/custom-connections-control.test.mjs": null,
+    "test/custom-connections.test.mjs": null
   }
 }

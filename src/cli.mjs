@@ -139,6 +139,11 @@ export function parseCli(argv) {
   if (group === "connections") {
     if (action === "list" && argv.length === 2) return { command: "connections.list" };
     if (action === "apply" && argv.length === 2) return { command: "connections.apply" };
+    if (action === "prepare-router") {
+      const options = parseOptions(argv.slice(2), { "--backup-directory": "backupDirectory" });
+      requireFields(options, ["backupDirectory"], "connections prepare-router");
+      return { command: "connections.prepare-router", backupDirectory: options.backupDirectory };
+    }
     if (action === "login" && subject && argv.length === 3) {
       return { command: "connections.login", target: subject };
     }
@@ -170,7 +175,7 @@ export function parseCli(argv) {
         },
       };
     }
-    usage("connections add|apply|list|login|remove");
+    usage("connections add|apply|list|login|prepare-router|remove");
   }
 
   throw new Error(`未知命令 ${group}`);
@@ -221,6 +226,8 @@ async function dispatch(parsed, controller) {
       return controller.removeConnection(parsed.id);
     case "connections.apply":
       return controller.applyConnections();
+    case "connections.prepare-router":
+      return controller.prepareConnectionRouter({ backupDirectory: parsed.backupDirectory });
     case "launch":
       return controller.launch();
     case "restore":

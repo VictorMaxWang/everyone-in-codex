@@ -68,6 +68,10 @@ test("CLI 将受支持命令解析为稳定的 Controller 调用参数", () => {
   });
   assert.deepEqual(parseCli(["connections", "apply"]), { command: "connections.apply" });
   assert.deepEqual(
+    parseCli(["connections", "prepare-router", "--backup-directory", "D:\\Backup\\router"]),
+    { command: "connections.prepare-router", backupDirectory: "D:\\Backup\\router" },
+  );
+  assert.deepEqual(
     parseCli([
       "connections",
       "add",

@@ -6,6 +6,7 @@ import { createLocalConnectionHub } from "./local-connection-hub.mjs";
 import { createSecurePromptAction } from "./local-connection-actions.mjs";
 import { readFusionConfig } from "./local-runtime.mjs";
 import { verifyRouterOverlay } from "./router-overlay-verifier.mjs";
+import { prepareRouterOverlay } from "./router-overlay-installer.mjs";
 import {
   RouterConnectionAdapter,
   createRouterCommandRunner,
@@ -36,6 +37,7 @@ export function createConfiguredConnectionHub({
   commandRunnerFactory = createRouterCommandRunner,
   serviceRestarterFactory = createRouterServiceRestarter,
   overlayVerifier = verifyRouterOverlay,
+  overlayInstaller = prepareRouterOverlay,
   fetchImpl = globalThis.fetch,
   open = async () => Object.freeze({
     opened: true,
@@ -50,6 +52,7 @@ export function createConfiguredConnectionHub({
     throw new Error("connection_source_factory_invalid");
   }
   if (typeof overlayVerifier !== "function") throw new Error("router_overlay_verifier_invalid");
+  if (typeof overlayInstaller !== "function") throw new Error("router_overlay_installer_invalid");
   let hubPromise = null;
   const load = () => {
     hubPromise ??= (async () => {
@@ -117,5 +120,12 @@ export function createConfiguredConnectionHub({
     open: lazyDelegate(load, "open"),
     startSecretEntry: lazyDelegate(load, "startSecretEntry"),
     submitSecret: lazyDelegate(load, "submitSecret"),
+    async prepareRouter({ backupDirectory } = {}) {
+      const config = await readConfig(configPath);
+      return overlayInstaller({
+        routerRoot: config.router.sourceRoot,
+        backupDirectory,
+      });
+    },
   });
 }
