@@ -205,3 +205,48 @@ test("createLocalFusionController 默认装配 runtime 边界且保留显式依�
     ["restore", "local-runtime-1"],
   ]);
 });
+
+test("FusionController 统一委托 Connections，而不让 CLI 接触 owner 凭据", async () => {
+  const calls = [];
+  const controller = new FusionController({
+    profiles: {
+      getActive: async () => ({ name: "second" }),
+      list: async () => [],
+    },
+    harnesses: { list: async () => [] },
+    validationPolicy: { assert: async (profile) => profile },
+    connections: {
+      inspect: async () => [{ id: "codex2", state: "connected" }],
+      createCustom: async (draft) => {
+        calls.push(["create", draft]);
+        return { id: "custom-lab" };
+      },
+      startLogin: async (target) => {
+        calls.push(["login", target]);
+        return { target };
+      },
+      remove: async (id) => {
+        calls.push(["remove", id]);
+        return { removed: true };
+      },
+      apply: async () => {
+        calls.push(["apply"]);
+        return { applied: true };
+      },
+      open: async () => ({ opened: true }),
+    },
+  });
+
+  assert.deepEqual(await controller.listConnections(), [{ id: "codex2", state: "connected" }]);
+  assert.deepEqual(await controller.createConnection({ label: "Lab" }), { id: "custom-lab" });
+  assert.deepEqual(await controller.loginConnection("codex2"), { target: "codex2" });
+  assert.deepEqual(await controller.removeConnection("custom-lab"), { removed: true });
+  assert.deepEqual(await controller.applyConnections(), { applied: true });
+  assert.deepEqual(await controller.openConnections(), { opened: true });
+  assert.deepEqual(calls, [
+    ["create", { label: "Lab" }],
+    ["login", "codex2"],
+    ["remove", "custom-lab"],
+    ["apply"],
+  ]);
+});

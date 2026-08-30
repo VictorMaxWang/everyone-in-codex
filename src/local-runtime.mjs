@@ -763,6 +763,7 @@ export class LocalFusionRuntime {
     sourceEnvironment = process.env,
     loopbackPortAllocator = reserveLoopbackPort,
     nativeCatalogProvider = defaultCodex2NativeCatalogProvider,
+    schemaVerifier = null,
   } = {}) {
     if (typeof fetchImpl !== "function" || typeof spawnImpl !== "function") {
       throw new Error("LocalFusionRuntime 需要 fetch 与 spawn 边界");
@@ -793,6 +794,10 @@ export class LocalFusionRuntime {
       throw new Error("LocalFusionRuntime 需要 Codex 2 native catalog provider");
     }
     this.nativeCatalogProvider = nativeCatalogProvider;
+    if (schemaVerifier !== null && typeof schemaVerifier !== "function") {
+      throw new Error("LocalFusionRuntime schemaVerifier 无效");
+    }
+    this.schemaVerifier = schemaVerifier;
 
     this.validationPolicy = Object.freeze({
       assert: async (profile) => this.#assertConfiguredProfile(profile),
@@ -808,6 +813,9 @@ export class LocalFusionRuntime {
       launch: async ({ profile }) => this.#launch(profile),
       restore: async ({ leaseId }) => this.#restore(leaseId),
       inspect: async () => this.#inspectLeases(),
+    });
+    this.activity = Object.freeze({
+      inspect: async () => this.#inspectActivity(),
     });
   }
 
@@ -856,6 +864,12 @@ export class LocalFusionRuntime {
       mkdir(this.leaseDirectory, { recursive: true }),
       mkdir(path.join(this.stateRoot, "codexhost", profile.name), { recursive: true }),
     ]);
+    if (this.schemaVerifier) {
+      await this.schemaVerifier({
+        codexExecutable: path.join(profile.desktopRoot, "app", "resources", "codex.exe"),
+        stateRoot: this.stateRoot,
+      });
+    }
     return Object.freeze({
       prepared: true,
       profile: profile.name,
@@ -957,6 +971,29 @@ export class LocalFusionRuntime {
       });
     }
     return { running: leases.length > 0, leases };
+  }
+
+  async #inspectActivity() {
+    let activeCount = 0;
+    for (const filePath of await this.#activeLeaseFiles()) {
+      const receipt = await readJsonRegular(filePath, "fusion lease receipt");
+      const baseUrl = normalizeLoopbackUrl(
+        receipt?.gatewayBaseUrl,
+        "fusion lease gatewayBaseUrl",
+      );
+      baseUrl.pathname = "/healthz";
+      const response = await this.fetchImpl(baseUrl, {
+        headers: { accept: "application/json" },
+      });
+      if (!response.ok) throw new Error("fusion_activity_unavailable");
+      const payload = await response.json();
+      const count = Number(payload?.activity?.activeCount);
+      if (payload?.status !== "ok" || !Number.isSafeInteger(count) || count < 0) {
+        throw new Error("fusion_activity_invalid");
+      }
+      activeCount += count;
+    }
+    return Object.freeze({ activeCount });
   }
 
   async #captureProcess(child, expectedExecutable, role) {

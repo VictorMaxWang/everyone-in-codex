@@ -12,6 +12,8 @@ const REQUIRED_PORTABLE_FILES = [
   "src/cli.mjs",
   "config/fusion.example.json",
   "config/validation-policy.example.json",
+  "locks/router-v030.lock.json",
+  "patches/router/0001-custom-connections.patch",
   "runtime/node/node.exe",
   "runtime/node/LICENSE",
 ];
@@ -22,6 +24,7 @@ const ALLOWED_PORTABLE_PATHS = [
   /^src\/[A-Za-z0-9._/-]+\.(?:mjs|json|md|ps1)$/,
   /^config\/[A-Za-z0-9._/-]+\.json$/,
   /^locks\/[A-Za-z0-9._/-]+\.json$/,
+  /^patches\/[A-Za-z0-9._/-]+\.patch$/,
   /^runtime\/node\/(?:node\.exe|LICENSE)$/,
   /^runtime\/codexhost\/[A-Za-z0-9._/-]+\.(?:exe|dll|node|js|mjs|cjs|json|wasm|pak|bin|dat|txt|md|html|css|png|ico)$/,
   /^licenses\/[A-Za-z0-9._/-]+\.(?:txt|md)$/,

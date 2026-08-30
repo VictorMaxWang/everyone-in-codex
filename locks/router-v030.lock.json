@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "upstreamCommit": "9a2ae67663b5a1aed6ed3d53b70b5b5967d9e2a1",
+  "baselineTree": "6b5a5d7441f07c7a8d3e65c178c0cf7a9a97d45a",
+  "patchedTree": "1ff140d36408bc6462af6852781d5e420a4af984",
+  "patchSha256": "60b0ff22fc0c502a8995f289c492a0f01777c9c13519c1a703eda9c1aeab2e39",
+  "patches": [
+    "patches/router/0001-custom-connections.patch"
+  ],
+  "managedFiles": [
+    "codex-router.ps1",
+    "bin/connections",
+    "src/api-forwarder.mjs",
+    "src/control.mjs",
+    "src/custom-connections.mjs",
+    "src/model-registry.mjs",
+    "src/paths.mjs",
+    "src/support-bundle.mjs",
+    "test/custom-connections-control.test.mjs",
+    "test/custom-connections.test.mjs"
+  ]
+}

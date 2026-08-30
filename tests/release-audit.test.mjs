@@ -37,6 +37,8 @@ function createPortableFixture(root) {
   write(root, "src/cli.mjs", 'if (process.argv.includes("--help")) console.log("help");\n');
   write(root, "config/fusion.example.json", '{"schemaVersion":1}\n');
   write(root, "config/validation-policy.example.json", '{"schemaVersion":1}\n');
+  write(root, "locks/router-v030.lock.json", '{"schemaVersion":1}\n');
+  write(root, "patches/router/0001-custom-connections.patch", "patch fixture\n");
   write(root, "runtime/node/node.exe", "fixture-binary");
   write(root, "runtime/node/LICENSE", "Node.js license fixture\n");
 }
@@ -218,7 +220,9 @@ test(
         `${JSON.stringify({ schemaVersion: 1, node: process.versions.node })}\n`,
       );
       write(fixtureRoot, "locks/upstream.lock.json", '{"schemaVersion":1}\n');
+      write(fixtureRoot, "locks/router-v030.lock.json", '{"schemaVersion":1}\n');
       write(fixtureRoot, "patches/codexhost/0001.patch", "patch fixture\n");
+      write(fixtureRoot, "patches/router/0001-custom-connections.patch", "patch fixture\n");
       write(nodeRoot, "LICENSE", "Node.js license fixture\n");
       try {
         linkSync(process.execPath, join(nodeRoot, "node.exe"));
@@ -288,7 +292,10 @@ test(
         existsSync(join(releaseRoot, "config", "validation-policy.example.json")),
         true,
       );
-      assert.equal(existsSync(join(releaseRoot, "patches")), false);
+      assert.equal(
+        existsSync(join(releaseRoot, "patches", "router", "0001-custom-connections.patch")),
+        true,
+      );
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
       rmSync(outputRoot, { recursive: true, force: true });

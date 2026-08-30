@@ -11,7 +11,9 @@ The project deliberately keeps three responsibilities separate:
 ## Safety defaults
 
 - The base Codex Profile is never rewritten. The managed launch publishes an owned catalog and passes only seven allowlisted `-c` overrides to `app-server`.
-- Router and WebGPT are external dependencies. This CLI does not start, stop, restart, repair or upgrade them.
+- Router and WebGPT are external dependencies. Normal launch never changes their lifecycle;
+  `connections apply` may transactionally restart Router only after both Router and Fusion are idle.
+  WebGPT is never restarted by the integration.
 - The Router caller capability remains in the gateway process memory and is never exposed to a Harness.
 - Models are capability-filtered per Harness. Routed API and WebGPT models are available to
   Codex, Pi, OMP, DeepSeek Harness, Grok and Claude Code through independent loopback leases.
@@ -19,6 +21,8 @@ The project deliberately keeps three responsibilities separate:
   OpenAI session. A custom-provider key is never treated as an OpenAI credential, and the primary
   Codex Profile is never used as fallback.
 - Local real validation must use a non-primary Codex Profile explicitly allowlisted by `validation-policy.local.json`.
+- The current Codex CLI experimental app-server schema is verified before launch. Unknown File Change
+  or approval schemas fail closed instead of silently degrading previews.
 
 ## Model and Harness projection
 
@@ -30,6 +34,19 @@ The project deliberately keeps three responsibilities separate:
 - Model labels omit the redundant `Everyone in Codex /` prefix. Provider IDs, model slugs and
   resumable Model Refs remain unchanged.
 
+## Native previews and Connections
+
+- Pi, OMP, DeepSeek Harness, Grok and Claude Code project commands, tools, approvals, output and
+  file changes into the same Codex `HostItem` lifecycle. Reopened history uses the same categories.
+- Path-like write tools receive an approval-time local Diff only when the input is unambiguous and
+  remains inside the workspace. The baseline is revalidated before approval; actual Diff mismatch
+  stops the Turn with a protocol error.
+- The CodexHost settings page contains one Connections center for Router providers, custom APIs,
+  Codex 2, WebGPT and each Harness identity. Custom APIs support OpenAI Responses, OpenAI Chat
+  Completions and Anthropic Messages, with multiple model IDs per connection.
+- API keys remain owned by Router. The default path uses a local masked prompt; the advanced field
+  encrypts once with RSA-OAEP/SHA-256 and is cleared immediately after submission.
+
 ## CLI
 
 ```text
@@ -37,6 +54,8 @@ everyone-codex doctor
 everyone-codex profile add|list|use
 everyone-codex harness adopt|install|login|list|remove
 everyone-codex models sync
+everyone-codex setup
+everyone-codex connections add|list|login|remove|apply
 everyone-codex launch
 everyone-codex restore
 ```

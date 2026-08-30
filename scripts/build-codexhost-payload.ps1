@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$VsInstallPath = $env:EVERYONE_CODEX_VS_INSTALL_PATH
+    [string]$VsInstallPath = $env:EVERYONE_CODEX_VS_INSTALL_PATH,
+    [string]$OutputName = $env:EVERYONE_CODEX_PAYLOAD_NAME
 )
 
 Set-StrictMode -Version Latest
@@ -11,6 +12,14 @@ $sourceRoot = Join-Path $repositoryRoot '.build\upstreams\codexhost'
 $nodeRoot = Join-Path $repositoryRoot '.toolchains\node\22.22.0'
 $cargoHome = Join-Path $repositoryRoot '.toolchains\rust\cargo'
 $rustupHome = Join-Path $repositoryRoot '.toolchains\rust\rustup'
+if (-not $OutputName) {
+    $releaseVersion = [string](Get-Content -LiteralPath (Join-Path $repositoryRoot 'package.json') -Raw |
+        ConvertFrom-Json).version
+    $OutputName = "payload-v$releaseVersion"
+}
+if ($OutputName -notmatch '^payload-v[0-9A-Za-z][0-9A-Za-z.+-]*$') {
+    throw "Invalid CodexHost payload cohort name: $OutputName"
+}
 
 foreach ($required in @(
     (Join-Path $sourceRoot 'package.json'),
@@ -50,7 +59,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "CodexHost npm ci failed with exit code $LASTEXITCODE"
 }
 & (Join-Path $nodeRoot 'corepack.cmd') npm@11.8.0 --prefix $repositoryRoot `
-    run prepare:codexhost-payload -- --root $sourceRoot
+    run prepare:codexhost-payload -- --root $sourceRoot --output-name $OutputName
 if ($LASTEXITCODE -ne 0) {
     throw "CodexHost payload build failed with exit code $LASTEXITCODE"
 }

@@ -4,7 +4,10 @@ import { pathToFileURL } from "node:url";
 
 import { FusionGateway } from "./fusion-gateway.mjs";
 import { parseCodex2AuthJson } from "./codex2-native-catalog.mjs";
+import { HarnessRegistry } from "./harness-registry.mjs";
+import { createLocalConnectionControl } from "./local-connection-control.mjs";
 import {
+  LocalFusionRuntime,
   readFusionConfig,
   readRouterCallerSecret,
   routerCapabilityBaseUrl,
@@ -75,6 +78,7 @@ export async function startGatewayDaemonService({
   pid = process.pid,
   send = (value) => process.send?.(value),
   gatewayFactory = (options) => new FusionGateway(options),
+  connectionControlFactory = createLocalConnectionControl,
   nativeFetch = globalThis.fetch,
 } = {}) {
   if (!LEASE_ID_PATTERN.test(leaseId ?? "") || typeof send !== "function") {
@@ -87,10 +91,24 @@ export async function startGatewayDaemonService({
   ]);
   const callerSecret = await readRouterCallerSecret(config.router.stateDir);
   const routerBaseUrl = routerCapabilityBaseUrl(config, callerSecret);
+  const stateRoot = path.dirname(codexCatalogPath);
+  const registry = new HarnessRegistry({ stateFile: path.join(stateRoot, "harnesses.json") });
+  const localRuntime = new LocalFusionRuntime({
+    configPath,
+    stateRoot,
+    harnesses: registry,
+  });
+  const connectionControl = connectionControlFactory({
+    config,
+    configPath,
+    runtime: localRuntime,
+    registry,
+  });
   const gateway = gatewayFactory({
     routerBaseUrl,
     nativeOpenAiBaseUrl: config.nativeOpenAi?.apiBaseUrl ?? null,
     nativeFetch,
+    connectionControl,
     nativeOpenAiSessionProvider: async () => {
       try {
         return await readCodex2NativeSession(config);

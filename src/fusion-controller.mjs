@@ -7,8 +7,11 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 
+import { createConfiguredConnectionHub } from "./configured-connection-hub.mjs";
+import { createConnectionSources } from "./connection-sources.mjs";
+import { verifyCodexAppServerSchema } from "./codex-schema-contract.mjs";
 import { HarnessRegistry } from "./harness-registry.mjs";
-import { createLocalFusionRuntime } from "./local-runtime.mjs";
+import { LocalFusionRuntime, createLocalFusionRuntime } from "./local-runtime.mjs";
 
 /** 返回当前用户 LOCALAPPDATA 下由融合层拥有的全部状态路径。 */
 export function defaultFusionPaths({ localAppData = process.env.LOCALAPPDATA } = {}) {
@@ -192,6 +195,7 @@ export class FusionController {
     preparer = null,
     catalogBridge = null,
     launcher = null,
+    connections = null,
     validationPolicy = createLocalValidationPolicy(),
   } = {}) {
     if (!profiles || !harnesses) {
@@ -202,6 +206,7 @@ export class FusionController {
     this.preparer = preparer;
     this.catalogBridge = catalogBridge;
     this.launcher = launcher;
+    this.connections = connections;
     this.validationPolicy = validationPolicy;
   }
 
@@ -288,6 +293,38 @@ export class FusionController {
   async removeHarness(id) {
     return this.harnesses.remove(id);
   }
+
+  async listConnections() {
+    return requireBoundary(this.connections, "inspect", "ConnectionHub")();
+  }
+
+  async createConnection(draft) {
+    return requireBoundary(this.connections, "createCustom", "ConnectionHub")(draft);
+  }
+
+  async loginConnection(target) {
+    return requireBoundary(this.connections, "startLogin", "ConnectionHub")(target);
+  }
+
+  async removeConnection(id) {
+    return requireBoundary(this.connections, "remove", "ConnectionHub")(id);
+  }
+
+  async applyConnections() {
+    return requireBoundary(this.connections, "apply", "ConnectionHub")();
+  }
+
+  async startConnectionSecretEntry(input) {
+    return requireBoundary(this.connections, "startSecretEntry", "ConnectionHub")(input);
+  }
+
+  async submitConnectionSecret(input) {
+    return requireBoundary(this.connections, "submitSecret", "ConnectionHub")(input);
+  }
+
+  async openConnections() {
+    return requireBoundary(this.connections, "open", "ConnectionHub")();
+  }
 }
 
 /** 使用 LOCALAPPDATA 状态存储创建适合 CLI 的本机 Controller。 */
@@ -299,6 +336,7 @@ export function createLocalFusionController({
   preparer,
   catalogBridge,
   launcher,
+  connections,
   validationPolicy,
 } = {}) {
   const stores = createDefaultStores({ localAppData });
@@ -308,13 +346,29 @@ export function createLocalFusionController({
     ...(configPath === undefined ? {} : { configPath }),
     stateRoot: runtimeOptions.stateRoot ?? stores.paths.root,
     harnesses: stores.harnesses,
+    schemaVerifier: runtimeOptions.schemaVerifier ?? verifyCodexAppServerSchema,
   });
+  const localConnections = connections
+    ?? localRuntime.connections
+    ?? (localRuntime instanceof LocalFusionRuntime
+      ? createConfiguredConnectionHub({
+        runtime: localRuntime,
+        profiles: stores.profiles,
+        configPath: localRuntime.configPath,
+        sourceFactory: (config) => createConnectionSources({
+          profile: config.profile,
+          webgptHealthUrl: config.webgpt.healthUrl,
+          registry: stores.harnesses,
+        }),
+      })
+      : null);
   return new FusionController({
     profiles: stores.profiles,
     harnesses: stores.harnesses,
     preparer: preparer ?? localRuntime.preparer,
     catalogBridge: catalogBridge ?? localRuntime.catalogBridge,
     launcher: launcher ?? localRuntime.launcher,
+    connections: localConnections,
     validationPolicy: validationPolicy ?? localRuntime.validationPolicy,
   });
 }

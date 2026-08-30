@@ -16,6 +16,14 @@ const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024;
 const SESSION_HEADER = "x-everyone-codex-session";
 const MODEL_SOURCES = new Set(["router-provider", "webgpt", "native-openai"]);
 const PROTOCOLS = new Set(["openai-responses", "anthropic-messages"]);
+const CONNECTION_ROUTES = Object.freeze(new Map([
+  ["inspect", "inspect"],
+  ["key-session", "startKeySession"],
+  ["custom/create", "createCustom"],
+  ["login", "startLogin"],
+  ["remove", "remove"],
+  ["apply", "apply"],
+]));
 
 function writeJson(response, statusCode, value, headers = {}) {
   const body = JSON.stringify(value);
@@ -478,6 +486,8 @@ export class FusionGateway {
   #hostCapability;
   #sessions;
   #nativeOpenAiBaseUrl;
+  #activeRequestCount = 0;
+  #connectionControl;
 
   constructor({
     routerBaseUrl,
@@ -489,6 +499,7 @@ export class FusionGateway {
     nativeOpenAiSessionProvider = () => null,
     nativeOpenAiBaseUrl = null,
     nativeFetch = globalThis.fetch,
+    connectionControl = null,
   }) {
     if (!routerBaseUrl) throw new TypeError("routerBaseUrl is required");
     if (typeof fetchImpl !== "function") throw new TypeError("fetchImpl must be a function");
@@ -510,6 +521,12 @@ export class FusionGateway {
     this.maxBodyBytes = Math.max(1, Number(maxBodyBytes) || DEFAULT_MAX_BODY_BYTES);
     this.#hostCapability = hostCapability;
     this.#sessions = new HarnessSessionRegistry({ hostCapability, ttlMs: sessionTtlMs });
+    if (connectionControl !== null && [...CONNECTION_ROUTES.values()].some(
+      (method) => typeof connectionControl?.[method] !== "function",
+    )) {
+      throw new TypeError("connection_control_dependency_invalid");
+    }
+    this.#connectionControl = connectionControl;
     if (typeof nativeOpenAiSessionProvider !== "function" || typeof nativeFetch !== "function") {
       throw new TypeError("native_openai_dependency_invalid");
     }
@@ -553,6 +570,43 @@ export class FusionGateway {
       response.setHeader("cache-control", "no-store");
       const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
       const token = bearerToken(request);
+
+      if (request.method === "GET" && requestUrl.pathname === "/healthz") {
+        // 仅公开聚合计数，供独立 CLI 在应用连接前等待空闲；不暴露会话或正文。
+        writeJson(response, 200, {
+          status: "ok",
+          activity: { activeCount: this.#activeRequestCount },
+        });
+        return;
+      }
+
+      const connectionMatch = request.method === "POST"
+        ? /^\/v1\/connections\/(.+)$/u.exec(requestUrl.pathname)
+        : null;
+      if (connectionMatch) {
+        if (!token || !safeEqual(token, this.#hostCapability)) {
+          requestError(response, 401, "invalid_host", "Unauthorized");
+          return;
+        }
+        const method = CONNECTION_ROUTES.get(connectionMatch[1]);
+        if (!method || !this.#connectionControl) {
+          requestError(response, 404, "connection_endpoint_unavailable", "Not found");
+          return;
+        }
+        try {
+          const params = JSON.parse(await readBody(request, this.maxBodyBytes));
+          const result = await this.#connectionControl[method](params);
+          writeJson(response, 200, result);
+        } catch (error) {
+          const tooLarge = error?.code === "request_too_large";
+          requestError(
+            response,
+            tooLarge ? 413 : 400,
+            tooLarge ? "request_too_large" : "connection_operation_failed",
+          );
+        }
+        return;
+      }
 
       if (requestUrl.pathname === "/v1/sessions" && request.method === "POST") {
         if (!token || !safeEqual(token, this.#hostCapability)) {
@@ -711,6 +765,7 @@ export class FusionGateway {
         }
       }
 
+      this.#activeRequestCount += 1;
       const abortController = new AbortController();
       request.once("aborted", () => abortController.abort());
       response.once("close", () => {
@@ -781,6 +836,8 @@ export class FusionGateway {
       } catch {
         if (!response.headersSent) requestError(response, 502, "router_unavailable", "Router is unavailable");
         else response.destroy();
+      } finally {
+        this.#activeRequestCount -= 1;
       }
     });
 

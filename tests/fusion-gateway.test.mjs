@@ -158,6 +158,89 @@ test("Gateway 不向调用方透出 Router 错误正文或 capability", async (t
   assert.equal(JSON.parse(body).error.code, "router_request_failed");
 });
 
+test("Gateway 健康面只公开总活动计数并在请求结束后归零", async (t) => {
+  let releaseUpstream;
+  const release = new Promise((resolve) => { releaseUpstream = resolve; });
+  t.after(() => releaseUpstream());
+  const router = createServer(async (_request, response) => {
+    await release;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ id: "done", output: [] }));
+  });
+  const routerBaseUrl = `${await listen(router)}/_codex-router/private/v1/`;
+  t.after(() => close(router));
+
+  const gateway = new FusionGateway({ routerBaseUrl });
+  const lease = await startLease(gateway);
+  t.after(() => lease.close());
+  const sessionToken = await registerSession(lease);
+  const request = fetch(`${lease.baseUrl}/v1/responses`, {
+    method: "POST",
+    headers: sessionHeaders(lease, sessionToken),
+    body: JSON.stringify({ model: "provider/allowed", input: "sentinel" }),
+  });
+
+  let active;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    active = await fetch(`${lease.baseUrl}/healthz`).then((response) => response.json());
+    if (active.activity.activeCount === 1) break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.deepEqual(active, { status: "ok", activity: { activeCount: 1 } });
+
+  releaseUpstream();
+  assert.equal((await request).status, 200);
+  assert.deepEqual(
+    await fetch(`${lease.baseUrl}/healthz`).then((response) => response.json()),
+    { status: "ok", activity: { activeCount: 0 } },
+  );
+});
+
+test("Gateway Connections 控制面只接受 host capability 并严格路由六个动作", async (t) => {
+  const calls = [];
+  const connectionControl = Object.fromEntries([
+    ["inspect", { connections: [], pendingCount: 0, applyRequired: false, activity: { activeTurnCount: 0 }, operation: null }],
+    ["startKeySession", { id: "key-1", publicKeySpkiBase64: "QUJDRA==", expiresAt: 99 }],
+    ["createCustom", { connection: { id: "lab" }, applyRequired: true }],
+    ["startLogin", { id: "login", kind: "login", state: "waiting-user", message: null }],
+    ["remove", { id: "lab", pending: true }],
+    ["apply", { operation: { id: "apply", kind: "apply", state: "running", message: null }, applyRequired: true, publishedModelCount: 1 }],
+  ].map(([method, result]) => [method, async (params) => { calls.push([method, params]); return result; }]));
+  const gateway = new FusionGateway({
+    routerBaseUrl: "http://127.0.0.1:9/_codex-router/private/v1/",
+    connectionControl,
+  });
+  const lease = await startLease(gateway);
+  t.after(() => lease.close());
+
+  const unauthorized = await fetch(`${lease.baseUrl}/v1/connections/inspect`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(unauthorized.status, 401);
+
+  const routes = [
+    ["inspect", {}],
+    ["key-session", {}],
+    ["custom/create", { draft: { displayName: "Lab" }, secret: { mode: "keyless" } }],
+    ["login", { id: "codex2" }],
+    ["remove", { id: "lab" }],
+    ["apply", {}],
+  ];
+  for (const [route, body] of routes) {
+    const response = await fetch(`${lease.baseUrl}/v1/connections/${route}`, {
+      method: "POST",
+      headers: { ...lease.controlAuthorizationHeaders(), "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    assert.equal(response.status, 200, route);
+  }
+  assert.deepEqual(calls.map(([method]) => method), [
+    "inspect", "startKeySession", "createCustom", "startLogin", "remove", "apply",
+  ]);
+});
+
 test("Gateway 为 Grok 补全严格 Responses SSE 文本字段并重排 sequence_number", async (t) => {
   const router = createServer((_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });

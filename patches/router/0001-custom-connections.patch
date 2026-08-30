@@ -1,0 +1,1244 @@
+diff --git a/bin/connections b/bin/connections
+new file mode 100755
+index 0000000..2994134
+--- /dev/null
++++ b/bin/connections
+@@ -0,0 +1,5 @@
++#!/bin/sh
++set -eu
++
++repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
++exec node "$repo_dir/src/control.mjs" connections "$@"
+diff --git a/codex-router.ps1 b/codex-router.ps1
+index 195d1dc..b0334dd 100644
+--- a/codex-router.ps1
++++ b/codex-router.ps1
+@@ -16,7 +16,7 @@ $Commands = @(
+   "setup", "install", "doctor", "status", "providers", "provider-key", "enable",
+   "disable", "uninstall", "update", "rollback", "support-bundle",
+   "smoke-test", "start", "stop", "test-model", "discover-models", "local-mlx",
+-  "signed-routing", "refresh-catalog", "media", "tray", "panel", "companion"
++  "signed-routing", "refresh-catalog", "connections", "media", "tray", "panel", "companion"
+ )
+ if ($Command -notin $Commands) {
+   throw "Unknown command '$Command'. Choose: $($Commands -join ', ')."
+@@ -40,6 +40,7 @@ switch ($Command) {
+   }
+   "providers" { Invoke-RouterNode "src\providers.mjs" $Arguments }
+   "provider-key" { Invoke-RouterNode "src\provider-key.mjs" $Arguments }
++  "connections" { Invoke-RouterNode "src\control.mjs" (@("connections") + $Arguments) }
+   # `bin/install` accepts --prepare-only/--migrate-known/--force-deps, so the
+   # Windows wrapper has to pass the equivalent switches through instead of
+   # dropping them; `./model-router.ps1 codex install -ForceDeps` was silently
+diff --git a/src/api-forwarder.mjs b/src/api-forwarder.mjs
+index bc1f965..127e002 100644
+--- a/src/api-forwarder.mjs
++++ b/src/api-forwarder.mjs
+@@ -44,6 +44,7 @@ import { VERSION } from "./version.mjs";
+ import { installStableFetchTransport } from "./fetch-transport.mjs";
+ import { zaiCacheUsageTransform } from "./zai-cache-usage.mjs";
+ import { sanitizeRecursiveToolSchemas } from "./tool-schema-recursion.mjs";
++import { fetchWithSameOriginRedirects } from "./custom-connections.mjs";
+ 
+ installStableFetchTransport();
+ 
+@@ -115,6 +116,15 @@ function deepSeekEffort(value) {
+   return ["xhigh", "max", "ultra"].includes(value) ? "max" : "high";
+ }
+ 
++function fetchProvider(provider, target, init) {
++  // A credential must never cross the origin the operator approved. Built-in
++  // providers keep the platform fetch behavior; only mutable custom endpoints
++  // require an explicit same-origin redirect policy.
++  return provider.customConnection
++    ? fetchWithSameOriginRedirects(target, init)
++    : fetch(target, init);
++}
++
+ // GMI Cloud exposes MiniMax M3 through Chat Completions, but preserves the
+ // upstream's three-state `thinking.type` control instead of accepting Codex's
+ // reasoning_effort. Keep this provider-scoped: other MiniMax resellers have
+@@ -1264,7 +1274,7 @@ async function handleRequest(request, response) {
+     normalized.endpoint,
+   );
+   let target = `${session.baseUrl}${route}${requestUrl.search}`;
+-  let upstream = await fetch(target, {
++  let upstream = await fetchProvider(normalized.provider, target, {
+     method: request.method,
+     headers: upstreamHeaders(
+       request.headers,
+@@ -1289,7 +1299,7 @@ async function handleRequest(request, response) {
+       normalized.endpoint,
+     );
+     target = `${session.baseUrl}${route}${requestUrl.search}`;
+-    upstream = await fetch(target, {
++    upstream = await fetchProvider(normalized.provider, target, {
+       method: request.method,
+       headers: upstreamHeaders(
+         request.headers,
+diff --git a/src/control.mjs b/src/control.mjs
+index 944814f..4b073eb 100644
+--- a/src/control.mjs
++++ b/src/control.mjs
+@@ -654,6 +654,70 @@ async function readSecretFromStdin() {
+   return Buffer.concat(chunks).toString("utf8");
+ }
+ 
++async function readConnectionDraftFromStdin() {
++  const chunks = [];
++  let size = 0;
++  for await (const chunk of process.stdin) {
++    size += chunk.length;
++    if (size > 1024 * 1024) throw new Error("The custom connection draft is too large.");
++    chunks.push(chunk);
++  }
++  const raw = Buffer.concat(chunks).toString("utf8").trim();
++  if (!raw) throw new Error("A custom connection JSON draft is required on stdin.");
++  let parsed;
++  try {
++    parsed = JSON.parse(raw);
++  } catch {
++    throw new Error("The custom connection draft on stdin is not valid JSON.");
++  }
++  return parsed;
++}
++
++async function handleConnections(action = "list", id) {
++  const {
++    applyCustomConnections,
++    createCustomConnection,
++    customConnectionsSnapshot,
++    planCustomConnection,
++    probeCustomConnection,
++    removeCustomConnection,
++    setCustomConnectionSecret,
++    updateCustomConnection,
++  } = await import("./custom-connections.mjs");
++  let result;
++  if (action === "list") {
++    result = customConnectionsSnapshot();
++  } else if (action === "plan") {
++    result = planCustomConnection(await readConnectionDraftFromStdin());
++  } else if (action === "create") {
++    const connection = await createCustomConnection(await readConnectionDraftFromStdin());
++    result = { connection, snapshot: customConnectionsSnapshot() };
++  } else if (action === "update") {
++    if (!id) throw new Error("Usage: control connections update <id> < draft.json");
++    const connection = await updateCustomConnection(id, await readConnectionDraftFromStdin());
++    result = { connection, snapshot: customConnectionsSnapshot() };
++  } else if (action === "remove") {
++    if (!id) throw new Error("Usage: control connections remove <id>");
++    result = {
++      removal: await removeCustomConnection(id),
++      snapshot: customConnectionsSnapshot(),
++    };
++  } else if (action === "probe") {
++    if (!id) throw new Error("Usage: control connections probe <id>");
++    result = await probeCustomConnection(id);
++  } else if (action === "secret-set") {
++    if (!id) throw new Error("Usage: control connections secret-set <id>");
++    result = await setCustomConnectionSecret(id, await readSecretFromStdin());
++  } else if (action === "apply") {
++    result = await applyCustomConnections();
++  } else {
++    throw new Error(
++      "Usage: control connections list|plan|create|update <id>|remove <id>|probe <id>|secret-set <id>|apply",
++    );
++  }
++  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
++}
++
+ async function saveProviderCredential(providerId) {
+   const { providerOnboardingSnapshot, saveApiCredential } = await import("./provider-onboarding.mjs");
+   const value = await readSecretFromStdin();
+@@ -2622,6 +2686,8 @@ if (args.includes("--probe")) {
+   } else {
+     await saveProviderCredential(args[1]);
+   }
++} else if (args[0] === "connections") {
++  await handleConnections(args[1], args[2]);
+ } else if (args[0] === "auth-mode") {
+   await setLoginFreeMode(args[1]);
+ } else if (args[0] === "signed-routing") {
+diff --git a/src/custom-connections.mjs b/src/custom-connections.mjs
+new file mode 100644
+index 0000000..13356bd
+--- /dev/null
++++ b/src/custom-connections.mjs
+@@ -0,0 +1,543 @@
++import {
++  existsSync,
++  readFileSync,
++  unlinkSync,
++} from "node:fs";
++import path from "node:path";
++
++import { writePrivateFile, writePrivateJson } from "./file-security.mjs";
++import { withModelOverlayLock } from "./model-overlay-lock.mjs";
++import {
++  CUSTOM_CONNECTIONS_PATH,
++  PROVIDER_SELECTION_PATH,
++  STATE_DIR,
++} from "./paths.mjs";
++
++const DEFAULT_CONTEXT_WINDOW = 131_072;
++const DEFAULT_AUTO_COMPACT = 110_000;
++const PROTOCOLS = Object.freeze({
++  "openai-responses": "openai-responses",
++  "openai-chat": "openai",
++  "anthropic-messages": "anthropic",
++});
++
++function defaults(options = {}) {
++  const stateDir = options.stateDir || STATE_DIR;
++  return {
++    stateDir,
++    statePath: options.statePath ||
++      (stateDir === STATE_DIR ? CUSTOM_CONNECTIONS_PATH : path.join(stateDir, "custom-connections.json")),
++    selectionPath: options.selectionPath || PROVIDER_SELECTION_PATH,
++  };
++}
++
++function providerId(id) {
++  return `custom-${id}`;
++}
++
++function activeSecretPath(id, stateDir) {
++  return path.join(stateDir, `custom-connection-${id}.secret`);
++}
++
++function candidateSecretPath(id, stateDir) {
++  return path.join(stateDir, `custom-connection-${id}.candidate.secret`);
++}
++
++function cleanId(value, label = "connection id") {
++  const id = String(value || "").trim().toLowerCase();
++  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(id)) {
++    throw new Error(`${label} must use 1-63 lowercase letters, digits, or hyphens.`);
++  }
++  return id;
++}
++
++function gatewaySafe(value) {
++  const safe = String(value || "")
++    .toLowerCase()
++    .replace(/[^a-z0-9-]+/g, "-")
++    .replace(/-{2,}/g, "-")
++    .replace(/^-|-$/g, "");
++  if (!safe) throw new Error("Every custom model requires a non-empty model id.");
++  return safe;
++}
++
++function loopback(url) {
++  return ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
++}
++
++function normalizeBaseUrl(value) {
++  let url;
++  try {
++    url = new URL(String(value || ""));
++  } catch {
++    throw new Error("Custom connection baseUrl must be an absolute HTTP(S) URL.");
++  }
++  if (!["http:", "https:"].includes(url.protocol)) {
++    throw new Error("Custom connection baseUrl must be an HTTP(S) URL.");
++  }
++  if (url.username || url.password || url.search || url.hash) {
++    throw new Error("Custom connection baseUrl must not contain userinfo, query, or fragment data.");
++  }
++  if (!loopback(url) && url.protocol !== "https:") {
++    throw new Error("Remote custom connections must use HTTPS.");
++  }
++  return url.toString().replace(/\/+$/, "");
++}
++
++function normalizeModels(models) {
++  if (!Array.isArray(models) || models.length === 0) {
++    throw new Error("A custom connection requires at least one model id.");
++  }
++  const seen = new Set();
++  return models.map((raw) => {
++    const source = typeof raw === "string" ? { id: raw } : raw;
++    const id = String(source?.id || "").trim();
++    if (!id || id.length > 256) throw new Error("Every custom model requires a valid model id.");
++    if (seen.has(id)) throw new Error(`Duplicate custom model id: ${id}`);
++    seen.add(id);
++    const contextWindow = source.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
++    const autoCompact = source.autoCompact ?? DEFAULT_AUTO_COMPACT;
++    if (!Number.isInteger(contextWindow) || contextWindow < 1) {
++      throw new Error(`Custom model ${id} has an invalid contextWindow.`);
++    }
++    if (!Number.isInteger(autoCompact) || autoCompact < 1 || autoCompact > contextWindow) {
++      throw new Error(`Custom model ${id} has an invalid autoCompact limit.`);
++    }
++    const modalities = source.inputModalities ?? ["text"];
++    if (
++      !Array.isArray(modalities) ||
++      modalities.length === 0 ||
++      modalities.some((item) => !["text", "image"].includes(item))
++    ) {
++      throw new Error(`Custom model ${id} has invalid inputModalities.`);
++    }
++    return {
++      id,
++      displayName: String(source.displayName || id).trim() || id,
++      contextWindow,
++      autoCompact,
++      inputModalities: [...new Set(modalities)],
++      metadataEstimated: source.metadataEstimated !== false,
++    };
++  });
++}
++
++export function planCustomConnection(input) {
++  for (const field of ["apiKey", "key", "secret", "token"]) {
++    if (input?.[field] !== undefined) {
++      throw new Error("API keys are accepted only by connections secret-set over stdin.");
++    }
++  }
++  const id = cleanId(input?.id);
++  const baseUrl = normalizeBaseUrl(input?.baseUrl);
++  const url = new URL(baseUrl);
++  const keyless = input?.keyless === true;
++  if (keyless && !loopback(url)) {
++    throw new Error("Only a loopback custom connection may be keyless.");
++  }
++  if (!PROTOCOLS[input?.protocol]) {
++    throw new Error(
++      "Custom connection protocol must be openai-responses, openai-chat, or anthropic-messages.",
++    );
++  }
++  return {
++    id,
++    displayName: String(input?.displayName || id).trim() || id,
++    baseUrl,
++    protocol: input.protocol,
++    keyless,
++    models: normalizeModels(input.models),
++  };
++}
++
++function emptyState() {
++  return { version: 1, active: [], candidate: null };
++}
++
++function validateStoredConnection(connection) {
++  return planCustomConnection(connection);
++}
++
++function readState(options = {}) {
++  const { statePath } = defaults(options);
++  if (!existsSync(statePath)) return emptyState();
++  const parsed = JSON.parse(readFileSync(statePath, "utf8"));
++  if (parsed?.version !== 1 || !Array.isArray(parsed.active)) {
++    throw new Error("custom-connections.json has an unsupported schema.");
++  }
++  return {
++    version: 1,
++    active: parsed.active.map(validateStoredConnection),
++    candidate: parsed.candidate === null || parsed.candidate === undefined
++      ? null
++      : Array.isArray(parsed.candidate)
++        ? parsed.candidate.map(validateStoredConnection)
++        : (() => { throw new Error("custom-connections.json candidate must be an array or null."); })(),
++  };
++}
++
++function writeState(state, options = {}) {
++  writePrivateJson(defaults(options).statePath, state);
++  return state;
++}
++
++function editableConnections(state) {
++  return state.candidate ? structuredClone(state.candidate) : structuredClone(state.active);
++}
++
++async function mutateCandidate(options, operation) {
++  const resolved = defaults(options);
++  return withModelOverlayLock(() => {
++    const state = readState(resolved);
++    const candidate = editableConnections(state);
++    const result = operation(candidate, state);
++    writeState({ version: 1, active: state.active, candidate }, resolved);
++    return result;
++  }, { stateDir: resolved.stateDir });
++}
++
++export async function createCustomConnection(input, options = {}) {
++  const connection = planCustomConnection(input);
++  await mutateCandidate(options, (candidate) => {
++    if (candidate.some((entry) => entry.id === connection.id)) {
++      throw new Error(`Custom connection ${connection.id} already exists.`);
++    }
++    candidate.push(connection);
++  });
++  return connection;
++}
++
++export async function updateCustomConnection(id, input, options = {}) {
++  const expected = cleanId(id);
++  const connection = planCustomConnection({ ...input, id: expected });
++  await mutateCandidate(options, (candidate) => {
++    const index = candidate.findIndex((entry) => entry.id === expected);
++    if (index === -1) throw new Error(`Unknown custom connection: ${expected}`);
++    candidate[index] = connection;
++  });
++  return connection;
++}
++
++export async function removeCustomConnection(id, options = {}) {
++  const expected = cleanId(id);
++  await mutateCandidate(options, (candidate) => {
++    const index = candidate.findIndex((entry) => entry.id === expected);
++    if (index === -1) throw new Error(`Unknown custom connection: ${expected}`);
++    candidate.splice(index, 1);
++    const staged = candidateSecretPath(expected, defaults(options).stateDir);
++    if (existsSync(staged)) unlinkSync(staged);
++  });
++  return { id: expected, pendingRemoval: true };
++}
++
++function stagedSecret(id, connection, options = {}) {
++  const { stateDir } = defaults(options);
++  const target = candidateSecretPath(id, stateDir);
++  if (!existsSync(target)) return undefined;
++  try {
++    const parsed = JSON.parse(readFileSync(target, "utf8"));
++    if (parsed?.version !== 1 || parsed.baseUrl !== connection.baseUrl) return undefined;
++    const value = String(parsed.value || "").trim();
++    return value || undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++function reusableActiveSecret(connection, active, options = {}) {
++  const previous = active.find((entry) => entry.id === connection.id);
++  if (!previous || previous.baseUrl !== connection.baseUrl) return undefined;
++  const target = activeSecretPath(connection.id, defaults(options).stateDir);
++  if (!existsSync(target)) return undefined;
++  const value = readFileSync(target, "utf8").trim();
++  return value || undefined;
++}
++
++export async function setCustomConnectionSecret(id, value, options = {}) {
++  const expected = cleanId(id);
++  const secret = String(value || "").trim();
++  if (!secret) throw new Error("No API key was provided; nothing changed.");
++  if (Buffer.byteLength(secret) > 16 * 1024) throw new Error("The API key is too large.");
++  const resolved = defaults(options);
++  return withModelOverlayLock(() => {
++    const state = readState(resolved);
++    const candidate = state.candidate || state.active;
++    const connection = candidate.find((entry) => entry.id === expected);
++    if (!connection) throw new Error(`Unknown custom connection: ${expected}`);
++    if (connection.keyless) throw new Error(`Custom connection ${expected} is keyless.`);
++    writePrivateJson(candidateSecretPath(expected, resolved.stateDir), {
++      version: 1,
++      baseUrl: connection.baseUrl,
++      value: secret,
++    });
++    return { id: expected, configured: true };
++  }, { stateDir: resolved.stateDir });
++}
++
++function credentialConfigured(connection, state, options) {
++  return connection.keyless || Boolean(
++    stagedSecret(connection.id, connection, options) ||
++    reusableActiveSecret(connection, state.active, options),
++  );
++}
++
++export function customConnectionsSnapshot(options = {}) {
++  const state = readState(options);
++  const project = (connection) => ({
++    ...connection,
++    credentialConfigured: credentialConfigured(connection, state, options),
++  });
++  return {
++    path: defaults(options).statePath,
++    active: state.active.map(project),
++    candidate: (state.candidate || []).map(project),
++    pending: state.candidate !== null,
++    restartRequired: state.candidate !== null,
++  };
++}
++
++export function customConnectionSecretValues(options = {}) {
++  const state = readState(options);
++  const values = new Set();
++  for (const connection of [...state.active, ...(state.candidate || [])]) {
++    const active = activeSecretPath(connection.id, defaults(options).stateDir);
++    if (existsSync(active)) {
++      const value = readFileSync(active, "utf8").trim();
++      if (value) values.add(value);
++    }
++    const candidate = candidateSecretPath(connection.id, defaults(options).stateDir);
++    if (existsSync(candidate)) {
++      try {
++        const value = String(JSON.parse(readFileSync(candidate, "utf8"))?.value || "").trim();
++        if (value) values.add(value);
++      } catch {
++        // A malformed staged secret cannot be used, but any active value above
++        // is still worth redacting from a support artifact.
++      }
++    }
++  }
++  return [...values];
++}
++
++function readSelection(selectionPath) {
++  if (!existsSync(selectionPath)) return undefined;
++  try {
++    const parsed = JSON.parse(readFileSync(selectionPath, "utf8"));
++    return parsed?.version === 1 && Array.isArray(parsed.providers)
++      ? parsed.providers.map(String)
++      : undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++function transactionFiles(state, options) {
++  const resolved = defaults(options);
++  const ids = new Set([
++    ...state.active.map((entry) => entry.id),
++    ...(state.candidate || []).map((entry) => entry.id),
++  ]);
++  return [
++    resolved.statePath,
++    resolved.selectionPath,
++    ...[...ids].flatMap((id) => [
++      activeSecretPath(id, resolved.stateDir),
++      candidateSecretPath(id, resolved.stateDir),
++    ]),
++  ];
++}
++
++export async function applyCustomConnections(options = {}) {
++  const resolved = defaults(options);
++  return withModelOverlayLock(async () => {
++    // The model registry imports this module to merge the active cohort.
++    // Load publication lazily so the fresh publication child does not form a
++    // registry -> connections -> publication -> registry module cycle.
++    const {
++      captureModelOverlayFiles,
++      restoreModelOverlayFiles,
++      transactModelOverlayMutation,
++    } = await import("./model-overlay-publication.mjs");
++    const before = readState(resolved);
++    if (before.candidate === null) {
++      return {
++        active: before.active.map((entry) => entry.id),
++        changed: false,
++        restartRequired: false,
++      };
++    }
++    const files = transactionFiles(before, resolved);
++    const result = await transactModelOverlayMutation({
++      lock: false,
++      capture: () => captureModelOverlayFiles(files),
++      restore: restoreModelOverlayFiles,
++      applyPublication: options.applyPublication,
++      mutate: async () => {
++        for (const connection of before.candidate) {
++          if (connection.keyless) continue;
++          const secret = stagedSecret(connection.id, connection, resolved) ||
++            reusableActiveSecret(connection, before.active, resolved);
++          if (!secret) {
++            throw new Error(
++              `Custom connection ${connection.id}: a new API key is required before it can be applied.`,
++            );
++          }
++          writePrivateFile(activeSecretPath(connection.id, resolved.stateDir), `${secret}\n`);
++        }
++
++        const nextIds = new Set(before.candidate.map((entry) => entry.id));
++        for (const connection of before.active) {
++          if (!nextIds.has(connection.id)) {
++            const target = activeSecretPath(connection.id, resolved.stateDir);
++            if (existsSync(target)) unlinkSync(target);
++          }
++        }
++        for (const connection of [...before.active, ...before.candidate]) {
++          const staged = candidateSecretPath(connection.id, resolved.stateDir);
++          if (existsSync(staged)) unlinkSync(staged);
++        }
++
++        writeState({ version: 1, active: before.candidate, candidate: null }, resolved);
++        const selected = readSelection(resolved.selectionPath);
++        if (selected) {
++          const previous = new Set(before.active.map((entry) => providerId(entry.id)));
++          const kept = selected.filter((id) => !previous.has(id));
++          writePrivateJson(resolved.selectionPath, {
++            version: 1,
++            providers: [...new Set([
++              ...kept,
++              ...before.candidate.map((entry) => providerId(entry.id)),
++            ])],
++          });
++        }
++      },
++    });
++    return {
++      active: before.candidate.map((entry) => entry.id),
++      changed: true,
++      restartRequired: true,
++      publication: result,
++    };
++  }, { stateDir: resolved.stateDir });
++}
++
++export function customConnectionRegistryDocument(options = {}) {
++  const state = readState(options);
++  const providers = [];
++  const models = [];
++  let priority = 10_000;
++  for (const connection of state.active) {
++    const id = providerId(connection.id);
++    providers.push({
++      id,
++      kind: "openai-compatible",
++      displayName: connection.displayName,
++      ownedBy: connection.displayName,
++      baseUrl: connection.baseUrl,
++      protocol: PROTOCOLS[connection.protocol],
++      customConnection: true,
++      ...(connection.keyless
++        ? { keyless: true }
++        : {
++            credential: {
++              environment: [],
++              file: path.basename(activeSecretPath(connection.id, defaults(options).stateDir)),
++              label: "API key",
++            },
++          }),
++    });
++    for (const model of connection.models) {
++      const gatewayModel = `${id}-${gatewaySafe(model.id)}`;
++      models.push({
++        slug: `${id}/${model.id}`,
++        gatewayModel,
++        upstreamModel: model.id,
++        provider: id,
++        listed: true,
++        displayName: model.displayName,
++        description: `${connection.displayName} custom model; unverified capabilities use conservative local estimates.`,
++        compHash: `${gatewayModel}-connection-v1`,
++        requestProfile: "upstream-controlled-reasoning",
++        reasoningLevels: [],
++        contextWindow: model.contextWindow,
++        autoCompact: model.autoCompact,
++        inputModalities: model.inputModalities,
++        metadataEstimated: model.metadataEstimated,
++        priority: priority--,
++      });
++    }
++  }
++  return { version: 1, providers, models };
++}
++
++export async function fetchWithSameOriginRedirects(
++  url,
++  init,
++  { fetchImpl = fetch, maxRedirects = 3 } = {},
++) {
++  let target = new URL(url);
++  for (let redirect = 0; ; redirect += 1) {
++    const response = await fetchImpl(target, { ...init, redirect: "manual" });
++    const location = response.headers.get("location");
++    if (!(response.status >= 300 && response.status < 400 && location)) return response;
++    if (redirect >= maxRedirects) {
++      await response.body?.cancel().catch(() => undefined);
++      throw new Error("Custom connection exceeded the redirect limit.");
++    }
++    const next = new URL(location, target);
++    if (next.origin !== target.origin) {
++      await response.body?.cancel().catch(() => undefined);
++      const error = new Error("Custom connection refused a cross-origin redirect.");
++      error.code = "custom_connection_cross_origin_redirect";
++      throw error;
++    }
++    await response.body?.cancel().catch(() => undefined);
++    target = next;
++  }
++}
++
++function candidateConnection(id, state) {
++  return (state.candidate || state.active).find((entry) => entry.id === id);
++}
++
++export async function probeCustomConnection(id, options = {}) {
++  const expected = cleanId(id);
++  const state = readState(options);
++  const connection = candidateConnection(expected, state);
++  if (!connection) throw new Error(`Unknown custom connection: ${expected}`);
++  const secret = connection.keyless
++    ? undefined
++    : stagedSecret(expected, connection, options) || reusableActiveSecret(connection, state.active, options);
++  if (!connection.keyless && !secret) {
++    throw new Error(`Custom connection ${expected} needs an API key before probing.`);
++  }
++  const headers = { Accept: "application/json", "Accept-Encoding": "identity" };
++  if (secret) {
++    if (connection.protocol === "anthropic-messages") headers["x-api-key"] = secret;
++    else headers.Authorization = `Bearer ${secret}`;
++  }
++  const response = await fetchWithSameOriginRedirects(
++    `${connection.baseUrl}/models`,
++    { method: "GET", headers, signal: AbortSignal.timeout(10_000) },
++    options,
++  );
++  const payload = await response.json().catch(() => ({}));
++  if (!response.ok) {
++    const error = new Error(`Custom connection model directory returned HTTP ${response.status}.`);
++    error.status = response.status;
++    throw error;
++  }
++  const rows = Array.isArray(payload?.data)
++    ? payload.data
++    : Array.isArray(payload?.models)
++      ? payload.models
++      : [];
++  return {
++    id: expected,
++    status: response.status,
++    models: rows
++      .map((entry) => typeof entry === "string" ? entry : entry?.id)
++      .filter((entry) => typeof entry === "string" && entry),
++    generated: false,
++  };
++}
+diff --git a/src/model-registry.mjs b/src/model-registry.mjs
+index 892cee9..d03f4b3 100644
+--- a/src/model-registry.mjs
++++ b/src/model-registry.mjs
+@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
+ import path from "node:path";
+ 
+ import { CHATGPT_WEB_BASE_URL } from "./codex-native-responses.mjs";
++import { customConnectionRegistryDocument } from "./custom-connections.mjs";
+ import { instructionOverlayExists } from "./instruction-overlays.mjs";
+ import { SOURCE_ROOT } from "./paths.mjs";
+ import { officialModelDisplayName, readUserModels } from "./user-models.mjs";
+@@ -147,10 +148,11 @@ export function readRegistryDocument(root = REGISTRY_PATH) {
+   }
+   if (isFile) {
+     const parsed = parseFragment(root);
++    const custom = customConnectionRegistryDocument();
+     return {
+       version: 1,
+-      providers: parsed.providers || [],
+-      models: parsed.models || [],
++      providers: [...(parsed.providers || []), ...custom.providers],
++      models: [...(parsed.models || []), ...custom.models],
+     };
+   }
+   const providers = [];
+@@ -162,6 +164,12 @@ export function readRegistryDocument(root = REGISTRY_PATH) {
+     providers.push(...(parsed.providers || []));
+     models.push(...(parsed.models || []));
+   }
++  // Custom Connections are protected operator state rather than checked-in
++  // registry fragments. Merge only the active cohort here; candidate edits do
++  // not become routable until the transactional apply publishes them.
++  const custom = customConnectionRegistryDocument();
++  providers.push(...custom.providers);
++  models.push(...custom.models);
+   return { version: 1, providers, models };
+ }
+ 
+@@ -782,7 +790,9 @@ export const PROVIDERS = registry.providers;
+ // mutable user-model overlay is merged. Repository certification gates must
+ // bind to this set: a local overlay is useful routing configuration, but it
+ // cannot certify itself for every installer.
+-export const CHECKED_IN_MODELS = registry.models;
++export const CHECKED_IN_MODELS = Object.freeze(
++  registry.models.filter((model) => !PROVIDERS.get(model.provider)?.customConnection),
++);
+ export const MODELS = merged.models;
+ export const USER_MODEL_WARNINGS = merged.warnings;
+ export const LISTED_MODELS = Object.freeze(MODELS.filter((model) => model.listed));
+diff --git a/src/paths.mjs b/src/paths.mjs
+index cc07873..afbc91a 100644
+--- a/src/paths.mjs
++++ b/src/paths.mjs
+@@ -123,6 +123,9 @@ export const DISCOVERY_MODE_PATH = path.join(STATE_DIR, "discovery-mode.json");
+ // cache for the curation surfaces, never an authority: what is registered
+ // locally is always recomputed from the live registry.
+ export const PROVIDER_CATALOG_CACHE_PATH = path.join(STATE_DIR, "provider-catalog-cache.json");
++export const CUSTOM_CONNECTIONS_PATH =
++  process.env.MODEL_ROUTER_CUSTOM_CONNECTIONS ||
++  path.join(STATE_DIR, "custom-connections.json");
+ export const INSTALL_MANIFEST_PATH = path.join(STATE_DIR, "install-manifest.json");
+ export const SKILL_OWNERSHIP_PATH = path.join(STATE_DIR, "managed-skills.json");
+ export const MIGRATIONS_DIR = path.join(STATE_DIR, "migrations");
+diff --git a/src/support-bundle.mjs b/src/support-bundle.mjs
+index 6316e8d..2f563d1 100644
+--- a/src/support-bundle.mjs
++++ b/src/support-bundle.mjs
+@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
+ import { redactCallerUrl } from "./caller-auth.mjs";
+ import { readInstallManifest } from "./install-manifest.mjs";
+ import { redactProxyCredentials } from "./proxy-environment.mjs";
++import { customConnectionSecretValues } from "./custom-connections.mjs";
+ import { protectPrivateFile } from "./file-security.mjs";
+ import { detectLegacyInstallations } from "./legacy-migration.mjs";
+ import { PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
+@@ -84,6 +85,7 @@ function logTail() {
+ 
+ function knownLocalSecrets() {
+   const values = new Set();
++  for (const value of customConnectionSecretValues()) values.add(value);
+   const files = [CALLER_SECRET_PATH, INTERNAL_SECRET_PATH];
+   for (const provider of PROVIDERS.values()) {
+     if (provider.kind !== "openai-compatible") continue;
+diff --git a/test/custom-connections-control.test.mjs b/test/custom-connections-control.test.mjs
+new file mode 100644
+index 0000000..bfa13d5
+--- /dev/null
++++ b/test/custom-connections-control.test.mjs
+@@ -0,0 +1,62 @@
++import assert from "node:assert/strict";
++import { execFileSync } from "node:child_process";
++import { existsSync, mkdtempSync, readFileSync } from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import test from "node:test";
++
++const root = path.resolve(import.meta.dirname, "..");
++
++function run(stateDir, args, input = "") {
++  return execFileSync(process.execPath, [path.join(root, "src", "control.mjs"), ...args], {
++    cwd: root,
++    encoding: "utf8",
++    input,
++    env: {
++      ...process.env,
++      CODEX_HOME: stateDir,
++      MODEL_ROUTER_STATE_DIR: stateDir,
++      MODEL_ROUTER_TARGET: "codex",
++    },
++  });
++}
++
++test("control exposes plan, create, secret-set, list, and apply without echoing a key", () => {
++  const stateDir = mkdtempSync(path.join(os.tmpdir(), "custom-connections-control-"));
++  const draft = JSON.stringify({
++    id: "team-api",
++    displayName: "Team API",
++    baseUrl: "https://models.example.test/v1",
++    protocol: "openai-responses",
++    models: ["model-a"],
++  });
++  const planned = JSON.parse(run(stateDir, ["connections", "plan"], draft));
++  assert.equal(planned.id, "team-api");
++  assert.equal(existsSync(path.join(stateDir, "custom-connections.json")), false);
++  const created = JSON.parse(run(stateDir, ["connections", "create"], draft));
++  assert.equal(created.connection.id, "team-api");
++  const secret = "control-test-secret";
++  const set = JSON.parse(run(stateDir, ["connections", "secret-set", "team-api"], secret));
++  assert.deepEqual(set, { id: "team-api", configured: true });
++  assert.doesNotMatch(JSON.stringify(set), /control-test-secret/);
++  assert.doesNotMatch(readFileSync(path.join(stateDir, "custom-connections.json"), "utf8"), /control-test-secret/);
++
++  const listed = JSON.parse(run(stateDir, ["connections", "list"]));
++  assert.equal(listed.candidate[0].credentialConfigured, true);
++  const applied = JSON.parse(run(stateDir, ["connections", "apply"]));
++  assert.equal(applied.restartRequired, true);
++  assert.deepEqual(applied.active, ["team-api"]);
++
++  const updatedDraft = JSON.stringify({
++    ...JSON.parse(draft),
++    displayName: "Updated Team API",
++    models: ["model-a", "model-b"],
++  });
++  const updated = JSON.parse(
++    run(stateDir, ["connections", "update", "team-api"], updatedDraft),
++  );
++  assert.equal(updated.connection.displayName, "Updated Team API");
++  const removed = JSON.parse(run(stateDir, ["connections", "remove", "team-api"]));
++  assert.equal(removed.removal.pendingRemoval, true);
++  assert.deepEqual(removed.snapshot.candidate, []);
++});
+diff --git a/test/custom-connections.test.mjs b/test/custom-connections.test.mjs
+new file mode 100644
+index 0000000..32da0fd
+--- /dev/null
++++ b/test/custom-connections.test.mjs
+@@ -0,0 +1,375 @@
++import assert from "node:assert/strict";
++import { execFileSync, spawn } from "node:child_process";
++import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
++import http from "node:http";
++import os from "node:os";
++import path from "node:path";
++import net from "node:net";
++import test from "node:test";
++
++import {
++  applyCustomConnections,
++  createCustomConnection,
++  customConnectionRegistryDocument,
++  customConnectionsSnapshot,
++  probeCustomConnection,
++  removeCustomConnection,
++  setCustomConnectionSecret,
++  updateCustomConnection,
++} from "../src/custom-connections.mjs";
++
++function isolatedOptions(stateDir) {
++  return {
++    stateDir,
++    statePath: path.join(stateDir, "custom-connections.json"),
++    selectionPath: path.join(stateDir, "enabled-providers.json"),
++  };
++}
++
++function remoteDraft(overrides = {}) {
++  return {
++    id: "team-api",
++    displayName: "Team API",
++    baseUrl: "https://models.example.test/v1",
++    protocol: "openai-responses",
++    models: ["model-a", "owner/model-b"],
++    ...overrides,
++  };
++}
++
++test("custom connection drafts enforce the outbound URL and authentication boundary", async () => {
++  const stateDir = mkdtempSync(path.join(os.tmpdir(), "custom-connection-validation-"));
++  const options = isolatedOptions(stateDir);
++
++  await assert.rejects(
++    createCustomConnection(remoteDraft({ apiKey: "must-not-enter-json" }), options),
++    /accepted only by connections secret-set/,
++  );
++
++  await assert.rejects(
++    createCustomConnection(remoteDraft({ baseUrl: "http://models.example.test/v1" }), options),
++    /HTTPS/,
++  );
++  for (const baseUrl of [
++    "https://user@example.test/v1",
++    "https://example.test/v1?tenant=a",
++    "https://example.test/v1#models",
++  ]) {
++    await assert.rejects(createCustomConnection(remoteDraft({ baseUrl }), options), /must not contain/);
++  }
++
++  await createCustomConnection(
++    remoteDraft({
++      id: "local-api",
++      baseUrl: "http://127.0.0.1:11434/v1",
++      keyless: true,
++    }),
++    options,
++  );
++  const snapshot = customConnectionsSnapshot(options);
++  assert.equal(snapshot.candidate[0].id, "local-api");
++  assert.equal(snapshot.candidate[0].credentialConfigured, true);
++});
++
++test("candidate metadata and secrets apply atomically without placing the key in JSON", async () => {
++  const stateDir = mkdtempSync(path.join(os.tmpdir(), "custom-connection-apply-"));
++  const options = isolatedOptions(stateDir);
++  const secret = "test-secret-value";
++
++  await createCustomConnection(remoteDraft(), options);
++  assert.equal(customConnectionsSnapshot(options).candidate[0].credentialConfigured, false);
++  await setCustomConnectionSecret("team-api", secret, options);
++  assert.equal(customConnectionsSnapshot(options).candidate[0].credentialConfigured, true);
++  assert.doesNotMatch(readFileSync(options.statePath, "utf8"), /test-secret-value/);
++
++  const applied = await applyCustomConnections({
++    ...options,
++    applyPublication: async () => ({}),
++  });
++  assert.equal(applied.restartRequired, true);
++  assert.deepEqual(applied.active, ["team-api"]);
++  assert.doesNotMatch(readFileSync(options.statePath, "utf8"), /test-secret-value/);
++  assert.equal(
++    readFileSync(path.join(stateDir, "custom-connection-team-api.secret"), "utf8").trim(),
++    secret,
++  );
++
++  await updateCustomConnection(
++    "team-api",
++    remoteDraft({ baseUrl: "https://new.example.test/v1" }),
++    options,
++  );
++  await assert.rejects(
++    applyCustomConnections({ ...options, applyPublication: async () => ({}) }),
++    /new API key is required/,
++  );
++  await setCustomConnectionSecret("team-api", "replacement-secret", options);
++  await applyCustomConnections({ ...options, applyPublication: async () => ({}) });
++  assert.equal(
++    readFileSync(path.join(stateDir, "custom-connection-team-api.secret"), "utf8").trim(),
++    "replacement-secret",
++  );
++
++  await removeCustomConnection("team-api", options);
++  await applyCustomConnections({ ...options, applyPublication: async () => ({}) });
++  assert.deepEqual(customConnectionsSnapshot(options).active, []);
++});
++
++test("a failed publication restores active metadata and its previous secret", async () => {
++  const stateDir = mkdtempSync(path.join(os.tmpdir(), "custom-connection-rollback-"));
++  const options = isolatedOptions(stateDir);
++  await createCustomConnection(remoteDraft(), options);
++  await setCustomConnectionSecret("team-api", "original-secret", options);
++  await applyCustomConnections({ ...options, applyPublication: async () => ({}) });
++  await updateCustomConnection(
++    "team-api",
++    remoteDraft({ baseUrl: "https://replacement.example.test/v1" }),
++    options,
++  );
++  await setCustomConnectionSecret("team-api", "replacement-secret", options);
++
++  let publicationCalls = 0;
++  await assert.rejects(
++    applyCustomConnections({
++      ...options,
++      applyPublication: async () => {
++        publicationCalls += 1;
++        if (publicationCalls === 1) throw new Error("publication failed");
++        return {};
++      },
++    }),
++    /publication failed/,
++  );
++  const snapshot = customConnectionsSnapshot(options);
++  assert.equal(snapshot.active[0].baseUrl, "https://models.example.test/v1");
++  assert.equal(snapshot.candidate[0].baseUrl, "https://replacement.example.test/v1");
++  assert.equal(
++    readFileSync(path.join(stateDir, "custom-connection-team-api.secret"), "utf8").trim(),
++    "original-secret",
++  );
++});
++
++test("active connections become provider and model registry entries with conservative defaults", async () => {
++  const stateDir = mkdtempSync(path.join(os.tmpdir(), "custom-connection-registry-"));
++  const options = isolatedOptions(stateDir);
++  await createCustomConnection(remoteDraft({ protocol: "anthropic-messages" }), options);
++  await setCustomConnectionSecret("team-api", "secret", options);
++  await applyCustomConnections({ ...options, applyPublication: async () => ({}) });
++
++  const registry = customConnectionRegistryDocument(options);
++  assert.equal(registry.providers.length, 1);
++  assert.equal(registry.providers[0].protocol, "anthropic");
++  assert.equal(registry.providers[0].credential.file, "custom-connection-team-api.secret");
++  assert.equal(registry.models.length, 2);
++  assert.deepEqual(
++    registry.models.map((model) => ({
++      upstreamModel: model.upstreamModel,
++      contextWindow: model.contextWindow,
++      autoCompact: model.autoCompact,
++      inputModalities: model.inputModalities,
++      metadataEstimated: model.metadataEstimated,
++    })),
++    [
++      {
++        upstreamModel: "model-a",
++        contextWindow: 131072,
++        autoCompact: 110000,
++        inputModalities: ["text"],
++        metadataEstimated: true,
++      },
++      {
++        upstreamModel: "owner/model-b",
++        contextWindow: 131072,
++        autoCompact: 110000,
++        inputModalities: ["text"],
++        metadataEstimated: true,
++      },
++    ],
++  );
++});
++
++test("all three public connection protocols map to the existing forwarder contracts", () => {
++  const stateDir = mkdtempSync(path.join(os.tmpdir(), "custom-connection-protocols-"));
++  const options = isolatedOptions(stateDir);
++  writeFileSync(
++    options.statePath,
++    `${JSON.stringify({
++      version: 1,
++      active: [
++        remoteDraft({ id: "responses", protocol: "openai-responses", models: ["a"] }),
++        remoteDraft({ id: "chat", protocol: "openai-chat", models: ["b"] }),
++        remoteDraft({ id: "messages", protocol: "anthropic-messages", models: ["c"] }),
++      ],
++      candidate: null,
++    })}\n`,
++    { mode: 0o600 },
++  );
++  assert.deepEqual(
++    customConnectionRegistryDocument(options).providers.map((provider) => provider.protocol),
++    ["openai-responses", "openai", "anthropic"],
++  );
++});
++
++test("model-directory probe never follows a cross-origin redirect", async () => {
++  let destinationHits = 0;
++  const destination = http.createServer((_request, response) => {
++    destinationHits += 1;
++    response.end('{"data":[]}');
++  });
++  await new Promise((resolve) => destination.listen(0, "127.0.0.1", resolve));
++  const destinationPort = destination.address().port;
++  const source = http.createServer((_request, response) => {
++    response.writeHead(302, { Location: `http://127.0.0.1:${destinationPort}/v1/models` });
++    response.end();
++  });
++  await new Promise((resolve) => source.listen(0, "127.0.0.1", resolve));
++  const sourcePort = source.address().port;
++
++  try {
++    const stateDir = mkdtempSync(path.join(os.tmpdir(), "custom-connection-probe-"));
++    const options = isolatedOptions(stateDir);
++    await createCustomConnection(
++      remoteDraft({
++        id: "local-probe",
++        baseUrl: `http://127.0.0.1:${sourcePort}/v1`,
++        keyless: true,
++      }),
++      options,
++    );
++    await assert.rejects(probeCustomConnection("local-probe", options), /cross-origin redirect/);
++    assert.equal(destinationHits, 0);
++  } finally {
++    source.close();
++    destination.close();
++  }
++});
++
++test("the fresh model registry loads active custom connections and their protocol", () => {
++  const stateDir = mkdtempSync(path.join(os.tmpdir(), "custom-connection-live-registry-"));
++  writeFileSync(
++    path.join(stateDir, "custom-connections.json"),
++    `${JSON.stringify({
++      version: 1,
++      active: [remoteDraft({ protocol: "openai-chat", models: ["model-a"] })],
++      candidate: null,
++    })}\n`,
++    { mode: 0o600 },
++  );
++  writeFileSync(path.join(stateDir, "custom-connection-team-api.secret"), "secret\n", {
++    mode: 0o600,
++  });
++  const script = [
++    "const registry = await import('./src/model-registry.mjs');",
++    "const provider = registry.PROVIDERS.get('custom-team-api');",
++    "const model = registry.MODEL_BY_SLUG.get('custom-team-api/model-a');",
++    "process.stdout.write(JSON.stringify({ protocol: provider?.protocol, model, checkedIn: registry.CHECKED_IN_MODELS.some((entry) => entry.slug === 'custom-team-api/model-a') }));",
++  ].join("\n");
++  const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
++    cwd: path.resolve(import.meta.dirname, ".."),
++    encoding: "utf8",
++    env: {
++      ...process.env,
++      MODEL_ROUTER_STATE_DIR: stateDir,
++      CODEX_HOME: stateDir,
++    },
++  });
++  const result = JSON.parse(output);
++  assert.equal(result.protocol, "openai");
++  assert.equal(result.model.upstreamModel, "model-a");
++  assert.equal(result.model.metadataEstimated, true);
++  assert.equal(result.checkedIn, false);
++});
++
++async function openPort() {
++  const server = net.createServer();
++  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
++  const port = server.address().port;
++  await new Promise((resolve) => server.close(resolve));
++  return port;
++}
++
++async function waitForHealth(port, child, key) {
++  const deadline = Date.now() + 10_000;
++  while (Date.now() < deadline) {
++    if (child.exitCode !== null) throw new Error("API forwarder exited before health was ready.");
++    try {
++      const response = await fetch(`http://127.0.0.1:${port}/health`, {
++        headers: { Authorization: `Bearer ${key}` },
++      });
++      if (response.ok) return;
++    } catch {
++      // Startup races the first few probes.
++    }
++    await new Promise((resolve) => setTimeout(resolve, 50));
++  }
++  throw new Error("API forwarder health timed out.");
++}
++
++test("the API forwarder refuses a custom connection cross-origin redirect", async () => {
++  let destinationHits = 0;
++  let sourceHits = 0;
++  const destination = http.createServer((_request, response) => {
++    destinationHits += 1;
++    response.end('{"output":[]}');
++  });
++  await new Promise((resolve) => destination.listen(0, "127.0.0.1", resolve));
++  const destinationPort = destination.address().port;
++  const source = http.createServer((_request, response) => {
++    sourceHits += 1;
++    response.writeHead(307, { Location: `http://127.0.0.1:${destinationPort}/v1/responses` });
++    response.end();
++  });
++  await new Promise((resolve) => source.listen(0, "127.0.0.1", resolve));
++  const sourcePort = source.address().port;
++  const stateDir = mkdtempSync(path.join(os.tmpdir(), "custom-connection-forwarder-"));
++  writeFileSync(
++    path.join(stateDir, "custom-connections.json"),
++    `${JSON.stringify({
++      version: 1,
++      active: [remoteDraft({
++        id: "local-forward",
++        baseUrl: `http://127.0.0.1:${sourcePort}/v1`,
++        keyless: true,
++        models: ["model-a"],
++      })],
++      candidate: null,
++    })}\n`,
++    { mode: 0o600 },
++  );
++  const forwarderPort = await openPort();
++  const internalKey = "CUSTOM_CONNECTION_INTERNAL_TEST_KEY";
++  const child = spawn(process.execPath, [path.resolve(import.meta.dirname, "../src/api-forwarder.mjs")], {
++    cwd: path.resolve(import.meta.dirname, ".."),
++    env: {
++      ...process.env,
++      CODEX_HOME: stateDir,
++      MODEL_ROUTER_STATE_DIR: stateDir,
++      MODEL_ROUTER_API_PORT: String(forwarderPort),
++      MODEL_ROUTER_INTERNAL_KEY: internalKey,
++      MODEL_ROUTER_QUIET: "1",
++    },
++    stdio: ["ignore", "ignore", "pipe"],
++  });
++  try {
++    await waitForHealth(forwarderPort, child, internalKey);
++    const response = await fetch(`http://127.0.0.1:${forwarderPort}/v1/responses`, {
++      method: "POST",
++      headers: {
++        Authorization: `Bearer ${internalKey}`,
++        "Content-Type": "application/json",
++      },
++      body: JSON.stringify({
++        model: "custom-local-forward-model-a",
++        input: "hello",
++      }),
++    });
++    assert.equal(response.status, 502);
++    assert.equal(sourceHits, 1);
++    assert.equal(destinationHits, 0);
++  } finally {
++    child.kill("SIGTERM");
++    await new Promise((resolve) => child.once("exit", resolve));
++    source.close();
++    destination.close();
++  }
++});

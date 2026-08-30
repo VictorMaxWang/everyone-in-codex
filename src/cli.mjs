@@ -132,6 +132,42 @@ export function parseCli(argv) {
     return { command: "models.sync", target: options.target ?? "codex" };
   }
 
+  if (group === "setup" && argv.length === 1) {
+    return { command: "connections.open" };
+  }
+
+  if (group === "connections") {
+    if (action === "list" && argv.length === 2) return { command: "connections.list" };
+    if (action === "apply" && argv.length === 2) return { command: "connections.apply" };
+    if (action === "login" && subject && argv.length === 3) {
+      return { command: "connections.login", target: subject };
+    }
+    if (action === "remove" && subject && argv.length === 3) {
+      return { command: "connections.remove", id: subject };
+    }
+    if (action === "add") {
+      const options = parseOptions(argv.slice(2), {
+        "--label": "label",
+        "--base-url": "baseUrl",
+        "--protocol": "protocol",
+        "--models": "models",
+      });
+      requireFields(options, ["label", "baseUrl", "protocol", "models"], "connections add");
+      const modelIds = [...new Set(options.models.split(",").map((id) => id.trim()).filter(Boolean))];
+      if (modelIds.length === 0) usage("connections add 缺少有效 models");
+      return {
+        command: "connections.add",
+        draft: {
+          label: options.label,
+          baseUrl: options.baseUrl,
+          protocol: options.protocol,
+          models: modelIds.map((id) => ({ id })),
+        },
+      };
+    }
+    usage("connections add|apply|list|login|remove");
+  }
+
   throw new Error(`未知命令 ${group}`);
 }
 
@@ -157,6 +193,18 @@ async function dispatch(parsed, controller) {
       return controller.removeHarness(parsed.id);
     case "models.sync":
       return controller.syncModels({ target: parsed.target });
+    case "connections.open":
+      return controller.openConnections();
+    case "connections.list":
+      return controller.listConnections();
+    case "connections.add":
+      return controller.createConnection(parsed.draft);
+    case "connections.login":
+      return controller.loginConnection(parsed.target);
+    case "connections.remove":
+      return controller.removeConnection(parsed.id);
+    case "connections.apply":
+      return controller.applyConnections();
     case "launch":
       return controller.launch();
     case "restore":

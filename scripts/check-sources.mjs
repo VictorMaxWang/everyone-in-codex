@@ -91,11 +91,13 @@ function main() {
     "package.json",
     "locks/toolchains.lock.json",
     "locks/upstream.lock.json",
+    "locks/router-v030.lock.json",
     "locks/harnesses.lock.json",
     "scripts/bootstrap.ps1",
     "scripts/check-sources.mjs",
     "scripts/package-windows.ps1",
     "scripts/release-audit.mjs",
+    "patches/router/0001-custom-connections.patch",
     "src/cli.mjs",
   ];
   const normalizedFiles = new Set(files.map((file) => file.split(sep).join("/")));
@@ -126,6 +128,15 @@ function main() {
   }
   if (upstream.schemaVersion !== 1 || harnesses.schemaVersion !== 1 || !Array.isArray(harnesses.harnesses)) {
     throw new Error("Upstream and Harness locks must use schemaVersion 1");
+  }
+  const router = parseJson("locks/router-v030.lock.json");
+  if (
+    router.schemaVersion !== 1
+    || !/^[a-f0-9]{40}$/u.test(router.baselineTree)
+    || !/^[a-f0-9]{40}$/u.test(router.patchedTree)
+    || !/^[a-f0-9]{64}$/u.test(router.patchSha256)
+  ) {
+    throw new Error("Router v0.3 overlay lock is invalid");
   }
 
   for (const relativePath of files.filter((file) => extname(file).toLowerCase() === ".mjs")) {

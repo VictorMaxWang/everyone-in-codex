@@ -17,12 +17,15 @@ async function exists(filePath) {
   }
 }
 
-async function publishPayload(sourceRoot) {
+async function publishPayload(sourceRoot, outputName) {
   const buildRoot = path.join(repositoryRoot, ".build", "codexhost");
-  const destination = path.join(buildRoot, "payload");
+  if (!/^payload-v[0-9A-Za-z][0-9A-Za-z.+-]*$/u.test(outputName)) {
+    throw new Error("prepare-codexhost-payload output name is invalid");
+  }
+  const destination = path.join(buildRoot, outputName);
   const suffix = `${process.pid}-${randomUUID().replaceAll("-", "")}`;
-  const partial = path.join(buildRoot, `payload.partial-${suffix}`);
-  const previous = path.join(buildRoot, `payload.previous-${suffix}`);
+  const partial = path.join(buildRoot, `${outputName}.partial-${suffix}`);
+  const previous = path.join(buildRoot, `${outputName}.previous-${suffix}`);
   let previousMoved = false;
   let published = false;
 
@@ -51,6 +54,10 @@ const rootIndex = process.argv.indexOf("--root");
 if (rootIndex === -1 || !process.argv[rootIndex + 1]) {
   throw new Error("prepare-codexhost-payload requires --root <materialized-codexhost>");
 }
+const outputIndex = process.argv.indexOf("--output-name");
+if (outputIndex === -1 || !process.argv[outputIndex + 1]) {
+  throw new Error("prepare-codexhost-payload requires --output-name <payload-vVERSION>");
+}
 const upstreamRoot = path.resolve(process.argv[rootIndex + 1]);
 const payloadModule = await import(
   pathToFileURL(path.join(upstreamRoot, "scripts", "release", "prepare-payload.mjs"))
@@ -65,5 +72,5 @@ const result = await payloadModule.prepareReleasePayload({
   root: upstreamRoot,
 });
 // 发布到融合层固定读取位置；目录切换失败时保留上一份完整 payload。
-const publishedPayload = await publishPayload(result.payloadRoot);
+const publishedPayload = await publishPayload(result.payloadRoot, process.argv[outputIndex + 1]);
 process.stdout.write(`${JSON.stringify({ ok: true, payload: publishedPayload })}\n`);
