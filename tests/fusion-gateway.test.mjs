@@ -365,6 +365,43 @@ test("Gateway 为 Grok 补全严格 Responses SSE 文本字段并重排 sequence
   assert.deepEqual(events[7].response.text.format, { type: "text" });
 });
 
+test("Grok 的 stream=true 在上游误标 JSON 时仍按 Responses SSE 修复", async (t) => {
+  const gateway = new FusionGateway({
+    routerBaseUrl: "http://127.0.0.1:43123/_codex-router/private/v1/",
+    fetchImpl: async () => new Response([
+      'data: {"type":"response.created","sequence_number":0,"response":{"id":"r1"}}\n\n',
+      'data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"message","id":"m1","content":[]}}\n\n',
+      'data: {"type":"response.output_text.delta","sequence_number":2,"delta":"ok"}\n\n',
+      'data: {"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"type":"message","id":"m1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}}\n\n',
+      'data: {"type":"response.completed","sequence_number":4,"response":{"id":"r1","status":"completed","output":[]}}\n\n',
+    ].join(""), {
+      status: 200,
+      // Native OAuth Router 当前可能保留 JSON 类型，即使正文与请求都是 SSE。
+      headers: { "content-type": "application/json" },
+    }),
+  });
+  const lease = await startLease(gateway, { harnessId: "grok" });
+  t.after(() => lease.close());
+  const sessionToken = await registerSession(lease, {
+    context: { ...SESSION_CONTEXT, harnessId: "grok", sessionId: "grok-mislabeled-stream" },
+  });
+
+  const response = await fetch(`${lease.baseUrl}/v1/responses`, {
+    method: "POST",
+    headers: sessionHeaders(lease, sessionToken),
+    body: JSON.stringify({ model: "provider/allowed", input: "sentinel", stream: true }),
+  });
+  assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/u);
+  const events = (await response.text())
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => JSON.parse(line.slice("data:".length)));
+  assert.deepEqual(events.map(({ sequence_number }) => sequence_number), [0, 1, 2, 3, 4]);
+  assert.deepEqual(events[2].logprobs, []);
+  assert.equal(events.at(-1).response.output.length, 1);
+  assert.equal(events.at(-1).response.output[0].content[0].text, "ok");
+});
+
 test("上游 SSE 异步报错只终止当前请求，不会杀死 Gateway", async (t) => {
   const gateway = new FusionGateway({
     routerBaseUrl: "http://127.0.0.1:43123/_codex-router/private/v1/",
@@ -747,6 +784,101 @@ test("Anthropic messages 使用同一会话门禁，count_tokens 本地完成，
   });
   assert.equal(unsupported.status, 501);
   assert.equal((await unsupported.json()).error.type, "unsupported_endpoint");
+});
+
+test("Claude 子进程模型别名由 Host 会话绑定到真实 Fusion 模型", async (t) => {
+  const routedModels = [];
+  const gateway = new FusionGateway({
+    routerBaseUrl: "http://127.0.0.1:43123/_codex-router/private/v1/",
+    fetchImpl: async (_url, init) => {
+      const request = JSON.parse(init.body);
+      routedModels.push(request.model);
+      return new Response(JSON.stringify({
+        id: `resp-${routedModels.length}`,
+        model: request.model,
+        status: "completed",
+        output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }), { headers: { "content-type": "application/json" } });
+    },
+  });
+  const lease = await startLease(gateway, {
+    harnessId: "claude-code",
+    protocol: "anthropic-messages",
+    models: [
+      { id: "gpt-5.6-sol", source: "router-provider" },
+      { id: "gpt-5.4", source: "router-provider" },
+    ],
+  });
+  t.after(() => lease.close());
+  const sessionToken = await registerSession(lease, {
+    context: {
+      ...SESSION_CONTEXT,
+      harnessId: "claude-code",
+      sessionId: "claude-bound-model",
+      modelId: "gpt-5.6-sol",
+    },
+  });
+
+  const count = await fetch(`${lease.baseUrl}/v1/messages/count_tokens`, {
+    method: "POST",
+    headers: sessionHeaders(lease, sessionToken),
+    body: JSON.stringify({ model: "sonnet", messages: [{ role: "user", content: "count" }] }),
+  });
+  assert.equal(count.status, 200);
+  assert.equal(routedModels.length, 0);
+
+  const first = await fetch(`${lease.baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: sessionHeaders(lease, sessionToken),
+    // 即使客户端伪造另一个已允许 slug，仍只能使用 Host 绑定的模型。
+    body: JSON.stringify({ model: "gpt-5.4", messages: [{ role: "user", content: "one" }] }),
+  });
+  assert.equal(first.status, 200);
+
+  const switched = await fetch(`${lease.baseUrl}/v1/sessions/${sessionToken}/model`, {
+    method: "PATCH",
+    headers: {
+      ...lease.controlAuthorizationHeaders(),
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ modelId: "gpt-5.4" }),
+  });
+  assert.equal(switched.status, 204);
+  const second = await fetch(`${lease.baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: sessionHeaders(lease, sessionToken),
+    body: JSON.stringify({ model: "sonnet", messages: [{ role: "user", content: "two" }] }),
+  });
+  assert.equal(second.status, 200);
+  assert.deepEqual(routedModels, ["gpt-5.6-sol", "gpt-5.4"]);
+
+  const hidden = await fetch(`${lease.baseUrl}/v1/sessions/${sessionToken}/model`, {
+    method: "PATCH",
+    headers: {
+      ...lease.controlAuthorizationHeaders(),
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ modelId: "hidden/model" }),
+  });
+  assert.equal(hidden.status, 403);
+  const afterRejectedSwitch = await fetch(`${lease.baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: sessionHeaders(lease, sessionToken),
+    body: JSON.stringify({ model: "gpt-5.6-sol", messages: [{ role: "user", content: "three" }] }),
+  });
+  assert.equal(afterRejectedSwitch.status, 200);
+  assert.deepEqual(routedModels, ["gpt-5.6-sol", "gpt-5.4", "gpt-5.4"]);
+
+  const malformed = await fetch(`${lease.baseUrl}/v1/sessions/${sessionToken}/model`, {
+    method: "PATCH",
+    headers: {
+      ...lease.controlAuthorizationHeaders(),
+      "content-type": "application/json",
+    },
+    body: "{",
+  });
+  assert.equal(malformed.status, 400);
 });
 
 test("客户端取消会中止唯一一次 upstream，不会重提请求", async (t) => {

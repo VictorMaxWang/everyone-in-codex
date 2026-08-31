@@ -105,3 +105,42 @@ test("默认 Session token 随 Harness Session 撤销，不因固定 30 分钟�
     harnessId: "pi",
   }).context.sessionId, CONTEXT.sessionId);
 });
+
+test("Claude 会话只允许 Host 绑定并切换真实模型", () => {
+  const registry = new HarnessSessionRegistry({
+    hostCapability: "host-capability-for-test",
+    randomToken: () => "claude-session-token",
+  });
+  const receipt = registry.register({
+    hostCapability: "host-capability-for-test",
+    consumerId: "claude-code",
+    context: {
+      ...CONTEXT,
+      harnessId: "claude-code",
+      sessionId: "claude-session-1",
+      modelId: "gpt-5.6-sol",
+    },
+  });
+
+  assert.equal(registry.authorize({
+    sessionToken: receipt.sessionToken,
+    consumerId: "claude-code",
+    harnessId: "claude-code",
+  }).modelId, "gpt-5.6-sol");
+  assert.throws(() => registry.setModel({
+    hostCapability: "wrong-host-capability",
+    sessionToken: receipt.sessionToken,
+    modelId: "gpt-5.4",
+  }), /invalid_host_capability/);
+
+  registry.setModel({
+    hostCapability: "host-capability-for-test",
+    sessionToken: receipt.sessionToken,
+    modelId: "gpt-5.4",
+  });
+  assert.equal(registry.authorize({
+    sessionToken: receipt.sessionToken,
+    consumerId: "claude-code",
+    harnessId: "claude-code",
+  }).modelId, "gpt-5.4");
+});

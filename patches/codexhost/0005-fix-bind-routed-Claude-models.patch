@@ -1,0 +1,246 @@
+diff --git a/packages/adapters/claude-code/src/sdk-transport.ts b/packages/adapters/claude-code/src/sdk-transport.ts
+index 139fc149cee00fc835c9d00cbcd053989e2a4f87..2469d9b719bdf10e7fbc06832de014372c015b77 100644
+--- a/packages/adapters/claude-code/src/sdk-transport.ts
++++ b/packages/adapters/claude-code/src/sdk-transport.ts
+@@ -167,6 +167,10 @@ function routedClaudeEnvironment(environment: NodeJS.ProcessEnv): NodeJS.Process
+   return childEnvironment;
+ }
+ 
++// Claude CLI 会在发出 HTTP 请求前校验模型名。真实 Fusion modelId 由
++// Host 会话绑定，子进程只使用 Claude 自身认可的稳定别名。
++const ROUTED_CLAUDE_MODEL_ALIAS = "sonnet";
++
+ export function allowsDangerouslySkipPermissions(
+   getuid: (() => number) | undefined = process.getuid,
+ ): boolean {
+@@ -477,6 +481,9 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
+     });
+     const thinking = claudeThinkingConfiguration(this.#thinkingOptionId);
+     if (this.#routed) {
++      if (!this.#model) {
++        throw new Error("Claude routed Session requires a Model binding");
++      }
+       this.#registration = await registerHarnessSession({
+         environment: this.#environment,
+         harnessId: "claude-code",
+@@ -484,6 +491,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
+         cwd: this.#cwd,
+         workspaceRoots: [this.#cwd],
+         permissionMode: this.#permissionMode,
++        modelId: this.#model,
+       });
+       if (!this.#registration) {
+         throw new Error("Claude routed Session requires Host registration");
+@@ -501,7 +509,11 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
+           ...(this.#openMode === "resume"
+             ? { resume: this.sessionId }
+             : { sessionId: this.sessionId }),
+-          ...(this.#model ? { model: this.#model } : {}),
++          ...(this.#routed
++            ? { model: ROUTED_CLAUDE_MODEL_ALIAS }
++            : this.#model
++              ? { model: this.#model }
++              : {}),
+           thinking: thinking.enabled ? { type: "adaptive" } : { type: "disabled" },
+           ...(thinking.effort ? { effort: thinking.effort } : {}),
+           pathToClaudeCodeExecutable: executable,
+@@ -559,6 +571,13 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
+   async setModel(model?: string): Promise<void> {
+     const activeQuery = this.#query;
+     if (!this.#started || !activeQuery) throw new Error("Claude SDK transport is not started");
++    if (this.#routed) {
++      if (!model || !this.#registration) {
++        throw new Error("Claude routed Session requires a Model binding");
++      }
++      await this.#registration.setModel(model);
++      return;
++    }
+     await activeQuery.setModel(model);
+   }
+ 
+diff --git a/packages/adapters/claude-code/test/sdk-transport.test.ts b/packages/adapters/claude-code/test/sdk-transport.test.ts
+index 395731b50292e0c4fcd4cf7885d512087cc3a03d..148155ccd39b34ec2b35fbd9003eca92ef848856 100644
+--- a/packages/adapters/claude-code/test/sdk-transport.test.ts
++++ b/packages/adapters/claude-code/test/sdk-transport.test.ts
+@@ -79,6 +79,7 @@ function fixture(
+   thinkingOptionId = harnessThinkingOptionIdSchema.parse("auto"),
+   environment?: NodeJS.ProcessEnv,
+   routed = false,
++  model?: string,
+ ) {
+   const fakeQuery = new FakeQuery();
+   let queryInput: QueryInput | undefined;
+@@ -96,6 +97,7 @@ function fixture(
+     sessionId: "00000000-0000-4000-8000-000000000001",
+     openMode,
+     ...(routed ? { routed: true } : {}),
++    ...(model ? { model } : {}),
+     permissionMode,
+     thinkingOptionId,
+     closeTimeoutMs: 100,
+@@ -877,6 +879,7 @@ describe("ClaudeSdkTransport process environment", () => {
+           EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY: "lease-secret",
+         },
+         true,
++        "gpt-5.6-sol",
+       );
+ 
+       await value.transport.start();
+@@ -1039,6 +1042,61 @@ describe("ClaudeSdkTransport Model control", () => {
+     await selected.close();
+   });
+ 
++  it("binds routed Fusion Models through Host control while Claude only sees a valid alias", async () => {
++    const value = fixture();
++    const fetcher = vi
++      .fn<typeof fetch>()
++      .mockResolvedValueOnce(new Response("{}", {
++        headers: { "x-everyone-codex-session": "session-secret" },
++      }))
++      .mockResolvedValueOnce(new Response(null, { status: 204 }))
++      .mockResolvedValueOnce(new Response(null, { status: 204 }));
++    vi.stubGlobal("fetch", fetcher);
++    try {
++      const selected = new ClaudeSdkTransport({
++        command: process.execPath,
++        environment: {
++          PATH: process.env.PATH,
++          EVERYONE_CODEX_HOST_CONTROL_URL: "http://127.0.0.1:54321",
++          EVERYONE_CODEX_HOST_CONTROL_CAPABILITY: "host-secret",
++          EVERYONE_CODEX_CLAUDE_BASE_URL: "http://127.0.0.1:54322/v1",
++          EVERYONE_CODEX_CLAUDE_LEASE_CAPABILITY: "lease-secret",
++        },
++        cwd: process.cwd(),
++        sessionId: "00000000-0000-4000-8000-000000000010",
++        openMode: "create",
++        model: "gpt-5.6-sol",
++        routed: true,
++        permissionMode: "default",
++        thinkingOptionId: harnessThinkingOptionIdSchema.parse("auto"),
++        closeTimeoutMs: 100,
++        onPermissionModeChanged: value.onPermissionModeChanged,
++        onFault: value.onFault,
++        onPlanLimit: value.onPlanLimit,
++        queryFactory: value.queryFactory,
++      });
++
++      await selected.start();
++      expect(options(value).model).toBe("sonnet");
++      expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toMatchObject({
++        harnessId: "claude-code",
++        modelId: "gpt-5.6-sol",
++      });
++      await selected.setModel("gpt-5.4");
++      expect(value.fakeQuery.setModel).not.toHaveBeenCalled();
++      expect(fetcher.mock.calls[1]?.[0].toString()).toBe(
++        "http://127.0.0.1:54321/v1/sessions/session-secret/model",
++      );
++      expect(fetcher.mock.calls[1]?.[1]).toMatchObject({
++        method: "PATCH",
++        body: JSON.stringify({ modelId: "gpt-5.4" }),
++      });
++      await selected.close();
++    } finally {
++      vi.unstubAllGlobals();
++    }
++  });
++
+   it("detects Model selection without probing Context Usage", async () => {
+     const value = fixture();
+     value.fakeQuery.getContextUsage.mockRejectedValueOnce(new Error("must not be called"));
+diff --git a/packages/harness-adapter/src/session-registration.ts b/packages/harness-adapter/src/session-registration.ts
+index 07ab782a40e306c71a98dd8ba1b86dac83581113..ef857cb8dd2e95ba3d95538ece03fd05125d5f25 100644
+--- a/packages/harness-adapter/src/session-registration.ts
++++ b/packages/harness-adapter/src/session-registration.ts
+@@ -11,11 +11,13 @@ export interface HarnessSessionRegistrationInput {
+   cwd: string;
+   workspaceRoots?: readonly string[];
+   permissionMode: string;
++  modelId?: string;
+ }
+ 
+ export interface HarnessSessionRegistration {
+   sessionToken: string;
+   environment: NodeJS.ProcessEnv;
++  setModel(modelId: string): Promise<void>;
+   close(): Promise<void>;
+ }
+ 
+@@ -104,6 +106,7 @@ export async function registerHarnessSession(
+       cwd: input.cwd,
+       workspaceRoots: input.workspaceRoots ?? [input.cwd],
+       permissionMode: input.permissionMode,
++      ...(nonBlank(input.modelId) ? { modelId: input.modelId } : {}),
+     }),
+   });
+   if (!response.ok) throw new Error("Everyone in Codex Session registration was rejected");
+@@ -127,6 +130,23 @@ export async function registerHarnessSession(
+   return {
+     sessionToken,
+     environment: sessionEnvironment,
++    setModel: async (modelId) => {
++      if (closed) throw new Error("Everyone in Codex Session is closed");
++      if (!nonBlank(modelId)) throw new Error("Everyone in Codex Session Model is invalid");
++      const update = new URL(
++        `/v1/sessions/${encodeURIComponent(sessionToken)}/model`,
++        origin,
++      );
++      const updated = await fetcher(update, {
++        method: "PATCH",
++        headers: {
++          authorization: `Bearer ${capability}`,
++          "content-type": "application/json",
++        },
++        body: JSON.stringify({ modelId }),
++      });
++      if (!updated.ok) throw new Error("Everyone in Codex Session Model update was rejected");
++    },
+     close: async () => {
+       if (closed) return;
+       closed = true;
+diff --git a/packages/harness-adapter/test/session-registration.test.ts b/packages/harness-adapter/test/session-registration.test.ts
+index 195d422f401af5c0e627421d97f54fff61ef8b17..8428a314ce58feb7c9df238614ff5b218bab8741 100644
+--- a/packages/harness-adapter/test/session-registration.test.ts
++++ b/packages/harness-adapter/test/session-registration.test.ts
+@@ -14,6 +14,7 @@ describe("Harness Session registration", () => {
+       .mockResolvedValueOnce(new Response("{}", {
+         headers: { "x-everyone-codex-session": "session-secret" },
+       }))
++      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+       .mockResolvedValueOnce(new Response(null, { status: 204 }));
+     const registration = await registerHarnessSession(
+       {
+@@ -26,6 +27,7 @@ describe("Harness Session registration", () => {
+         cwd: "C:\\workspace",
+         workspaceRoots: ["C:\\workspace"],
+         permissionMode: "default",
++        modelId: "gpt-5.6-sol",
+       },
+       fetcher,
+     );
+@@ -39,14 +41,24 @@ describe("Harness Session registration", () => {
+       cwd: "C:\\workspace",
+       workspaceRoots: ["C:\\workspace"],
+       permissionMode: "default",
++      modelId: "gpt-5.6-sol",
+     });
+ 
++    await registration?.setModel("gpt-5.4");
+     await registration?.close();
+     await registration?.close();
+-    expect(fetcher).toHaveBeenCalledTimes(2);
++    expect(fetcher).toHaveBeenCalledTimes(3);
+     expect(fetcher.mock.calls[1]?.[0].toString()).toBe(
++      "http://127.0.0.1:54321/v1/sessions/session-secret/model",
++    );
++    expect(fetcher.mock.calls[1]?.[1]).toMatchObject({
++      method: "PATCH",
++      body: JSON.stringify({ modelId: "gpt-5.4" }),
++    });
++    expect(fetcher.mock.calls[2]?.[0].toString()).toBe(
+       "http://127.0.0.1:54321/v1/sessions/session-secret",
+     );
++    await expect(registration?.setModel("gpt-5.5")).rejects.toThrow("Session is closed");
+   });
+ 
+   it("is inert without a configured Host control pair", async () => {

@@ -95,6 +95,7 @@ function grokSseSequenceTransform() {
   let currentSummaryIndex = 0;
   let currentSummaryText = "";
   let currentOutputText = "";
+  const completedOutputItems = [];
   const rewriteLine = (line) => {
     if (!line.startsWith("data:")) return line;
     const data = line.slice("data:".length).trimStart();
@@ -184,6 +185,17 @@ function grokSseSequenceTransform() {
           if (typeof event.text !== "string") event.text = currentOutputText;
           else currentOutputText = event.text;
         }
+      }
+      if (event.type === "response.output_item.done"
+        && Number.isInteger(event.output_index)
+        && event.item && typeof event.item === "object" && !Array.isArray(event.item)) {
+        completedOutputItems[event.output_index] = event.item;
+      }
+      if (event.type === "response.completed"
+        && event.response && typeof event.response === "object"
+        && (!Array.isArray(event.response.output) || event.response.output.length === 0)) {
+        const completed = completedOutputItems.filter(Boolean);
+        if (completed.length > 0) event.response.output = completed;
       }
       const pendingValues = [event];
       while (pendingValues.length > 0) {
@@ -659,6 +671,10 @@ export class FusionGateway {
           const context = payload?.context && typeof payload.context === "object"
             ? payload.context
             : payload;
+          if (context?.harnessId === "claude-code" && !modelsById.has(context?.modelId)) {
+            requestError(response, 403, "model_not_allowed", "Model is not allowed");
+            return;
+          }
           const receipt = this.#sessions.register({
             hostCapability: token,
             // 控制面是 Gateway 级而非 lease 级；一个 host capability 可为任一已知 Harness 注册会话。
@@ -669,6 +685,45 @@ export class FusionGateway {
         } catch (error) {
           const tooLarge = error?.code === "request_too_large";
           requestError(response, tooLarge ? 413 : 400, tooLarge ? "request_too_large" : "invalid_session_context");
+        }
+        return;
+      }
+
+      const modelUpdateMatch = request.method === "PATCH"
+        ? /^\/v1\/sessions\/([^/]+)\/model$/u.exec(requestUrl.pathname)
+        : null;
+      if (modelUpdateMatch) {
+        if (!token || !safeEqual(token, this.#hostCapability)) {
+          requestError(response, 401, "invalid_host", "Unauthorized");
+          return;
+        }
+        let payload;
+        try {
+          payload = JSON.parse(await readBody(request, this.maxBodyBytes));
+        } catch (error) {
+          const tooLarge = error?.code === "request_too_large";
+          requestError(
+            response,
+            tooLarge ? 413 : 400,
+            tooLarge ? "request_too_large" : "invalid_json",
+            tooLarge ? "Request too large" : "Invalid request",
+          );
+          return;
+        }
+        if (!modelsById.has(payload?.modelId)) {
+          requestError(response, 403, "model_not_allowed", "Model is not allowed");
+          return;
+        }
+        try {
+          this.#sessions.setModel({
+            hostCapability: token,
+            sessionToken: decodeURIComponent(modelUpdateMatch[1]),
+            modelId: payload.modelId,
+          });
+          response.writeHead(204, { "cache-control": "no-store" });
+          response.end();
+        } catch {
+          requestError(response, 404, "invalid_session", "Session not found");
         }
         return;
       }
@@ -753,11 +808,15 @@ export class FusionGateway {
         requestError(response, tooLarge ? 413 : 400, tooLarge ? "request_too_large" : "invalid_json");
         return;
       }
-      const model = modelsById.get(clientPayload?.model);
+      // Claude CLI 只能看见自身认可的别名；真实 Fusion modelId 由 Host
+      // 会话绑定，客户端无法通过手写 model 字段越过 allowlist。
+      const boundModelId = harnessId === "claude-code" ? session?.modelId : null;
+      const model = modelsById.get(boundModelId ?? clientPayload?.model);
       if (!model) {
         requestError(response, 403, "model_not_allowed", "Model is not allowed");
         return;
       }
+      if (boundModelId) clientPayload = { ...clientPayload, model: model.id };
       if (isCountTokens) {
         writeJson(response, 200, countAnthropicTokens(clientPayload));
         return;
@@ -850,11 +909,19 @@ export class FusionGateway {
           return;
         }
         response.statusCode = upstream.status;
+        const grokStreaming = harnessId === "grok" && (
+          upstreamPayload.stream === true
+          || upstream.headers.get("content-type")?.includes("text/event-stream")
+        );
         for (const headerName of ["content-type", "cache-control", "x-request-id"]) {
           const value = upstream.headers.get(headerName);
           if (value) response.setHeader(headerName, value);
         }
         if (isAnthropicMessage && upstreamPayload.stream) {
+          response.setHeader("content-type", "text/event-stream; charset=utf-8");
+        } else if (grokStreaming) {
+          // Native OAuth Router 有时保留 JSON 类型，但正文仍是 Responses SSE。
+          // Grok 的请求意图比不可靠的上游响应头更权威。
           response.setHeader("content-type", "text/event-stream; charset=utf-8");
         }
         if (!upstream.body) {
@@ -864,8 +931,7 @@ export class FusionGateway {
         const upstreamStream = Readable.fromWeb(upstream.body);
         if (isAnthropicMessage && upstreamPayload.stream) {
           await pipeline(upstreamStream, createResponsesSseToAnthropicTransform(), response);
-        } else if (harnessId === "grok"
-          && upstream.headers.get("content-type")?.includes("text/event-stream")) {
+        } else if (grokStreaming) {
           await pipeline(upstreamStream, grokSseSequenceTransform(), response);
         } else {
           await pipeline(upstreamStream, response);

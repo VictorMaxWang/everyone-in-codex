@@ -16,6 +16,18 @@ function requireIdentifier(value, name) {
   return value;
 }
 
+function requireModelId(value) {
+  if (
+    typeof value !== "string"
+    || value.length < 1
+    || value.length > 512
+    || value.trim() !== value
+  ) {
+    throw new TypeError("model_id_invalid");
+  }
+  return value;
+}
+
 function normalizeContext(context) {
   if (!context || typeof context !== "object" || Array.isArray(context)) {
     throw new TypeError("session_context_invalid");
@@ -116,6 +128,7 @@ export class HarnessSessionRegistry {
     this.#sessions.set(sessionToken, {
       consumerId: normalizedConsumerId,
       context: normalizedContext,
+      modelId: context.modelId === undefined ? null : requireModelId(context.modelId),
       expiresAt,
       threadId: randomUUID(),
       activeTurnId: null,
@@ -142,6 +155,20 @@ export class HarnessSessionRegistry {
       throw new Error("invalid_session");
     }
     return session;
+  }
+
+  setModel({ hostCapability, sessionToken, modelId } = {}) {
+    this.#authorizeHost(hostCapability);
+    const session = typeof sessionToken === "string" ? this.#sessions.get(sessionToken) : null;
+    if (!session) throw new Error("invalid_session");
+    this.authorize({
+      sessionToken,
+      consumerId: session.consumerId,
+      harnessId: session.context.harnessId,
+    });
+    if (session.context.harnessId !== "claude-code") throw new Error("invalid_session");
+    // 真实模型只由 Host 控制面更新；Harness 子进程持有的短期 token 无权改写。
+    session.modelId = requireModelId(modelId);
   }
 
   revoke({ hostCapability, sessionToken } = {}) {
