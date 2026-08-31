@@ -30,6 +30,16 @@ const ALLOWED_ASSET_HOSTS = new Set([
   "objects.githubusercontent.com",
 ]);
 const TEXT_RESPONSE_LIMIT = 2 * 1024 * 1024;
+const ASSET_DOWNLOAD_ATTEMPTS = 5;
+const RETRYABLE_DOWNLOAD_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EPIPE",
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -137,14 +147,18 @@ function allowedAssetUrl(value, redirected = false) {
   return url;
 }
 
-async function downloadReleaseAsset({ fetchImpl, asset, destination, onChunk }) {
+async function fetchReleaseAsset({ fetchImpl, asset, offset }) {
   let url = allowedAssetUrl(asset.url);
   let response;
   for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
     response = await fetchImpl(url, {
       method: "GET",
       redirect: "manual",
-      headers: { accept: "application/octet-stream", "user-agent": "everyone-in-codex-updater" },
+      headers: {
+        accept: "application/octet-stream",
+        "user-agent": "everyone-in-codex-updater",
+        ...(offset > 0 ? { range: `bytes=${offset}-` } : {}),
+      },
     });
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get("location");
@@ -158,20 +172,70 @@ async function downloadReleaseAsset({ fetchImpl, asset, destination, onChunk }) 
     throw new Error("product_update_rate_limited");
   }
   if (!response.ok || !response.body) throw new Error(`product_update_download_failed:${response.status}`);
+  if (offset > 0) {
+    const match = /^bytes (\d+)-(\d+)\/(\d+)$/u.exec(
+      response.headers.get("content-range") ?? "",
+    );
+    if (
+      response.status !== 206
+      || !match
+      || Number(match[1]) !== offset
+      || Number(match[2]) < offset
+      || Number(match[3]) !== asset.size
+    ) {
+      await response.body.cancel().catch(() => {});
+      throw new Error("product_update_resume_rejected");
+    }
+  }
+  return response;
+}
+
+function retryableDownloadError(error) {
+  if (error instanceof TypeError) return true;
+  const code = error?.code ?? error?.cause?.code;
+  return RETRYABLE_DOWNLOAD_CODES.has(code);
+}
+
+function defaultAssetRetryDelay(failedAttempt) {
+  const delayMs = 1_000 * (2 ** Math.max(0, failedAttempt - 1));
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function downloadReleaseAsset({
+  fetchImpl,
+  asset,
+  destination,
+  onChunk,
+  retryDelay,
+}) {
   const handle = await open(destination, "wx", 0o600);
   const digest = createHash("sha256");
   let received = 0;
   try {
-    const reader = response.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = Buffer.from(value);
-      received += chunk.length;
-      if (received > asset.size) throw new Error("product_update_download_size_mismatch");
-      digest.update(chunk);
-      await handle.write(chunk);
-      onChunk?.(chunk.length);
+    for (
+      let attempt = 1;
+      attempt <= ASSET_DOWNLOAD_ATTEMPTS && received < asset.size;
+      attempt += 1
+    ) {
+      let response;
+      try {
+        response = await fetchReleaseAsset({ fetchImpl, asset, offset: received });
+        const reader = response.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = Buffer.from(value);
+          received += chunk.length;
+          if (received > asset.size) throw new Error("product_update_download_size_mismatch");
+          digest.update(chunk);
+          await handle.write(chunk);
+          onChunk?.(chunk.length);
+        }
+      } catch (error) {
+        await response?.body?.cancel().catch(() => {});
+        if (attempt >= ASSET_DOWNLOAD_ATTEMPTS || !retryableDownloadError(error)) throw error;
+        await retryDelay(attempt);
+      }
     }
   } catch (error) {
     await handle.close().catch(() => {});
@@ -282,10 +346,12 @@ export async function stageProductRelease({
   fetchImpl = globalThis.fetch,
   onProgress,
   now = Date.now,
+  retryDelay = defaultAssetRetryDelay,
 } = {}) {
   if (typeof productRoot !== "string" || !path.isAbsolute(productRoot)) {
     throw new Error("product_root_invalid");
   }
+  if (typeof retryDelay !== "function") throw new Error("product_update_retry_delay_invalid");
   const updatesRoot = path.join(productRoot, "updates");
   const versionsRoot = path.join(productRoot, "versions");
   await Promise.all([mkdir(updatesRoot, { recursive: true }), mkdir(versionsRoot, { recursive: true })]);
@@ -307,18 +373,21 @@ export async function stageProductRelease({
       asset: release.assets.windows,
       destination: path.join(workRoot, release.assets.windows.name),
       onChunk: progress,
+      retryDelay,
     });
     const checksums = await downloadReleaseAsset({
       fetchImpl,
       asset: release.assets.checksums,
       destination: path.join(workRoot, release.assets.checksums.name),
       onChunk: progress,
+      retryDelay,
     });
     const externalManifest = await downloadReleaseAsset({
       fetchImpl,
       asset: release.assets.manifest,
       destination: path.join(workRoot, release.assets.manifest.name),
       onChunk: progress,
+      retryDelay,
     });
     const checksumMap = parseSha256Sums(await readFile(checksums.path, "utf8"));
     if (
